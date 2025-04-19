@@ -11,7 +11,7 @@ unsigned long init_begin;
 
 static unsigned long *__sys_call_table;
 typedef asmlinkage long (*t_syscall)(const struct pt_regs *);
-static t_syscall orig_read;
+static t_syscall orig_syscall;
 
 unsigned long *
 get_syscall_table(void)
@@ -70,10 +70,10 @@ unprotect_memory(void)
 
 
 asmlinkage int
-hooked_open(const struct pt_regs *pt_regs)
+hooked_syscall(const struct pt_regs *pt_regs)
 {
 	printk("rscaller hooked func");
-	return orig_read(pt_regs);
+	return orig_syscall(pt_regs);
 }
 
 int syscall_num = __NR_execve;
@@ -94,11 +94,11 @@ rscaller_init(void)
 #endif
 
 
-	orig_read = (t_syscall)__sys_call_table[syscall_num];
+	orig_syscall = (t_syscall)__sys_call_table[syscall_num];
 
 	unprotect_memory();
 
-	__sys_call_table[syscall_num] = (unsigned long) hooked_open;
+	__sys_call_table[syscall_num] = (unsigned long) hooked_syscall;
 
 	protect_memory();
 
@@ -110,7 +110,7 @@ rscaller_cleanup(void)
 {
 	unprotect_memory();
 
-	__sys_call_table[syscall_num] = (unsigned long) orig_read;
+	__sys_call_table[syscall_num] = (unsigned long) orig_syscall;
 
 	protect_memory();
 }
