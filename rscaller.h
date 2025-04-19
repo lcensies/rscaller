@@ -1,69 +1,20 @@
-// #include <linux/kernel.h>
-// #include <linux/module.h>
-// #include <linux/moduleparam.h>
-// #include <linux/kallsyms.h>
-// #include <linux/kprobes.h>
-// #include <linux/syscalls.h>
-// #include <linux/types.h>
-// // #include <asm/utrap.h>
-// #include <linux/cred.h>
-
-// #include <linux/init.h>
-// #include <linux/parser.h>
-// #include <linux/version.h>	// for version macro
-// #include <linux/moduleparam.h>	// for params
-
-// #include <linux/ftrace.h>	// for kallsys
-// #include <linux/slab.h>		// for kmalloc
-// #include <linux/fs.h>		// for kernel_read
-// #include <asm/uaccess.h>	// for segment descriptors
+#include <linux/sched.h>
+#include <linux/module.h>
+#include <linux/syscalls.h>
+#include <linux/dirent.h>
+#include <linux/slab.h>
+#include <linux/version.h> 
 
 
 #include "misssing_defs.h"
-// #include "handler_wrappers.h"
-
-struct linux_dirent {
-        unsigned long   d_ino;
-        unsigned long   d_off;
-        unsigned short  d_reclen;
-        char            d_name[1];
-};
-
-#define MAGIC_PREFIX "diamorphine_secret"
-
-#define PF_INVISIBLE 0x10000000
-
-#define MODULE_NAME "diamorphine"
-
-enum {
-	SIGINVIS = 31,
-	SIGSUPER = 64,
-	SIGMODINVIS = 63,
-};
-
-#ifndef IS_ENABLED
-#define IS_ENABLED(option) \
-(defined(__enabled_ ## option) || defined(__enabled_ ## option ## _MODULE))
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
-#define KPROBE_LOOKUP 1
-#include <linux/kprobes.h>
-static struct kprobe kp = {
-	    .symbol_name = "kallsyms_lookup_name"
-};
-#endif
+#include "handler_wrappers.h"
 
 
 
-// #define NOT_PTR false
-// #define PTR true
 
-// typedef void* (*kallsyms_lookup_name_t)(const char *name);
-// typedef asmlinkage long (*syscall_ptr_t)(const struct pt_regs*);
+#define MODULE_NAME "rscaller"
 
-// // static int kprobe_handler(struct kprobe *p, struct pt_regs *regs);
-// // static int subscribe_kprobes(void);
+
 
 // typedef struct {
 //   int type;

@@ -1,11 +1,3 @@
-#include <linux/sched.h>
-#include <linux/module.h>
-#include <linux/syscalls.h>
-#include <linux/dirent.h>
-#include <linux/slab.h>
-#include <linux/version.h> 
-
-
 #include "rscaller.h"
 
 #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
@@ -22,7 +14,7 @@ typedef asmlinkage long (*t_syscall)(const struct pt_regs *);
 static t_syscall orig_read;
 
 unsigned long *
-get_syscall_table_bf(void)
+get_syscall_table(void)
 {
 	unsigned long *syscall_table;
 	
@@ -80,15 +72,16 @@ unprotect_memory(void)
 asmlinkage int
 hooked_open(const struct pt_regs *pt_regs)
 {
+	printk("rscaller hooked func");
 	return orig_read(pt_regs);
 }
 
-int syscall_num = __NR_open;
+int syscall_num = __NR_execve;
 
 static int __init
-diamorphine_init(void)
+rscaller_init(void)
 {
-	__sys_call_table = get_syscall_table_bf();
+	__sys_call_table = get_syscall_table();
 	if (!__sys_call_table)
 		return -1;
 
@@ -113,7 +106,7 @@ diamorphine_init(void)
 }
 
 static void __exit
-diamorphine_cleanup(void)
+rscaller_cleanup(void)
 {
 	unprotect_memory();
 
@@ -122,8 +115,8 @@ diamorphine_cleanup(void)
 	protect_memory();
 }
 
-module_init(diamorphine_init);
-module_exit(diamorphine_cleanup);
+module_init(rscaller_init);
+module_exit(rscaller_cleanup);
 
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("your mom");
