@@ -14,15 +14,14 @@
 
 #define MODULE_NAME "rscaller"
 
-
-
 typedef struct {
   int type;
+  size_t size;
   bool is_ptr;
 } ParamMeta;
 
 typedef struct {
-  ParamMeta meta;
+  // ParamMeta meta;
   SyscallParam param;
 } ParamBuffer;
 
@@ -30,6 +29,8 @@ typedef struct {
   int n_params;
   ParamMeta params_meta[6]; 
 } SyscallSignature;
+
+typedef asmlinkage int (*syscall_ptr_t)(const struct pt_regs *pt_regs);
 
 typedef struct {
   int number;
@@ -45,15 +46,30 @@ typedef struct {
   syscall_ptr_t hooked_addr;
 } SyscallEntry;
 
-static ParamMeta params[6] = {{CHAR_PTR_TYPE, PTR}, {COMPAT_UPTR_T_PTR_TYPE, PTR}, {COMPAT_UPTR_T_PTR_TYPE, PTR}};
+#define PTR true
+#define NOT_PTR false
+
 
 const static SyscallSignature signature__x64_sys_execve = {
   .n_params =  3,
   .params_meta = {{CHAR_PTR_TYPE, PTR}, {COMPAT_UPTR_T_PTR_TYPE, PTR}, {COMPAT_UPTR_T_PTR_TYPE, PTR}}
 };
 
+
+const static SyscallSignature signature__x64_sys_open = {
+  .n_params =  3,
+  .params_meta = {{CHAR_PTR_TYPE, PTR}, {INT_TYPE, NOT_PTR}, {UMODE_T_TYPE, PTR}}
+};
+
+
+const static SyscallSignature signature__x64_sys_openat = {
+  .n_params =  3,
+  .params_meta = {{CHAR_PTR_TYPE, PTR}, {INT_TYPE, NOT_PTR}, {UMODE_T_TYPE, PTR}}
+};
+
+
 #define SYSCALL_ENTRY(NUM, NAME)                                       \
-    (SyscallEntry)   {                                                   \
+    {                                                   \
         .number = (NUM),                                               \
         .name = #NAME,                                                 \
         .signature = signature__x64_sys_##NAME,                        \
@@ -65,7 +81,7 @@ const static SyscallSignature signature__x64_sys_execve = {
 SyscallEntry syscall_entries[] = {
 // SYSCALL_ENTRY(0,__x64_sys_read),
 // SYSCALL_ENTRY(1,__x64_sys_write),
-SYSCALL_ENTRY(2,__x64_sys_open),
+// SYSCALL_ENTRY(2,open),
 // SYSCALL_ENTRY(3,__x64_sys_close),
 // SYSCALL_ENTRY(4,__x64_sys_newstat),
 // SYSCALL_ENTRY(5,__x64_sys_newfstat),
@@ -123,7 +139,7 @@ SYSCALL_ENTRY(2,__x64_sys_open),
 // SYSCALL_ENTRY(56,__x64_sys_clone),
 // SYSCALL_ENTRY(57,__x64_sys_fork),
 // SYSCALL_ENTRY(58,__x64_sys_vfork),
-// SYSCALL_ENTRY(59, execve),
+SYSCALL_ENTRY(59, execve),
 // SYSCALL_ENTRY(60,__x64_sys_exit    ),
 // SYSCALL_ENTRY(61,__x64_sys_wait4),
 // SYSCALL_ENTRY(62,__x64_sys_kill),
@@ -305,7 +321,7 @@ SYSCALL_ENTRY(2,__x64_sys_open),
 // SYSCALL_ENTRY(254,__x64_sys_inotify_add_watch),
 // SYSCALL_ENTRY(255,__x64_sys_inotify_rm_watch),
 // SYSCALL_ENTRY(256,__x64_sys_migrate_pages),
-// SYSCALL_ENTRY(257,__x64_sys_openat),
+SYSCALL_ENTRY(257,openat),
 // SYSCALL_ENTRY(258,__x64_sys_mkdirat),
 // SYSCALL_ENTRY(259,__x64_sys_mknodat),
 // SYSCALL_ENTRY(260,__x64_sys_fchownat),
