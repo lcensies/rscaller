@@ -13,7 +13,8 @@ configure: btf bindings handlers
 	which bindgen || $(yes | cargo binstall bindgen-cli)
 
 bindings:
-	cd client/src/bindings && cargo run
+
+	cd client/src/bindings && cargo run ${KMOD_DIR}/rscaller.h
 
 handlers:
 	cd ${SCRIPTS_DIR} && poetry install && \

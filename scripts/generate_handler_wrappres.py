@@ -140,7 +140,7 @@ def generate_syscalls_meta(syscalls: Dict[str, SyscallDefinition]) -> str:
 
     def generate_syscall_meta(syscall: SyscallDefinition) -> str:
         generated: str = ""
-        generated = f"const static SyscallSignature signature__x64_sys_{syscall.name}= " + "{"
+        generated = f"SyscallSignature signature__x64_sys_{syscall.name}= " + "{"
         generated += f"\t.n_params =  {len(syscall.arguments)}," 
         generated += f"\t.params_meta= {generate_syscall_args(syscall.arguments)}" + "};\n" 
 
@@ -164,6 +164,17 @@ def generate_wrappers(syscall_map: dict, kernel_sources: str, syscalls_filters: 
 
     return union + "\n" + "".join(funcs)
        
+# TODO: ADD
+
+# typedef struct {
+#   // ParamMeta meta;
+#   SyscallParam param;
+# } ParamBuffer;
+
+# typedef struct {
+#   int number;
+#   ParamBuffer param_bufs[6];   
+# } Syscall;
 
 def main():
     kernel_sources: str = f"{find_git_root()}/linux"

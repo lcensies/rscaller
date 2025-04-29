@@ -97,7 +97,6 @@ extractor: KernelTypeExtractor = KernelTypeExtractor(kernel_sources)
 extractor.parse()
 
 filters = [ "compat_size_t"]
-    
 defs = extractor.fetch_definitions(filters)
 
 for definition in defs:
