@@ -1,25 +1,29 @@
-import sys
+import os
+
 from typing import Set, List, Dict
 from resolve_syscall import resolve_syscall_name, syscall_exists
 from fetch_buffer_idx import get_buffer_arguments, find_syscall_definitions
+from fetch_buffer_idx import SyscallDefinition, SyscallArgument
+from utils import find_git_root
+
 
 N_SYSCALLS = 1000
+# TODO: update handler template
 SYSCALL_HANDLER_TEMPLATE = """
 __attribute__((__unused__)) static int handle_syscall_<SYSCALL_NUM>(struct kprobe* kp, struct pt_regs *regs, int buf_arg_idx, int buf_size_arg_idx) {
   return handler_entry_wrapper(<SYSCALL_NUM>, kp, regs <BUF_ARG_IDX_PARAMS>);
 }
 """
-OUT_FILE = "handler_wrappers.h"
+OUT_FILE = f"{find_git_root()}/kmod/handler_wrappers.h"
+FILTER_FILE = "files/forwarded_syscalls"
 
 
-
-def generate_handler_wrapper(syscall_num: int, kernel_sources: str) -> str:
+def generate_handler_wrapper(syscall_num: int, kernel_sources: str, syscall_filters: List[str]) -> str:
     if not syscall_exists(syscall_num):
         return ""
 
-    syscall_name = resolve_syscall_name(syscall_num)
-
-    if syscall_name == "Unknown":
+    syscall_name: str = resolve_syscall_name(syscall_num)
+    if syscall_name not in syscall_filters or syscall_name == "Unknown":
         return ""
 
     try: 
@@ -33,14 +37,28 @@ def generate_handler_wrapper(syscall_num: int, kernel_sources: str) -> str:
         "<BUF_ARG_IDX_PARAMS>", buf_arg_params
     )
 
+def generate_params_enum(type_defs: Set[str]) -> str:
+    counter: int = 0
+    generated: str = "\nenum ParamType {\n"
+
+    for type_def in type_defs:
+        generated += f"\t{type_def.upper()} = {counter},\n"
+        counter += 1
+
+    generated += "};\n"
+
+    return generated
+
+
 def generate_union_variant_fetcher(type_defs: Set[str]) -> str:
     # macro_defs: list[str] = [x.upper().replace(" ", "") for x in type_defs]
     counter: int = 0
     generated: str = ""
 
-    for macro_def in type_defs:
-        generated += f"\n#define {macro_def.upper()} {counter}"
-        counter += 1        
+    # Has been replaced to enum, no longer needed
+    # for macro_def in type_defs:
+    #     generated += f"\n#define {macro_def.upper()} {counter}"
+    #     counter += 1        
 
     switch_cases: list[str] = [f"case {type_def.upper()}: *param = &src->{type_def}; *param_size = sizeof(src->{type_def}); return;" for type_def in type_defs]
 
@@ -57,13 +75,15 @@ def generate_union_variant_fetcher(type_defs: Set[str]) -> str:
     return generated
          
 
-def generate_param_types_union(syscall_definitions: dict) -> str:
+def generate_types(syscall_definitions: dict, filters: List[str]) -> str:
     # syscall name -> count / union type
     param_types_dict: dict[str, tuple[int, str]] = {}
     # type -> type name
     arg_type_names: dict[str, str] = {} 
 
-    for d in syscall_definitions.values():
+    active_syscalls: dict = {k: v for k, v in syscall_definitions.items() if k in filters}
+
+    for d in active_syscalls.values():
         for arg in d.arguments:
 
             arg_type_real: str = arg.type 
@@ -91,24 +111,70 @@ def generate_param_types_union(syscall_definitions: dict) -> str:
 
     generated = "\ntypedef union {\n"
     generated += "\n".join([x for x in union_members]) + "\n} SyscallParam;\n"
-    generated += generate_union_variant_fetcher(sorted_type_names)
     
+    generated += generate_params_enum(sorted_type_names)
+    generated += generate_union_variant_fetcher(sorted_type_names)
+    generated += generate_syscalls_meta(active_syscalls)
     
     return generated
 
-def main():
-    kernel_sources = "/home/dta/linux"
-    # kernel_sources = sys.argv[1]
-    syscall_map = find_syscall_definitions(kernel_sources)
 
-    funcs: List[str] = [generate_handler_wrapper(i, kernel_sources) for i in range(N_SYSCALLS + 1)]
+def generate_syscalls_meta(syscalls: Dict[str, SyscallDefinition]) -> str:
+    generated: str = ""
+
+    def generate_syscall_args(args: List[SyscallArgument]) -> str:
+        generated: str = "{"
+
+        for arg in args:
+            is_ptr_suffix: str = "PTR_" if arg.is_ptr else ""
+            is_ptr_str: str = "true" if arg.is_ptr else "false"
+            arg_str: str = f"{arg.type.upper()}_{is_ptr_suffix}TYPE"
+            arg_str = "{" + arg_str + "," + is_ptr_str  + "}," 
+
+            generated += arg_str 
+        pass
+
+        generated += "}"
+
+        return generated
+
+    def generate_syscall_meta(syscall: SyscallDefinition) -> str:
+        generated: str = ""
+        generated = f"const static SyscallSignature signature__x64_sys_{syscall.name}= " + "{"
+        generated += f"\t.n_params =  {len(syscall.arguments)}," 
+        generated += f"\t.params_meta= {generate_syscall_args(syscall.arguments)}" + "};\n" 
+
+        return generated
+
+    for syscall in syscalls.values():
+        generated += generate_syscall_meta(syscall)
+
+    return generated
+
+def get_forwarded_syscalls() -> List[str]:
+    with open(f"{find_git_root()}/{FILTER_FILE}") as f:
+        return [x.strip() for x in f.readlines()]
+
+
+def generate_wrappers(syscall_map: dict, kernel_sources: str, syscalls_filters: List[str]):
+    funcs: List[str] = [generate_handler_wrapper(i, kernel_sources, syscalls_filters) for i in range(N_SYSCALLS + 1)]
     funcs = [x for x in funcs if x != ""]
     
-    union = generate_param_types_union(syscall_map)
+    union = generate_types(syscall_map, syscalls_filters)
+
+    return union + "\n" + "".join(funcs)
+       
+
+def main():
+    kernel_sources: str = f"{find_git_root()}/linux"
+    # kernel_sources = sys.argv[1]
+    syscall_map = find_syscall_definitions(kernel_sources)
+    forwarded_syscalls: list[str] = get_forwarded_syscalls()
+
+    generated: str = generate_wrappers(syscall_map, kernel_sources, forwarded_syscalls)
 
     with open(OUT_FILE, "w+") as f:
-        f.write(union)
-        f.write("".join(funcs))
+        f.write(generated)
 
 if __name__ == "__main__":
     main()

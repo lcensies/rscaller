@@ -5,6 +5,7 @@ from dataclasses import dataclass, asdict
 from dacite import from_dict
 from typing import Optional, List, Dict, Tuple, Set
 import json
+from utils import find_git_root
 
 @dataclass
 class SyscallArgument:
@@ -16,7 +17,7 @@ class SyscallArgument:
 class SyscallDefinition:
     name: str
     signature_str: str
-    arguments: List[str]
+    arguments: List[SyscallArgument]
         
 
 syscall_map: Dict[str, SyscallDefinition] = {}
@@ -149,7 +150,7 @@ def get_buffer_arguments(syscall_name: str,
 
 
 if __name__ == "__main__":
-    kernel_sources = sys.argv[1]  # Update this path
+    kernel_sources = f"{find_git_root()}/linux"
     syscall_definitions = find_syscall_definitions(kernel_sources)
 
     # Example usage
