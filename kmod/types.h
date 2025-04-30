@@ -1,36 +1,29 @@
 
-// #include <linux/sched.h>
-// #include <linux/module.h>
-// #include <linux/syscalls.h>
-// #include <linux/dirent.h>
-// #include <linux/slab.h>
-// #include <linux/version.h> 
-
-// #include <sys/types.h>
-// #include <linux/types.h>
-// #include <linux/compat.h>
-// #include <asm/types.h>
-// #include <asm/atomic.h>
-// #include <asm/posix_types.h>
-
-#include "vmlinux.h"
-// #include "handler_wrappers.h"
 
 
-
-
-// Ignore asmlinkage while generating bindings
 #ifdef __GENERATING_BINDINGS__
+   // Ignore asmlinkage while generating bindings
     #define asmlinkage
+    #include "vmlinux.h"
+#else
+    #include <linux/sched.h>
+    #include <linux/module.h>
+    #include <linux/syscalls.h>
+    #include <linux/dirent.h>
+    #include <linux/slab.h>
+    #include <linux/version.h> 
+
+    #include <linux/types.h>
+    #include <linux/compat.h>
+    #include <asm/types.h>
+    #include <asm/atomic.h>
+    #include <asm/posix_types.h>
 #endif
 
 #define PTR true
 #define NOT_PTR false
 
-typedef asmlinkage int (*syscall_ptr_t)(const struct pt_regs *pt_regs);
-
-
-
+// Compile time
 typedef struct {
   int type;
   size_t size;
@@ -42,7 +35,22 @@ typedef struct {
   ParamMeta params_meta[6]; 
 } SyscallSignature;
 
+#include "handler_wrappers.h"
 
+typedef asmlinkage int (*syscall_ptr_t)(const struct pt_regs *pt_regs);
+
+
+// Runtime
+typedef struct {
+  // ParamMeta meta;
+  SyscallParam param;
+} ParamBuffer;
+
+typedef struct {
+  int number;
+  int n_params;
+  ParamBuffer param_bufs[6];   
+} Syscall;
 
 typedef struct {
   int number;

@@ -1,13 +1,7 @@
-// #include <linux/sched.h>
-// #include <linux/module.h>
-// #include <linux/syscalls.h>
-// #include <linux/dirent.h>
-// #include <linux/slab.h>
-// #include <linux/version.h> 
 
 
+#include <stddef.h>
 #include "types.h"
-#include "handler_wrappers.h"
 
 #define MODULE_NAME "rscaller"
 
@@ -15,27 +9,29 @@
 #define NULL 0
 
 
+
+
 // TODO: include syscall entries in codegen
 
-SyscallEntry syscall_entries[] = {
+const SyscallEntry syscall_entries[] = {
     {                                   
         2,
         "open",
-        {	.n_params =  3,	.params_meta= {{CHAR_PTR_TYPE,true},{INT_TYPE,false},{UMODE_T_TYPE,false},}},
+        {	  3,	 {{CHAR_PTR_TYPE,true},{INT_TYPE,false},{UMODE_T_TYPE,false},}},
         NULL,                     
         NULL,             
     },
     {                                   
         257,
         "openat",
-        {	.n_params =  4,	.params_meta= {{INT_TYPE,false},{CHAR_PTR_TYPE,true},{INT_TYPE,false},{UMODE_T_TYPE,false},}},
+        {	 4,{{INT_TYPE,false},{CHAR_PTR_TYPE,true},{INT_TYPE,false},{UMODE_T_TYPE,false},}},
         NULL,                     
         NULL                 
     },
     {                                   
         59,
         "execve",
-        {	.n_params =  3,	.params_meta= {{CHAR_PTR_TYPE,true},{COMPAT_UPTR_T_PTR_TYPE,true},{COMPAT_UPTR_T_PTR_TYPE,true},}},
+        {	 3,	 {{CHAR_PTR_TYPE,true},{COMPAT_UPTR_T_PTR_TYPE,true},{COMPAT_UPTR_T_PTR_TYPE,true},}},
         NULL,                     
         NULL                 
     }
