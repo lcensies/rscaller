@@ -1,15 +1,9 @@
-
-
-#include <stddef.h>
+// #include <stddef.h>
 #include "types.h"
 
 #define MODULE_NAME "rscaller"
 
-
 #define NULL 0
-
-
-
 
 // TODO: include syscall entries in codegen
 
