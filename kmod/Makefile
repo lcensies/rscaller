@@ -1,16 +1,24 @@
-# Name of the module
-
 MODULE_NAME := rscaller
-# Current directory
 PWD := $(shell pwd)
 KMOD_DIR := ${PWD}
+LIB_DIR := ${KMOD_DIR}/lib
 obj-m := ${MODULE_NAME}.o
-ccflags-y := -std=gnu99
+ccflags-y := -std=gnu99 
 EXTRA_CFLAGS += -DDIRTY=no
-
-
 # Kernel source directory (update this to match your system)
 KDIR := /lib/modules/$(shell uname -r)/build
+
+LIBURING_URL := https://github.com/axboe/liburing/
+
+
+
+liburing_dir :="${LIB_DIR}/liburing"
+liburing:
+	@test -d ${liburing_dir} || git clone "${LIBURING_URL}" ${liburing_dir}
+	make -C ${liburing_dir}
+	sudo make -C ${liburing_dir} install
+
+configure: liburing
 
 
 all:
