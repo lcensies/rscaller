@@ -1,11 +1,12 @@
 PWD := $(shell pwd)
 KMOD_DIR := ${PWD}/kmod
 SCRIPTS_DIR := scripts
-BINDGEN_DIR := client/src/bindings/src
+BINDGEN_DIR := rsclient/src/bindings/src
 
 .PHONY: kmod kmod_reload
 
 # TODO: download linux kernel sources
+# TODO2: use syscall table based on kernel sourcecs
 
 configure: btf bindings handlers
 	#sudo apt install clang
@@ -13,8 +14,8 @@ configure: btf bindings handlers
 	which bindgen || $(yes | cargo binstall bindgen-cli)
 
 bindings:
+	cd ${BINDGEN_DIR} && cargo run ${KMOD_DIR}/rscaller.h
 
-	cd client/src/bindings && cargo run ${KMOD_DIR}/rscaller.h
 
 handlers:
 	cd ${SCRIPTS_DIR} && poetry install && \

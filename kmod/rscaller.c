@@ -1,5 +1,5 @@
 #include "rscaller.h"
-
+#include "buffer.h"
 
 #include <linux/syscalls.h>
 #include <linux/dirent.h>
@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
+
 
 #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
 unsigned long cr0;
@@ -24,6 +25,7 @@ typedef asmlinkage long (*t_syscall)(const struct pt_regs *);
 static t_syscall orig_syscall;
 
 #define REMOTE_PROGS_FOLDER "/remote_progs/"
+#define DEVICE_NAME "rscaller"
 
 unsigned long * get_syscall_table(void)
 {
@@ -129,6 +131,7 @@ int save_syscall_param(SyscallParam *buf, long param, int param_idx, const Sysca
 Syscall* save_syscall(unsigned long *params, const SyscallSignature *signature) {
 	Syscall* syscall;
 	int ret;
+	int i;
 
 	syscall = kvmalloc(sizeof(Syscall), GFP_KERNEL);
 	if (syscall == NULL) {
@@ -137,10 +140,10 @@ Syscall* save_syscall(unsigned long *params, const SyscallSignature *signature) 
 	}
 
 	smap_rw_disable();
-	for(int i = 0; i < signature->n_params; i++) {
+	for(i = 0; i < signature->n_params; i++) {
 
 		pr_info("Trying to save param %d", i);
-		ret = save_syscall_param(&syscall->param_bufs[i], params[i], i, signature);
+		ret = save_syscall_param(&(syscall->param_bufs[i]), params[i], i, signature);
 		if (ret == -1) {
 			pr_err("Failed to save syscall params");
 			return NULL;
@@ -233,13 +236,14 @@ asmlinkage int hooked_syscall(const struct pt_regs *pt_regs)
 	syscall = save_syscall((unsigned long*)&params, &signature);
 	smap_write_enable();
 
+	ret = control_buffer_submit_syscall(syscall);
+
 	return orig_syscall(pt_regs);
 }
 
 int syscall_num = __NR_execve;
 
-static int __init rscaller_init(void)
-{
+int init_hooks() {
 	__sys_call_table = get_syscall_table();
 	if (!__sys_call_table)
 		return -1;
@@ -260,18 +264,119 @@ static int __init rscaller_init(void)
 	__sys_call_table[syscall_num] = (unsigned long) hooked_syscall;
 
 	smap_write_enable();
+}
+
+void cleanup_hooks() {
+	smap_write_disable();
+	__sys_call_table[syscall_num] = (unsigned long) orig_syscall;
+	smap_write_enable();
+}
+
+static const struct file_operations fops = {
+    .mmap = mmap,
+    .release = release,
+};
+
+static struct miscdevice rscaller_dev = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name = DEVICE_NAME,
+    .fops = &fops,
+    .mode = 0666,
+};
+
+static int __init rscaller_init(void)
+{
+	printk("trying to register %s", DEVICE_PATH);
+	int ret;
+	struct proc_dir_entry *proc_entry;
+
+	if (ret = init_hooks()) {
+		pr_err("Failed to register hooks");
+		return ret;
+	}
+
+	pr_debug(!"trying to register %s", DEVICE_PATH);
+    ret = misc_register(&rscaller_dev);
+    if (ret) {
+		pr_err("Failed to register misc device");
+        // kfree(kernel_buffer);
+        return ret;
+    }
 
 	return 0;
 }
 
 static void __exit rscaller_cleanup(void)
 {
-	smap_write_disable();
+	cleanup_hooks();
 
-	__sys_call_table[syscall_num] = (unsigned long) orig_syscall;
-
-	smap_write_enable();
+	remove_proc_entry(MMAP_FILENAME, NULL);
 }
+
+
+struct mmap_info {
+    char *data;
+};
+
+/* After unmap. */
+static void vm_close(struct vm_area_struct *vma)
+{
+    pr_info("vm_close\n");
+}
+
+/* First page access. */
+static vm_fault_t vm_fault(struct vm_fault *vmf)
+{
+    struct page *page;
+    struct mmap_info *info;
+
+    pr_info("vm_fault\n");
+    info = (struct mmap_info *)vmf->vma->vm_private_data;
+    if (info->data) {
+        page = virt_to_page(info->data);
+        get_page(page);
+        vmf->page = page;
+    }
+    return 0;
+}
+
+/* After mmap. TODO vs mmap, when can this happen at a different time than mmap? */
+static void vm_open(struct vm_area_struct *vma)
+{
+    pr_info("vm_open\n");
+}
+
+static struct vm_operations_struct vm_ops =
+{
+    .close = vm_close,
+    .fault = vm_fault,
+    .open = vm_open,
+};
+
+// https://github.com/cirosantilli/linux-kernel-module-cheat/blob/2ea5e17d23553334c23934d83965de8a47df3780/kernel_modules/mmap.c
+
+static int mmap(struct file *filp, struct vm_area_struct *vma)
+{
+    pr_info("mmap\n");
+    vma->vm_ops = &vm_ops;
+    vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+    vma->vm_private_data = filp->private_data;
+    vm_open(vma);
+    return 0;
+}
+
+static int release(struct inode *inode, struct file *filp)
+{
+    struct mmap_info *info;
+
+    pr_info("release\n");
+    info = filp->private_data;
+    free_page((unsigned long)info->data);
+    kfree(info);
+    filp->private_data = NULL;
+    return 0;
+}
+
 
 module_init(rscaller_init);
 module_exit(rscaller_cleanup);

@@ -1,5 +1,6 @@
 // #include <stddef.h>
 #include "types.h"
+#include "buffer.h"
 
 #define MODULE_NAME "rscaller"
 

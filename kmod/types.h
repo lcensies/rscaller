@@ -6,7 +6,7 @@
     #define asmlinkage
     #include "vmlinux.h"
 #else
-    #include <linux/sched.h>
+    // #include <linux/sched.h>
     #include <linux/module.h>
     #include <linux/syscalls.h>
     #include <linux/dirent.h>
@@ -15,11 +15,14 @@
 
     #include <linux/types.h>
     #include <linux/compat.h>
-    #include <asm/types.h>
+    // #include <asm/types.h>
     #include <asm/atomic.h>
     #include <asm/posix_types.h>
 #endif
 
+#ifndef RSCALLER_TYPES
+
+#define RSCALLER_TYPES
 #define PTR true
 #define NOT_PTR false
 
@@ -39,17 +42,11 @@ typedef struct {
 
 typedef asmlinkage int (*syscall_ptr_t)(const struct pt_regs *pt_regs);
 
-
-// Runtime
-typedef struct {
-  // ParamMeta meta;
-  SyscallParam param;
-} ParamBuffer;
-
 typedef struct {
   int number;
   int n_params;
-  ParamBuffer param_bufs[6];   
+  int ret;
+  SyscallParam param_bufs[6];
 } Syscall;
 
 typedef struct {
@@ -66,3 +63,4 @@ typedef struct {
   syscall_ptr_t hooked_addr;
 } SyscallEntry;
 
+#endif
