@@ -3,6 +3,8 @@ FROM ghcr.io/philips-software/amp-devcontainer-rust
 RUN mkdir /app
 WORKDIR /app
 
+RUN cargo binstall bindgen-cli
+
 RUN apt update && apt install -y \
     clang \
     make \
