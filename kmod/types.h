@@ -52,11 +52,7 @@ typedef struct {
 typedef struct {
   int number;
   char name[64];
-  // Since all existing syscalls have only one parameter for user buffer, it is safe to define the number of argument responsible for buffer. For more complex scenarios, we can store the entire function signature.
-  // int buf_arg_idx;
-  // Optional parameter specifying number of bytes for operation
-  // The real buffer size should be greater or equal to it.
-  // int buf_size_arg_idx; 
+  // int is_remote;
   SyscallSignature signature;
   
   syscall_ptr_t original_addr;

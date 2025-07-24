@@ -4,9 +4,15 @@
 
 #define MODULE_NAME "rscaller"
 
-#define NULL 0
+// #define NULL 0
 
 // TODO: include syscall entries in codegen
+
+static int rscaller_dev_mmap_new(struct file *filp, struct vm_area_struct *vma);
+static int rscaller_dev_mmap_old(struct inode *inode, struct file *filp);
+
+static int rscaller_dev_release_new(struct inode *inode, struct file *filp);
+
 
 const SyscallEntry syscall_entries[] = {
     {                                   

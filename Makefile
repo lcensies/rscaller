@@ -1,13 +1,16 @@
 PWD := $(shell pwd)
-KMOD_DIR := ${PWD}/kmod
+KMOD_DIR := kmod
 SCRIPTS_DIR := scripts
 BINDGEN_DIR := rsclient/src/bindings/src
 
 KERNEL_VOLUMES := -v /lib/modules:/lib/modules -v /usr/src/kernels:/usr/src/kernels 
 APP_VOLUME := -v ${PWD}:/app
 COMMON_VOLUMES := ${KERNEL_VOLUMES} ${APP_VOLUME}
+# MAKE_IMAGE := gcc:15.1.0
+# TODO: build properly
+MAKE_IMAGE := archlinux:base-devel-20250720.0.386825
 
-MAKE_CMD := docker run --rm -it ${COMMON_VOLUMES} -w /app gcc:15.1.0 make
+MAKE_CMD := docker run --rm -it ${COMMON_VOLUMES} -w /app ${MAKE_IMAGE} make
 
 .PHONY: kmod kmod_reload
 
@@ -32,11 +35,12 @@ btf:
 	docker ps > /dev/null 2>/dev/null
 	docker run --privileged calico/bpftool /bpftool btf dump file /sys/kernel/btf/vmlinux format c > kmod/vmlinux.h
 
+.PHONY: kmod
 kmod: 
-	${MAKE_CMD} -C kmod
+	${MAKE_CMD} -C ${KMOD_DIR}
 
-kmod_reload:
-	${MAKE_CMD} -C kmod reload
+kmod_reload: 
+	cd ${KMOD_DIR} && sudo make reload
 
 dev-env:
 	docker build -t rscaller-devcont -f docker/devcontainer.Dockerfile .
