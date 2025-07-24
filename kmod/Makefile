@@ -8,20 +8,21 @@ EXTRA_CFLAGS += -DDIRTY=no
 # Kernel source directory 
 KDIR := /lib/modules/$(shell uname -r)/build
 # Alternatively, create Kbuild file with contents:
-# obj-m := rscaller.o buffer.o
-obj-m := ${MODULE_NAME}.o 
-$(MODNAME)-y += buffer.o $(KHOOK_GOALS)
-ccflags-y := -std=gnu99 $(KHOOK_CCFLAGS)
+obj-m += rscaller.o buffer.o
+# obj-m += ${MODULE_NAME}.o 
+# $(MODNAME)-y +=  $(KHOOK_GOALS)
+# rscaller-y += buffer.o
+ccflags-y += -std=gnu99 
 
-ldflags-y    += $(KHOOK_LDFLAGS) # use LDFLAGS for old kernels
+# ldflags-y    += $(KHOOK_LDFLAGS) # use LDFLAGS for old kernels
 
 
 all:
 	$(MAKE) -C $(KDIR) M=${KMOD_DIR} modules 
 
 insert:
-	sudo rmmod  ${MODULE_NAME} 2>/dev/null || :
-	sudo insmod ${MODULE_NAME}.ko
+	rmmod  ${MODULE_NAME} || :
+	insmod ${MODULE_NAME}.ko
 
 reload: all insert
 
