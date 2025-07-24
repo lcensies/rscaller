@@ -10,307 +10,332 @@
 #include <linux/sched.h>
 #include <linux/mm.h>
 
+#include <linux/fs.h>
+#include <linux/init.h>
+#include <linux/kernel.h> /* min */
+#include <linux/proc_fs.h>
+#include <linux/uaccess.h> /* copy_from_user, copy_to_user */
+#include <linux/slab.h>
 
-#if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
-unsigned long cr0;
-#elif IS_ENABLED(CONFIG_ARM64)
-void (*update_mapping_prot)(phys_addr_t phys, unsigned long virt, phys_addr_t size, pgprot_t prot);
-unsigned long start_rodata;
-unsigned long init_begin;
-#define section_size init_begin - start_rodata
+// #include <khook/engine.h>
+
+
+// #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
+// unsigned long cr0;
+// #elif IS_ENABLED(CONFIG_ARM64)
+// void (*update_mapping_prot)(phys_addr_t phys, unsigned long virt, phys_addr_t size, pgprot_t prot);
+// unsigned long start_rodata;
+// unsigned long init_begin;
+// #define section_size init_begin - start_rodata
+// #endif
+
+// #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
+// #define KPROBE_LOOKUP 1
+// #include <linux/kprobes.h>
+// static struct kprobe kp_kallsyms = {
+//     .symbol_name = "kallsyms_lookup_name",
+// };
+// #endif
+
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0)
+#define HAVE_PROC_OPS
 #endif
 
-static unsigned long *__sys_call_table;
-typedef asmlinkage long (*t_syscall)(const struct pt_regs *);
-static t_syscall orig_syscall;
+// static unsigned long *__sys_call_table;
+// typedef asmlinkage long (*t_syscall)(const struct pt_regs *);
+// static t_syscall orig_syscall;
 
 #define REMOTE_PROGS_FOLDER "/remote_progs/"
 #define DEVICE_NAME "rscaller"
 
-unsigned long * get_syscall_table(void)
-{
-	unsigned long *syscall_table;
-	
-	syscall_table = (unsigned long*)kallsyms_lookup_name("sys_call_table");
-	return syscall_table;
-}
-
-
-#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
-static inline void write_cr0_forced(unsigned long val)
-{
-	unsigned long __force_order;
-
-	asm volatile(
-		"mov %0, %%cr0"
-		: "+r"(val), "+m"(__force_order));
-}
-#endif
-
-static inline void smap_write_enable(void)
-{
-#if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
-#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
-	write_cr0_forced(cr0);
+#ifdef HAVE_PROC_OPS
+static const struct proc_ops rscaller_ops = {
+    .proc_mmap = rscaller_dev_mmap_new,
+    .proc_release = rscaller_dev_release_new,
+};
 #else
-	write_cr0(cr0);
+static const struct file_operations rscaller_ops = {
+    .mmap = rscaller_dev_mmap,
+    .release = rscaller_dev_release,
+};
 #endif
-#elif IS_ENABLED(CONFIG_ARM64)
-	update_mapping_prot(__pa_symbol(start_rodata), (unsigned long)start_rodata,
-			section_size, PAGE_KERNEL_RO);
 
-#endif
-}
+static const void* rscaller_ops_ptr = (void*)&rscaller_ops;
 
-static inline void smap_write_disable(void)
-{
-#if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
-#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
-	write_cr0_forced(cr0 & ~0x00010000);
-#else
-	write_cr0(cr0 & ~0x00010000);
-#endif
-#elif IS_ENABLED(CONFIG_ARM64)
-	update_mapping_prot(__pa_symbol(start_rodata), (unsigned long)start_rodata,
-			section_size, PAGE_KERNEL);
-#endif
-}
+// unsigned long * get_syscall_table(void)
+// {
+// 	#ifdef KPROBE_LOOKUP
+// 		unsigned long (*kallsyms_lookup_name)(const char *name);
+// 		if (register_kprobe(&kp_kallsyms) < 0)
+// 			return 0;
+// 		kallsyms_lookup_name = (unsigned long (*)(const char *name)) kp_kallsyms.addr;
+// 		unregister_kprobe(&kp_kallsyms);
+// 	#endif
 
-static inline void smap_rw_disable(void)
-{
-	stac();
-}
+// 	unsigned long * syscall_table;
 
-static inline void smap_rw_enable(void)
-{
-	clac();
-}
-
-// void fetch_param_variant(SyscallParam *src, int param_type, void **param, size_t *param_size) {
-
-// TODO: separately handle userspace char buffers
-int save_syscall_param(SyscallParam *buf, long param, int param_idx, const SyscallSignature *signature)
-{
-	void* inner_buf;
-	void* src_kernel;
-	bool is_ptr = signature->params_meta[param_idx].is_ptr;
-	int type_variant = signature->params_meta[param_idx].type;
-	size_t param_size = signature->params_meta[param_idx].size;
-
-	fetch_param_variant(buf, type_variant, &inner_buf, &param_size);
-
-	// Here we handle all pointers except char buffers
-	// param_size is taken from real size of struct
-	if (is_ptr) {
-		// pr_info("Trying to allocate %d bytes\n", param_size);
-        src_kernel = kvmalloc(param_size, GFP_KERNEL);
-        if (!src_kernel) {
-            pr_err("Failed to allocate temp buf for syscall");
-            return -ENOMEM; // it's good practice to return a proper error code
-        }
-
-        // Copy the data from user space to the kernel buffer
-        if (copy_from_user(src_kernel, (const void __user *)inner_buf, param_size)) {
-            kvfree(src_kernel); // Free the allocated buffer in case of failure
-            pr_err("Failed to copy data from user space");
-            return -EFAULT; // Return an error if copy fails
-        }
-
-        // Now use src_kernel as the source for memcpy
-        memcpy(inner_buf, src_kernel, param_size);
-        kvfree(src_kernel); // Free the allocated buffer after copying
-    } 
-	else {
-        memcpy(inner_buf, (void *)param, param_size); // Unsafe, we should ensure 'param' is valid!
-	}
-
-
-	return 0;
-}
-
-Syscall* save_syscall(unsigned long *params, const SyscallSignature *signature) {
-	Syscall* syscall;
-	int ret;
-	int i;
-
-	syscall = kvmalloc(sizeof(Syscall), GFP_KERNEL);
-	if (syscall == NULL) {
-		pr_err("Failed to alloc syscall buf");
-		return NULL;
-	}
-
-	smap_rw_disable();
-	for(i = 0; i < signature->n_params; i++) {
-
-		pr_info("Trying to save param %d", i);
-		ret = save_syscall_param(&(syscall->param_bufs[i]), params[i], i, signature);
-		if (ret == -1) {
-			pr_err("Failed to save syscall params");
-			return NULL;
-		}
-	}
-	smap_rw_enable();
-
-	pr_info("Saved syscall params");
-
-err:
-	kfree(syscall);
-	return NULL;
-}
-
-
-// Might be needed in case if it will be more convenient to save additional meta
-// inside ParamBuf
-// param_prepare_meta(ParamBuffer *buf, const SyscallSignature *signature, int param_idx) {
+// 	syscall_table = (unsigned long*)kallsyms_lookup_name("sys_call_table");
+// 	return syscall_table;
 // }
 
 
-char *get_current_binary_path(void)
-{
-    struct mm_struct *mm;
-    char *buf, *res;
+// #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
+// static inline void write_cr0_forced(unsigned long val)
+// {
+// 	unsigned long __force_order;
 
-    mm = current->mm;
-    if (!mm || !mm->exe_file)
-        return NULL;
+// 	asm volatile(
+// 		"mov %0, %%cr0"
+// 		: "+r"(val), "+m"(__force_order));
+// }
+// #endif
 
-    buf = kvmalloc(PATH_MAX, GFP_KERNEL);
-    if (!buf)
-        return NULL;
+// static inline void smap_write_enable(void)
+// {
+// #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
+// #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
+// 	write_cr0_forced(cr0);
+// #else
+// 	write_cr0(cr0);
+// #endif
+// #elif IS_ENABLED(CONFIG_ARM64)
+// 	update_mapping_prot(__pa_symbol(start_rodata), (unsigned long)start_rodata,
+// 			section_size, PAGE_KERNEL_RO);
 
-    res = d_path(&mm->exe_file->f_path, buf, PATH_MAX);
-    if (IS_ERR(res)) {
-        pr_err("d_path failed: %ld\n", PTR_ERR(res));
-        kvfree(buf);
-        return NULL;
-    }
+// #endif
+// }
 
-    res = kstrdup(res, GFP_KERNEL);
-    kvfree(buf);
-    return res;
-}
+// static inline void smap_write_disable(void)
+// {
+// #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
+// #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
+// 	write_cr0_forced(cr0 & ~0x00010000);
+// #else
+// 	write_cr0(cr0 & ~0x00010000);
+// #endif
+// #elif IS_ENABLED(CONFIG_ARM64)
+// 	update_mapping_prot(__pa_symbol(start_rodata), (unsigned long)start_rodata,
+// 			section_size, PAGE_KERNEL);
+// #endif
+// }
+
+// static inline void smap_rw_disable(void)
+// {
+// 	stac();
+// }
+
+// static inline void smap_rw_enable(void)
+// {
+// 	clac();
+// }
+
+// // void fetch_param_variant(SyscallParam *src, int param_type, void **param, size_t *param_size) {
+
+// // TODO: separately handle userspace char buffers
+// int save_syscall_param(SyscallParam *buf, long param, int param_idx, const SyscallSignature *signature)
+// {
+// 	void* inner_buf;
+// 	void* src_kernel;
+// 	bool is_ptr = signature->params_meta[param_idx].is_ptr;
+// 	int type_variant = signature->params_meta[param_idx].type;
+// 	size_t param_size = signature->params_meta[param_idx].size;
+
+// 	fetch_param_variant(buf, type_variant, &inner_buf, &param_size);
+
+// 	// Here we handle all pointers except char buffers
+// 	// param_size is taken from real size of struct
+// 	if (is_ptr) {
+// 		// pr_info("Trying to allocate %d bytes\n", param_size);
+//         src_kernel = kvmalloc(param_size, GFP_KERNEL);
+//         if (!src_kernel) {
+//             pr_err("Failed to allocate temp buf for syscall");
+//             return -ENOMEM; // it's good practice to return a proper error code
+//         }
+
+//         // Copy the data from user space to the kernel buffer
+//         if (copy_from_user(src_kernel, (const void __user *)inner_buf, param_size)) {
+//             kvfree(src_kernel); // Free the allocated buffer in case of failure
+//             pr_err("Failed to copy data from user space");
+//             return -EFAULT; // Return an error if copy fails
+//         }
+
+//         // Now use src_kernel as the source for memcpy
+//         memcpy(inner_buf, src_kernel, param_size);
+//         kvfree(src_kernel); // Free the allocated buffer after copying
+//     } 
+// 	else {
+//         memcpy(inner_buf, (void *)param, param_size); // Unsafe, we should ensure 'param' is valid!
+// 	}
 
 
-bool filter_binary(void) {
-	bool is_filtered;
-	char  *binary = get_current_binary_path();
+// 	return 0;
+// }
 
-	if (binary == NULL) {
-		return false;
-	}
+// Syscall* save_syscall(unsigned long *params, const SyscallSignature *signature) {
+// 	Syscall* syscall;
+// 	int ret;
+// 	int i;
+
+// 	syscall = kvmalloc(sizeof(Syscall), GFP_KERNEL);
+// 	if (syscall == NULL) {
+// 		pr_err("Failed to alloc syscall buf");
+// 		return NULL;
+// 	}
+
+// 	smap_rw_disable();
+// 	for(i = 0; i < signature->n_params; i++) {
+
+// 		pr_info("Trying to save param %d", i);
+// 		ret = save_syscall_param(&(syscall->param_bufs[i]), params[i], i, signature);
+// 		if (ret == -1) {
+// 			pr_err("Failed to save syscall params");
+// 			return NULL;
+// 		}
+// 	}
+// 	smap_rw_enable();
+
+// 	pr_info("Saved syscall params");
+
+// err:
+// 	kfree(syscall);
+// 	return NULL;
+// }
+
+
+// // Might be needed in case if it will be more convenient to save additional meta
+// // inside ParamBuf
+// // param_prepare_meta(ParamBuffer *buf, const SyscallSignature *signature, int param_idx) {
+// // }
+
+
+// char *get_current_binary_path(void)
+// {
+//     struct mm_struct *mm;
+//     char *buf, *res;
+
+//     mm = current->mm;
+//     if (!mm || !mm->exe_file)
+//         return NULL;
+
+//     buf = kvmalloc(PATH_MAX, GFP_KERNEL);
+//     if (!buf)
+//         return NULL;
+
+//     res = d_path(&mm->exe_file->f_path, buf, PATH_MAX);
+//     if (IS_ERR(res)) {
+//         pr_err("d_path failed: %ld\n", PTR_ERR(res));
+//         kvfree(buf);
+//         return NULL;
+//     }
+
+//     res = kstrdup(res, GFP_KERNEL);
+//     kvfree(buf);
+//     return res;
+// }
+
+
+// bool filter_binary(void) {
+// 	bool is_filtered;
+// 	char  *binary = get_current_binary_path();
+
+// 	if (binary == NULL) {
+// 		return false;
+// 	}
 	
-	is_filtered = !strstr(binary, REMOTE_PROGS_FOLDER);
+// 	is_filtered = !strstr(binary, REMOTE_PROGS_FOLDER);
 	
-	if (!is_filtered) {
-		pr_info("%s performed syscall\n", binary);	
-	}
+// 	if (!is_filtered) {
+// 		pr_info("%s performed syscall\n", binary);	
+// 	}
 	
-	kvfree(binary);
-	return is_filtered;
-}
+// 	kvfree(binary);
+// 	return is_filtered;
+// }
 
-// TODO: add codegen or macro for syscall
-asmlinkage int hooked_syscall(const struct pt_regs *pt_regs)
-{
-	int ret;
-	SyscallSignature signature;
-	Syscall *syscall;	
-	memcpy(&signature, &signature__x64_sys_execve, sizeof(signature__x64_sys_execve));
+// // TODO: add codegen or macro for syscall
+// asmlinkage int hooked_syscall(const struct pt_regs *pt_regs)
+// {
+// 	int ret;
+// 	SyscallSignature signature;
+// 	Syscall *syscall;	
+// 	memcpy(&signature, &signature__x64_sys_execve, sizeof(signature__x64_sys_execve));
 	
-	unsigned long params[6] = {
-		pt_regs->bx,
-		pt_regs->cx,
-		pt_regs->dx,
-		pt_regs->si,
-		pt_regs->di,
-		pt_regs->bp,
-	};
+// 	unsigned long params[6] = {
+// 		pt_regs->bx,
+// 		pt_regs->cx,
+// 		pt_regs->dx,
+// 		pt_regs->si,
+// 		pt_regs->di,
+// 		pt_regs->bp,
+// 	};
 
-	// Binary is outside of remote_progs folder
-	if (filter_binary()) {
-		return orig_syscall(pt_regs);
-	}
-
-
-	smap_write_disable();
-	syscall = save_syscall((unsigned long*)&params, &signature);
-	smap_write_enable();
-
-	ret = control_buffer_submit_syscall(syscall);
-
-	return orig_syscall(pt_regs);
-}
-
-int syscall_num = __NR_execve;
-
-int init_hooks() {
-	__sys_call_table = get_syscall_table();
-	if (!__sys_call_table)
-		return -1;
-
-#if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
-	cr0 = read_cr0();
-#elif IS_ENABLED(CONFIG_ARM64)
-	update_mapping_prot = (void *)kallsyms_lookup_name("update_mapping_prot");
-	start_rodata = (unsigned long)kallsyms_lookup_name("__start_rodata");
-	init_begin = (unsigned long)kallsyms_lookup_name("__init_begin");
-#endif
+// 	// Binary is outside of remote_progs folder
+// 	if (filter_binary()) {
+// 		return orig_syscall(pt_regs);
+// 	}
 
 
-	orig_syscall = (t_syscall)__sys_call_table[syscall_num];
+// 	smap_write_disable();
+// 	syscall = save_syscall((unsigned long*)&params, &signature);
+// 	smap_write_enable();
 
-	smap_write_disable();
+// 	ret = control_buffer_submit_syscall(syscall);
 
-	__sys_call_table[syscall_num] = (unsigned long) hooked_syscall;
+// 	return orig_syscall(pt_regs);
+// }
 
-	smap_write_enable();
-}
+// int syscall_num = __NR_execve;
 
-void cleanup_hooks() {
-	smap_write_disable();
-	__sys_call_table[syscall_num] = (unsigned long) orig_syscall;
-	smap_write_enable();
-}
 
-static const struct file_operations fops = {
-    .mmap = mmap,
-    .release = release,
-};
+// // KHOOK_EXT(long, __x64_sys_execve, const struct pt_regs *);
+// // static long khook___x64_sys_execve(const struct pt_regs *regs) {
+// //         printk("sys_execve -- %s pid %ld sig %ld\n", current->comm, regs->di, regs->si);
+// //         return KHOOK_ORIGIN(__x64_sys_execve, regs);
+// // }
 
-static struct miscdevice rscaller_dev = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name = DEVICE_NAME,
-    .fops = &fops,
-    .mode = 0666,
-};
+// // int init_hooks(void) {
+// // 	__sys_call_table = get_syscall_table();
+// // 	if (!__sys_call_table)
+// // 		return -1;
+
+// // #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
+// // 	cr0 = read_cr0();
+// // #elif IS_ENABLED(CONFIG_ARM64)
+// // #endif
+
+
+
+// void cleanup_hooks(void) {
+// 	// smap_write_disable();
+// 	// __sys_call_table[syscall_num] = (unsigned long) orig_syscall;
+// 	// smap_write_enable();
+
+// 	// khook_cleanup();
+// }
+
 
 static int __init rscaller_init(void)
 {
-	printk("trying to register %s", DEVICE_PATH);
 	int ret;
-	struct proc_dir_entry *proc_entry;
 
-	if (ret = init_hooks()) {
-		pr_err("Failed to register hooks");
-		return ret;
-	}
+	printk("Rscaller init");
 
-	pr_debug(!"trying to register %s", DEVICE_PATH);
-    ret = misc_register(&rscaller_dev);
-    if (ret) {
-		pr_err("Failed to register misc device");
-        // kfree(kernel_buffer);
-        return ret;
-    }
-
+	// if (ret = init_hooks()) {
+	// 	pr_err("Failed to register hooks");
+	// 	return ret;
+	// }
+	// pr_debug(!"trying to register %s", DEVICE_PATH);
+    proc_create(DEVICE_NAME, 0, NULL, rscaller_ops_ptr);
 	return 0;
+	// return khook_init(NULL);
 }
 
 static void __exit rscaller_cleanup(void)
 {
-	cleanup_hooks();
+	// cleanup_hooks();
 
-	remove_proc_entry(MMAP_FILENAME, NULL);
+	remove_proc_entry(DEVICE_NAME, NULL);
 }
 
 
@@ -355,17 +380,24 @@ static struct vm_operations_struct vm_ops =
 
 // https://github.com/cirosantilli/linux-kernel-module-cheat/blob/2ea5e17d23553334c23934d83965de8a47df3780/kernel_modules/mmap.c
 
-static int mmap(struct file *filp, struct vm_area_struct *vma)
+
+
+static int rscaller_dev_mmap_old(struct inode *inodp, struct file *filp) {
+    pr_info("rscaller_dev_mmap_old");
+	return 0;
+}
+
+static int rscaller_dev_mmap_new(struct file *filp, struct vm_area_struct *vma)
 {
-    pr_info("mmap\n");
-    vma->vm_ops = &vm_ops;
-    vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
-    vma->vm_private_data = filp->private_data;
+    // pr_info("mmap\n");
+    // vma->vm_ops = &vm_ops;
+    // // vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+    // vma->vm_private_data = filp->private_data;
     vm_open(vma);
     return 0;
 }
 
-static int release(struct inode *inode, struct file *filp)
+static int rscaller_dev_release_new(struct inode *inode, struct file *filp)
 {
     struct mmap_info *info;
 
