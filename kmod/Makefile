@@ -1,5 +1,6 @@
 include      ../lib/khook/Makefile.khook
 
+# EXTRA_CFLAGS=-I$(PWD)/../lib/khook
 MODULE_NAME := rscaller
 PWD := $(shell pwd)
 KMOD_DIR := ${PWD}
@@ -10,11 +11,11 @@ KDIR := /lib/modules/$(shell uname -r)/build
 # Alternatively, create Kbuild file with contents:
 obj-m += rscaller.o buffer.o
 # obj-m += ${MODULE_NAME}.o 
-# $(MODNAME)-y +=  $(KHOOK_GOALS)
+# rscaller-y +=  $(KHOOK_GOALS)
 # rscaller-y += buffer.o
 ccflags-y += -std=gnu99 
 
-# ldflags-y    += $(KHOOK_LDFLAGS) # use LDFLAGS for old kernels
+# ldflags-y  += $(KHOOK_LDFLAGS) # use LDFLAGS for old kernels
 
 
 all:

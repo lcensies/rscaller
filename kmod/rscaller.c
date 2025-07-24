@@ -288,11 +288,11 @@ static const void* rscaller_ops_ptr = (void*)&rscaller_ops;
 // int syscall_num = __NR_execve;
 
 
-// // KHOOK_EXT(long, __x64_sys_execve, const struct pt_regs *);
-// // static long khook___x64_sys_execve(const struct pt_regs *regs) {
-// //         printk("sys_execve -- %s pid %ld sig %ld\n", current->comm, regs->di, regs->si);
-// //         return KHOOK_ORIGIN(__x64_sys_execve, regs);
-// // }
+// KHOOK_EXT(long, __x64_sys_execve, const struct pt_regs *);
+// static long khook___x64_sys_execve(const struct pt_regs *regs) {
+//         printk("sys_execve -- %s pid %ld sig %ld\n", current->comm, regs->di, regs->si);
+//         return KHOOK_ORIGIN(__x64_sys_execve, regs);
+// }
 
 // // int init_hooks(void) {
 // // 	__sys_call_table = get_syscall_table();
