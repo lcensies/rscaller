@@ -8,6 +8,8 @@
 
 // TODO: include syscall entries in codegen
 
+void fetch_param_variant(SyscallParam *src, int param_type, void **param, size_t *param_size);
+
 static int rscaller_dev_mmap_new(struct file *filp, struct vm_area_struct *vma);
 static int rscaller_dev_mmap_old(struct inode *inode, struct file *filp);
 
@@ -21,6 +23,13 @@ const SyscallEntry syscall_entries[] = {
         {	  3,	 {{CHAR_PTR_TYPE,true},{INT_TYPE,false},{UMODE_T_TYPE,false},}},
         NULL,                     
         NULL,             
+    },
+    {                                   
+        62,
+        "kill",
+        {	 1,{{INT_TYPE,false},}},
+        NULL,                     
+        NULL                 
     },
     {                                   
         257,
@@ -37,6 +46,8 @@ const SyscallEntry syscall_entries[] = {
         NULL                 
     }
 };
+
+// // SYSCALL_ENTRY(62,__x64_sys_kill),
 
 // #define SYSCALL_ENTRY(NUM, NAME)                                       \
 //     {                                                   \

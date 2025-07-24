@@ -1,3 +1,4 @@
 execve
 open
 openat
+kill

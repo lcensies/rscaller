@@ -35,7 +35,6 @@ btf:
 	docker ps > /dev/null 2>/dev/null
 	docker run --privileged calico/bpftool /bpftool btf dump file /sys/kernel/btf/vmlinux format c > kmod/vmlinux.h
 
-.PHONY: kmod
 kmod: 
 	${MAKE_CMD} -C ${KMOD_DIR}
 

