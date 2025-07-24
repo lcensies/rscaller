@@ -12,10 +12,11 @@ KDIR := /lib/modules/$(shell uname -r)/build
 obj-m += rscaller.o buffer.o
 # obj-m += ${MODULE_NAME}.o 
 # rscaller-y +=  $(KHOOK_GOALS)
+rscaller-y += main.o $(KHOOK_GOALS)
 # rscaller-y += buffer.o
-ccflags-y += -std=gnu99 
+ccflags-y += -std=gnu99 $(KHOOK_CCFLAGS)
 
-# ldflags-y  += $(KHOOK_LDFLAGS) # use LDFLAGS for old kernels
+ldflags-y  += $(KHOOK_LDFLAGS) # use LDFLAGS for old kernels
 
 
 all:
