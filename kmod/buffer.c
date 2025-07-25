@@ -6,7 +6,7 @@
 
 
 int control_buffer_submit_syscall(Syscall *syscall) {
-    pr_debug("Submitting syscall to control buffer");
+    pr_info("Submitting syscall to control buffer");
     return 0;
 }
 

@@ -255,8 +255,8 @@ bool filter_binary(void) {
 inline int handle_syscall_common(const struct pt_regs *pt_regs,
                                   SyscallSignature *signature,
                                   int *ret) {
+	smap_rw_disable();
 	Syscall *syscall;	
-
 	unsigned long params[6] = {
 		pt_regs->bx,
 		pt_regs->cx,
@@ -275,15 +275,21 @@ inline int handle_syscall_common(const struct pt_regs *pt_regs,
 	}
 
 
-	smap_write_disable();
+	// // smap_write_disable();
 	syscall = save_syscall((unsigned long*)&params, signature);
-	smap_write_enable();
+	// // smap_write_enable();
 
 	*ret = control_buffer_submit_syscall(syscall);
 
+	smap_rw_enable();
 	return 0;
 }
 
+asmlinkage int hooked_syscall___x64_sys_kill(const struct pt_regs *pt_regs);
+
+// Wrapper for calling original syscall based on it's name
+// across different hooking engines
+#define ORIGINAL_SYSCALL(name, regs) KHOOK_ORIGIN(__x64_sys_kill, regs)
 
 #define DEFINE_HOOKED_SYSCALL(name) \
 asmlinkage int hooked_syscall_##name(const struct pt_regs *pt_regs) \
@@ -292,24 +298,25 @@ asmlinkage int hooked_syscall_##name(const struct pt_regs *pt_regs) \
     bool sent_remote; \
     SyscallSignature signature; \
     sent_remote = handle_syscall_common(pt_regs, &signature##name, &ret); \
-    if (!sent_remote) { \
-        return ORIGINAL_SYSCALL(name, pt_regs); \
-    } \
+    ret = ORIGINAL_SYSCALL(name, pt_regs); \
     return ret; \
 }
 
-
-#define ORIGINAL_SYSCALL(name, regs) KHOOK_ORIGIN(__x64_sys_kill, regs)
+// if (!sent_remote) { \
+//     return ORIGINAL_SYSCALL(name, pt_regs); \
+// } \
 
 
 KHOOK_EXT(long, __x64_sys_kill, const struct pt_regs *);
 static long khook___x64_sys_kill(const struct pt_regs *regs) {
         printk("sys_kill -- %s pid %ld sig %ld\n", current->comm, regs->di, regs->si);
-        return ORIGINAL_SYSCALL(__x64_sys_kill, regs);
+		return hooked_syscall___x64_sys_kill(regs);
+        // return ORIGINAL_SYSCALL(__x64_sys_kill, regs);
 }
 
+DEFINE_HOOKED_SYSCALL(__x64_sys_kill)
+
 int init_hooks(void) {
-    DEFINE_HOOKED_SYSCALL(__x64_sys_kill)
 	// __sys_call_table = get_syscall_table();
 	// if (!__sys_call_table)
 	// 	return -1;
