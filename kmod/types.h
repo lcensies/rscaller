@@ -1,6 +1,4 @@
 
-
-
 #ifdef __GENERATING_BINDINGS__
    // Ignore asmlinkage while generating bindings
     #define asmlinkage

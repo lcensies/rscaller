@@ -9,11 +9,11 @@ EXTRA_CFLAGS += -DDIRTY=no
 # Kernel source directory 
 KDIR := /lib/modules/$(shell uname -r)/build
 # Alternatively, create Kbuild file with contents:
-obj-m += rscaller.o buffer.o
+obj-m += rscaller.o 
 # buffer.o
 # obj-m += ${MODULE_NAME}.o 
 # rscaller-y +=  $(KHOOK_GOALS)
-rscaller-y += main.o  $(KHOOK_GOALS) 
+rscaller-y += main.o syscalls.o buffer.o $(KHOOK_GOALS) 
 # rscaller-y += buffer.o
 ccflags-y += -std=gnu99 $(KHOOK_CCFLAGS)
 

@@ -1,5 +1,4 @@
 #include "rscaller.h"
-#include "buffer.h"
 
 #include <linux/syscalls.h>
 #include <linux/dirent.h>
@@ -140,6 +139,7 @@ int save_syscall_param(SyscallParam *buf, long param, int param_idx, const Sysca
 	int type_variant = signature->params_meta[param_idx].type;
 	size_t param_size = signature->params_meta[param_idx].size;
 
+	// TODO: use macro to auto fetch specific variant
 	fetch_param_variant(buf, type_variant, &inner_buf, &param_size);
 
 	// Here we handle all pointers except char buffers

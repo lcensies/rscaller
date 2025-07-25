@@ -14,17 +14,20 @@ __attribute__((__unused__)) static int handle_syscall_<SYSCALL_NUM>(struct kprob
   return handler_entry_wrapper(<SYSCALL_NUM>, kp, regs <BUF_ARG_IDX_PARAMS>);
 }
 """
-OUT_FILE = f"{find_git_root()}/kmod/handler_wrappers.h"
+OUT_FILE_HEADER = f"{find_git_root()}/kmod/handler_wrappers.h"
+OUT_FILE_SRC = f"{find_git_root()}/kmod/syscalls.c"
 FILTER_FILE = "files/forwarded_syscalls"
 
+# TODO: handle problamatic syscalls, enable all by default,
+def get_forwarded_syscalls() -> List[str]:
+    with open(f"{find_git_root()}/{FILTER_FILE}") as f:
+        return [x.strip() for x in f.readlines()]
 
-def generate_handler_wrapper(syscall_num: int, kernel_sources: str, syscall_filters: List[str]) -> str:
+def generate_handler_wrapper(syscall_num: int, kernel_sources: str) -> str:
     if not syscall_exists(syscall_num):
         return ""
 
     syscall_name: str = resolve_syscall_name(syscall_num)
-    if syscall_name not in syscall_filters or syscall_name == "Unknown":
-        return ""
 
     try: 
         buf_arg_idx, buf_size_arg_idx = get_buffer_arguments(syscall_name, kernel_sources)
@@ -63,7 +66,7 @@ def generate_union_variant_fetcher(type_defs: Set[str]) -> str:
     switch_cases: list[str] = [f"case {type_def.upper()}: *param = &src->{type_def}; *param_size = sizeof(src->{type_def}); return;" for type_def in type_defs]
 
     func: str = \
-        "void fetch_param_variant(SyscallParam *src, int param_type, void **param, size_t *param_size) {\n" + \
+        "static inline void fetch_param_variant(SyscallParam *src, int param_type, void **param, size_t *param_size) {\n" + \
         "\tswitch (param_type) {\n\t\t" + \
         "\n\t\t".join(switch_cases) + \
         "\t}\n" + \
@@ -75,16 +78,15 @@ def generate_union_variant_fetcher(type_defs: Set[str]) -> str:
     return generated
          
 
-def generate_types(syscall_definitions: dict, filters: List[str]) -> str:
+def generate_header_file(active_syscalls: dict, kernel_sources: str) -> str:
     # syscall name -> count / union type
     param_types_dict: dict[str, tuple[int, str]] = {}
     # type -> type name
     arg_type_names: dict[str, str] = {} 
 
-    active_syscalls: dict = {k: v for k, v in syscall_definitions.items() if k in filters}
 
-    for d in active_syscalls.values():
-        for arg in d.arguments:
+    for sc_def in active_syscalls.values():
+        for arg in sc_def.arguments:
 
             arg_type_real: str = arg.type 
             ptr_suffix: str = ""
@@ -114,13 +116,16 @@ def generate_types(syscall_definitions: dict, filters: List[str]) -> str:
     
     generated += generate_params_enum(sorted_type_names)
     generated += generate_union_variant_fetcher(sorted_type_names)
-    generated += generate_syscalls_meta(active_syscalls)
-    
+    generated += generate_syscall_extern_defs(active_syscalls)
+
+    funcs: List[str] = [generate_handler_wrapper(i, kernel_sources) for i in range(N_SYSCALLS + 1)]
+    funcs = [x for x in funcs if x != ""]
+    generated += "\n" + "".join(funcs)
+
     return generated
 
-
 def generate_syscalls_meta(syscalls: Dict[str, SyscallDefinition]) -> str:
-    generated: str = ""
+    signatures: str = ""
 
     def generate_syscall_args(args: List[SyscallArgument]) -> str:
         generated: str = "{"
@@ -138,33 +143,45 @@ def generate_syscalls_meta(syscalls: Dict[str, SyscallDefinition]) -> str:
 
         return generated
 
-    def generate_syscall_meta(syscall: SyscallDefinition) -> str:
-        generated: str = ""
-        generated = f"SyscallSignature signature__x64_sys_{syscall.name}= " + "{"
-        generated += f"\t.n_params =  {len(syscall.arguments)}," 
-        generated += f"\t.params_meta= {generate_syscall_args(syscall.arguments)}" + "};\n" 
 
-        return generated
+    def generate_syscall_meta(syscall: SyscallDefinition) -> tuple[str, str]:
+        variable_name: str = generate_syscall_var(syscall.name)
+        signature: str = ""
+        signature = f"{variable_name} = " + "{"
+        signature += f"\t.n_params =  {len(syscall.arguments)}," 
+        signature += f"\t.params_meta= {generate_syscall_args(syscall.arguments)}" + "};\n" 
+
+        return signature
 
     for syscall in syscalls.values():
-        generated += generate_syscall_meta(syscall)
+        definition = generate_syscall_meta(syscall)
+        signatures += definition
 
-    return generated
+    return signatures
 
-def get_forwarded_syscalls() -> List[str]:
-    with open(f"{find_git_root()}/{FILTER_FILE}") as f:
-        return [x.strip() for x in f.readlines()]
+def generate_syscall_var(syscall_name: str) -> str:
+    return f"SyscallSignature signature__x64_sys_{syscall_name}"
 
+def generate_extern(var: str) -> str:
+    return f"extern {var};\n"
 
-def generate_wrappers(syscall_map: dict, kernel_sources: str, syscalls_filters: List[str]):
-    funcs: List[str] = [generate_handler_wrapper(i, kernel_sources, syscalls_filters) for i in range(N_SYSCALLS + 1)]
-    funcs = [x for x in funcs if x != ""]
+def generate_syscall_extern_defs(syscalls: list[SyscallDefinition]):
+    return "".join([generate_extern(generate_syscall_var(x)) for x in syscalls])
+
+def generate_source_file(syscalls: dict):
+    generated = "#include \"types.h\"\n"
+    generated += generate_syscalls_meta(syscalls)
+    return generated 
+
+# header_content -> source_content 
+def generate_wrappers(syscall_map: dict, kernel_sources: str, syscalls_filters: List[str]) -> tuple[str, str]:
+    active_syscalls: dict = {k: v for k, v in syscall_map.items() if k in syscalls_filters and k != "Unknown"}
     
-    union = generate_types(syscall_map, syscalls_filters)
+    header = generate_header_file(active_syscalls, kernel_sources)
+    source_file = generate_source_file(active_syscalls)
 
-    return union + "\n" + "".join(funcs)
+    return header, source_file
        
-# TODO: ADD
 
 # typedef struct {
 #   // ParamMeta meta;
@@ -177,15 +194,18 @@ def generate_wrappers(syscall_map: dict, kernel_sources: str, syscalls_filters: 
 # } Syscall;
 
 def main():
+    # TODO: use BTF instead of kernel sources
     kernel_sources: str = f"{find_git_root()}/linux"
-    # kernel_sources = sys.argv[1]
     syscall_map = find_syscall_definitions(kernel_sources)
     forwarded_syscalls: list[str] = get_forwarded_syscalls()
 
-    generated: str = generate_wrappers(syscall_map, kernel_sources, forwarded_syscalls)
+    gen_header, gen_src = generate_wrappers(syscall_map, kernel_sources, forwarded_syscalls)
 
-    with open(OUT_FILE, "w+") as f:
-        f.write(generated)
+    with open(OUT_FILE_HEADER, "w+") as f:
+        f.write(gen_header)
+
+    with open(OUT_FILE_SRC, "w+") as f:
+        f.write(gen_src)
 
 if __name__ == "__main__":
     main()

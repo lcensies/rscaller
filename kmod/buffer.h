@@ -19,7 +19,7 @@ typedef struct ControlBuffer {
 
 ControlBuffer* control_buffer_new(void);
 
-ControlBuffer *global_control_buffer;
+static ControlBuffer *global_control_buffer;
 int control_buffer_submit_syscall(Syscall *syscall);
 
 
