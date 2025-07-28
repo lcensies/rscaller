@@ -3,22 +3,21 @@
 // TODO: parametrize
 #define BUFFER_PATH "/tmp/rscaller_buf"
 
-
 void control_buffer_init(ControlBuffer *cb) {
     cb->kernel_to_user.size = 0;
     cb->user_to_kernel.size = 0;
 }
 
 int control_buffer_submit_syscall(ControlBuffer *cb, Syscall *syscall) {
-    pr_info("Submitting syscall to control buffer");
-    mem_queue_push(&cb->kernel_to_user, syscall)
+    RSC_LOG("Submitting syscall to control buffer");
+    mem_queue_push(&cb->kernel_to_user, syscall);
     return 0;
 }
 
 
 MemoryQueue* mem_queue_new(void)
 {
-    MemoryQueue *queue = kmalloc(sizeof(*queue), GFP_KERNEL);
+    MemoryQueue *queue = RSC_MALLOC(sizeof(*queue));
     if (!queue)
         return NULL;
 
@@ -30,7 +29,7 @@ MemoryQueue* mem_queue_new(void)
 
 void mem_queue_free(MemoryQueue *queue)
 {
-    kfree(queue);
+    RSC_FREE(queue);
 }
 
 inline void mem_queue_node_init(Syscall *node, Syscall *syscall) {
@@ -47,7 +46,7 @@ inline void mem_queue_node_free(Syscall *node) {
 Syscall* mem_queue_node_copy(Syscall *src) {
     Syscall *ret;
 
-    ret = kmalloc(sizeof(Syscall), GFP_KERNEL);
+    ret = RSC_MALLOC(sizeof(Syscall));
     memcpy(ret, src, sizeof(Syscall));
 
     return ret;
@@ -58,7 +57,7 @@ int mem_queue_push(MemoryQueue *queue, Syscall *syscall)
     Syscall *node;
 
     if (queue->size == BUFFER_SIZE) {
-        pr_debug("Memory queue is full");
+        RSC_LOG("Memory queue is full");
         return -1;
     }
 
@@ -90,6 +89,8 @@ Syscall* mem_queue_pop(MemoryQueue *queue)
     return ret;
 }
 
+#ifndef __GENERATING_BINDINGS__
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("your mom");
 MODULE_DESCRIPTION("Rscaller kmod");
+#endif

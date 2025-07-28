@@ -3,6 +3,24 @@
 
 #include "types.h"
 
+#ifdef __USERSPACE__
+#include <stddef.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#endif
+
+#ifdef __USERSPACE__
+#define RSC_LOG printf
+#define RSC_MALLOC(n) malloc(n)
+#define RSC_FREE(n) free(n)
+#else
+#define RSC_LOG pr_debug
+#define RSC_MALLOC(n) kmalloc(n, GFP_KERNEL)
+#define RSC_FREE(n) kfree(n)
+#endif
+
+
 #define BUFFER_SIZE 1024
 
 
@@ -23,7 +41,7 @@ static ControlBuffer global_control_buffer;
 void control_buffer_init(ControlBuffer *cb);
 void control_buffer_free(ControlBuffer *cb);
 
-int control_buffer_submit_syscall(Syscall *syscall);
+int control_buffer_submit_syscall(ControlBuffer *cb, Syscall *syscall);
 
 
 // Initialize ring buffer

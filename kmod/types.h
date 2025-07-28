@@ -1,8 +1,12 @@
+typedef unsigned long	__kernel_size_t;
+typedef __kernel_size_t size_t;
+typedef unsigned short umode_t;
 
 #ifdef __GENERATING_BINDINGS__
    // Ignore asmlinkage while generating bindings
     #define asmlinkage
     // #include "vmlinux.h"
+    #include <linux/types.h>
     #include "vmlinux_stripped.h"
 #else
     // #include <linux/sched.h>

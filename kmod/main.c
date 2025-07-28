@@ -145,7 +145,7 @@ int save_syscall_param(SyscallParam *buf, long param, int param_idx, const Sysca
 	// Here we handle all pointers except char buffers
 	// param_size is taken from real size of struct
 	if (is_ptr) {
-		// pr_info("Trying to allocate %d bytes\n", param_size);
+		// RSC_LOG("Trying to allocate %d bytes\n", param_size);
         src_kernel = kvmalloc(param_size, GFP_KERNEL);
         if (!src_kernel) {
             pr_err("Failed to allocate temp buf for syscall");
@@ -185,7 +185,7 @@ Syscall* save_syscall(unsigned long *params, const SyscallSignature *signature) 
 	smap_rw_disable();
 	for(i = 0; i < signature->n_params; i++) {
 
-		pr_info("Trying to save param %d", i);
+		RSC_LOG("Trying to save param %d", i);
 		ret = save_syscall_param(&(syscall->param_bufs[i]), params[i], i, signature);
 		if (ret == -1) {
 			pr_err("Failed to save syscall params");
@@ -194,7 +194,7 @@ Syscall* save_syscall(unsigned long *params, const SyscallSignature *signature) 
 	}
 	smap_rw_enable();
 
-	pr_info("Saved syscall params");
+	RSC_LOG("Saved syscall params");
 
 err:
 	kfree(syscall);
@@ -245,7 +245,7 @@ bool filter_binary(void) {
 	is_filtered = !strstr(binary, REMOTE_PROGS_FOLDER);
 	
 	if (!is_filtered) {
-		pr_info("%s performed syscall\n", binary);	
+		RSC_LOG("%s performed syscall\n", binary);	
 	}
 	
 	kvfree(binary);
@@ -266,7 +266,7 @@ inline int handle_syscall_common(const struct pt_regs *pt_regs,
 		pt_regs->bp,
 	};
     
-    pr_info("handle_syscall_common");
+    RSC_LOG("handle_syscall_common");
 
 	// Binary is outside of remote_progs folder
 	if (!filter_binary()) {
@@ -366,7 +366,7 @@ struct mmap_info {
 /* After unmap. */
 static void vm_close(struct vm_area_struct *vma)
 {
-    pr_info("vm_close\n");
+    RSC_LOG("vm_close\n");
 }
 
 /* First page access. */
@@ -375,7 +375,7 @@ static vm_fault_t vm_fault(struct vm_fault *vmf)
     struct page *page;
     struct mmap_info *info;
 
-    pr_info("vm_fault\n");
+    RSC_LOG("vm_fault\n");
     info = (struct mmap_info *)vmf->vma->vm_private_data;
     if (info->data) {
         page = virt_to_page(info->data);
@@ -388,7 +388,7 @@ static vm_fault_t vm_fault(struct vm_fault *vmf)
 /* After mmap. TODO vs mmap, when can this happen at a different time than mmap? */
 static void vm_open(struct vm_area_struct *vma)
 {
-    pr_info("vm_open\n");
+    RSC_LOG("vm_open\n");
 }
 
 static struct vm_operations_struct vm_ops =
@@ -403,13 +403,13 @@ static struct vm_operations_struct vm_ops =
 
 
 static int rscaller_dev_mmap_old(struct inode *inodp, struct file *filp) {
-    pr_info("rscaller_dev_mmap_old");
+    RSC_LOG("rscaller_dev_mmap_old");
 	return 0;
 }
 
 static int rscaller_dev_mmap_new(struct file *filp, struct vm_area_struct *vma)
 {
-    // pr_info("mmap\n");
+    // RSC_LOG("mmap\n");
     // vma->vm_ops = &vm_ops;
     // // vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
     // vma->vm_private_data = filp->private_data;
@@ -421,7 +421,7 @@ static int rscaller_dev_release_new(struct inode *inode, struct file *filp)
 {
     struct mmap_info *info;
 
-    pr_info("release\n");
+    RSC_LOG("release\n");
     info = filp->private_data;
     free_page((unsigned long)info->data);
     kfree(info);
