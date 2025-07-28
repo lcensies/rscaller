@@ -17,9 +17,12 @@ typedef struct ControlBuffer {
     MemoryQueue user_to_kernel;
 } ControlBuffer;
 
-ControlBuffer* control_buffer_new(void);
+static ControlBuffer global_control_buffer;
 
-static ControlBuffer *global_control_buffer;
+// ControlBuffer* control_buffer_new(void);
+void control_buffer_init(ControlBuffer *cb);
+void control_buffer_free(ControlBuffer *cb);
+
 int control_buffer_submit_syscall(Syscall *syscall);
 
 

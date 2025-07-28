@@ -2,7 +2,8 @@
 #ifdef __GENERATING_BINDINGS__
    // Ignore asmlinkage while generating bindings
     #define asmlinkage
-    #include "vmlinux.h"
+    // #include "vmlinux.h"
+    #include "vmlinux_stripped.h"
 #else
     // #include <linux/sched.h>
     #include <linux/module.h>

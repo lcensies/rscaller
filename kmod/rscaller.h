@@ -1,6 +1,9 @@
-// #include <stddef.h>
+typedef unsigned long	__kernel_size_t;
+typedef __kernel_size_t size_t;
+typedef unsigned short umode_t;
+
 #include "buffer.h"
-// #include "types.h"
+
 
 #define MODULE_NAME "rscaller"
 

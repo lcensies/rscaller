@@ -4,9 +4,14 @@
 #define BUFFER_PATH "/tmp/rscaller_buf"
 
 
+void control_buffer_init(ControlBuffer *cb) {
+    cb->kernel_to_user.size = 0;
+    cb->user_to_kernel.size = 0;
+}
 
-int control_buffer_submit_syscall(Syscall *syscall) {
+int control_buffer_submit_syscall(ControlBuffer *cb, Syscall *syscall) {
     pr_info("Submitting syscall to control buffer");
+    mem_queue_push(&cb->kernel_to_user, syscall)
     return 0;
 }
 

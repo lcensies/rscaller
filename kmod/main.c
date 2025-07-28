@@ -344,7 +344,8 @@ static int __init rscaller_init(void)
 		pr_err("Failed to register hooks");
 		return ret;
 	}
-    
+	
+	control_buffer_init(&global_control_buffer);
     proc_create(DEVICE_NAME, 0, NULL, rscaller_ops_ptr);
 
     return 0;
