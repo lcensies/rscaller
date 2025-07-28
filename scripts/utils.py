@@ -1,5 +1,9 @@
 import os 
 
+def read_file(path: str) -> str:
+    with open(path, 'r') as f:
+        return f.read()
+
 def find_git_root(start_path="."):
     """
     Find the Git repository root directory by walking upwards from start_path.
