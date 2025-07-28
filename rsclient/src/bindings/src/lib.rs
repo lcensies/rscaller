@@ -1,27 +1,15 @@
-use std::path::PathBuf;
-use std::process::Command;
-use std::io;
+#![allow(non_upper_case_globals)]
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+
 pub mod bindings;
+use utils::*;
 
-// Function to get the Git root directory
-pub fn get_git_root() -> io::Result<PathBuf> {
-    // Execute the git command to get the root directory
-    let output = Command::new("git")
-        .arg("rev-parse")
-        .arg("--show-toplevel")
-        .output()?;
-
-    // Convert the stdout output to a String and trim it
-    let git_root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    // Convert the String to a PathBuf and return
-    Ok(PathBuf::from(git_root))
-}
 
 pub fn generate_bindings(input_header: &str, output_file: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = bindgen::Builder::default();
     
-    let git_root: String = get_git_root()?.display().to_string();
+    let git_root: String = get_git_root()?;
     builder = builder.header(input_header);
     
     

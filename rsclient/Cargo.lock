@@ -36,6 +36,8 @@ name = "bindings"
 version = "0.1.0"
 dependencies = [
  "bindgen",
+ "libloading",
+ "utils",
 ]
 
 [[package]]
@@ -43,6 +45,24 @@ name = "bitflags"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c8214115b7bf84099f1309324e63141d4c5d7cc26862f97a0a857dbefe165bd"
+
+[[package]]
+name = "buffer"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libloading",
+ "utils",
+]
+
+[[package]]
+name = "cc"
+version = "1.2.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "deec109607ca693028562ed836a5f1c4b8bd77755c4e132fc5ce11b0b6211ae7"
+dependencies = [
+ "shlex",
+]
 
 [[package]]
 name = "cexpr"
@@ -76,8 +96,11 @@ version = "0.1.0"
 dependencies = [
  "bindgen",
  "bindings",
+ "buffer",
  "io-uring",
+ "libloading",
  "memmap",
+ "utils",
 ]
 
 [[package]]
@@ -120,9 +143,9 @@ checksum = "d750af042f7ef4f724306de029d18836c26c1765a54a6a3f094cbd23a7267ffa"
 
 [[package]]
 name = "libloading"
-version = "0.8.6"
+version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
+checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
  "windows-targets",
@@ -251,6 +274,10 @@ name = "unicode-ident"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a5f39404a5da50712a4c1eecf25e90dd62b613502b7e925fd4e4d19b5c96512"
+
+[[package]]
+name = "utils"
+version = "0.1.0"
 
 [[package]]
 name = "winapi"

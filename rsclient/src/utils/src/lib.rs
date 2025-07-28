@@ -1,12 +1,14 @@
 use std::process::Command;
+use std::path::PathBuf;
+use std::io;
 
 // Function to get the Git root directory
-fn get_git_root() -> io::Result<PathBuf> {
+pub fn get_git_root() -> io::Result<String> {
     let output = Command::new("git")
         .arg("rev-parse")
         .arg("--show-toplevel")
         .output()?;
 
-    let git_root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(PathBuf::from(git_root))
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    // Ok(PathBuf::from(git_root))
 }

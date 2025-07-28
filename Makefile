@@ -1,5 +1,6 @@
 PWD := $(shell pwd)
 KMOD_DIR := kmod
+KMOD_ABS_DIR := ${PWD}/kmod
 SCRIPTS_DIR := scripts
 BINDGEN_DIR := rsclient/src/bindings/src
 
@@ -12,6 +13,8 @@ MAKE_IMAGE := archlinux:base-devel-20250720.0.386825
 
 MAKE_CMD := docker run --rm -it ${COMMON_VOLUMES} -w /app ${MAKE_IMAGE} make
 
+BUFFER_HEADER_PATH := ${KMOD_ABS_DIR}/buffer_header_only.h
+
 .PHONY: kmod kmod_reload
 
 # TODO: download linux kernel sources
@@ -20,9 +23,15 @@ MAKE_CMD := docker run --rm -it ${COMMON_VOLUMES} -w /app ${MAKE_IMAGE} make
 configure: btf bindings handlers
 # 	sudo dnf install kernel-devel-$(uname -r)
 	git submodule update --init --remote
+	cargo install --git https://github.com/lcensies/libloading-bindgen --bin cargo-libloading-bindgen
+	cargo install single-header
 
+.PHONY: bindings
 bindings:
-	cd ${BINDGEN_DIR} && cargo run ${PWD}/kmod/rscaller.h
+# 	cd ${BINDGEN_DIR} && cargo run ${PWD}/kmod/rscaller.h
+# TODO: move buffer to lib folder
+	single-header ${KMOD_ABS_DIR}/buffer.c -- -D__GENERATING_BINDINGS__ -D__USERSPACE__ > ${BUFFER_HEADER_PATH}
+	cargo-libloading-bindgen ${BUFFER_HEADER_PATH} | rustfmt > ${BINDGEN_DIR}/bindings.rs
 
 
 handlers:

@@ -8,4 +8,7 @@ edition = "2024"
 bindgen = "0.71.1"
 io-uring = "0.7.4"
 bindings = { path = "./src/bindings" }
+buffer  = { path = "./src/buffer" }
+utils = { path = "./src/utils" }
 memmap = "0.7.0"
+libloading = "0.8.8"
