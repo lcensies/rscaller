@@ -22,7 +22,7 @@ configure: btf bindings handlers
 	git submodule update --init --remote
 
 bindings:
-	cd ${BINDGEN_DIR} && cargo run ${KMOD_DIR}/rscaller.h
+	cd ${BINDGEN_DIR} && cargo run ${PWD}/kmod/rscaller.h
 
 
 handlers:

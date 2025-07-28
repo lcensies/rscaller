@@ -4,8 +4,8 @@ use std::process::Command;
 use std::path::PathBuf;
 use bindings::generate_bindings;
 
-const GENERATED_FILE: &str = "bindings.rs";
-const KMOD_HEADER_FILE: &str = "kmod/preprocessed.h";
+const GENERATED_FILE: &str = "generated.rs";
+// const KMOD_HEADER_FILE: &str = "kmod/vmlinux.h";
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();

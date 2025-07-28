@@ -1,8 +1,7 @@
-
 use std::path::PathBuf;
 use std::process::Command;
 use std::io;
-
+pub mod bindings;
 
 // Function to get the Git root directory
 pub fn get_git_root() -> io::Result<PathBuf> {
@@ -36,17 +35,17 @@ pub fn generate_bindings(input_header: &str, output_file: &str) -> Result<(), Bo
             // format!("-I{}/arch/asm-generic", kernel_sources).as_str(),
             // format!("-I{}/include", kernel_sources).as_str(),
             // format!("-I{}/arch/x86/include/uapi", kernel_sources).as_str(),
-            "-D__KERNEL__",          
-            "-D__LINUX_SPINLOCK_H",
-            "-D_LINUX_JIFFIES_H",
-            "-DMODULE",                    // Some headers expect this
-            "-D__GENERATING_BINDINGS__", // Get rid of asmlinkage attribute
             // "-U__i386__",                 
             // "-Ux86_64",                   
             // "-D__x86_64__",    
-            "-DCONFIG_64BIT",       
-            "-D__ASM_SYSREG_H__",
+            "-D__KERNEL__",          
+            // "-D__LINUX_SPINLOCK_H",
+            // "-D_LINUX_JIFFIES_H",
+            "-DMODULE",                    // Some headers expect this
+            "-D__GENERATING_BINDINGS__", // Get rid of asmlinkage attribute
             "--target=x86_64-linux-gnu"
+            // "-DCONFIG_64BIT",       
+            // "-D__ASM_SYSREG_H__",
     ]).generate().expect("Unable to generate bindings");
     
     // Generate bindings
