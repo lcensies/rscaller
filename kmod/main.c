@@ -50,6 +50,7 @@ unsigned long init_begin;
 
 #ifdef HAVE_PROC_OPS
 static const struct proc_ops rscaller_ops = {
+	.proc_open = rscaller_dev_open_new,
     .proc_mmap = rscaller_dev_mmap_new,
     .proc_release = rscaller_dev_release_new,
 };
@@ -185,7 +186,7 @@ Syscall* save_syscall(unsigned long *params, const SyscallSignature *signature) 
 	smap_rw_disable();
 	for(i = 0; i < signature->n_params; i++) {
 
-		RSC_LOG("Trying to save param %d", i);
+		RSC_LOG("rscaller: Trying to save param %d", i);
 		ret = save_syscall_param(&(syscall->param_bufs[i]), params[i], i, signature);
 		if (ret == -1) {
 			pr_err("Failed to save syscall params");
@@ -194,7 +195,7 @@ Syscall* save_syscall(unsigned long *params, const SyscallSignature *signature) 
 	}
 	smap_rw_enable();
 
-	RSC_LOG("Saved syscall params");
+	RSC_LOG("rscaller: Saved syscall params");
 
 err:
 	kfree(syscall);
@@ -279,7 +280,7 @@ inline int handle_syscall_common(const struct pt_regs *pt_regs,
 	syscall = save_syscall((unsigned long*)&params, signature);
 	// // smap_write_enable();
 
-	*ret = control_buffer_submit_syscall(syscall);
+	*ret = control_buffer_submit_syscall(&global_ctl_buffer, syscall);
 
 	smap_rw_enable();
 	return 0;
@@ -333,19 +334,78 @@ void cleanup_hooks(void) {
 	khook_cleanup();
 }
 
+static int rscaller_dev_open_new(struct inode *inodep, struct file *filep) {
+    int ret = 0; 
+
+    if(!mutex_trylock(&ctl_buffer_mutex)) {
+        RSC_LOG("rscaller: device busy!\n");
+        ret = -EBUSY;
+        goto out;
+    }
+ 
+    RSC_LOG("rscaller: device opened\n");
+
+out:
+    return ret;
+}
+
+
+static int rscaller_dev_mmap_old(struct inode *inodp, struct file *filp) {
+    RSC_LOG("rscaller_dev_mmap_old");
+	return 0;
+}
+
+static int rscaller_dev_mmap_new(struct file *filp, struct vm_area_struct *vma)
+{
+    int ret = 0;
+    struct page *page = NULL;
+    unsigned long size = (unsigned long)(vma->vm_end - vma->vm_start);
+
+    if (size > sizeof(ControlBuffer)) {
+        ret = -EINVAL;
+        goto out;  
+    } 
+   
+    page = virt_to_page((unsigned long)&global_ctl_buffer + (vma->vm_pgoff << PAGE_SHIFT)); 
+    ret = remap_pfn_range(vma, vma->vm_start, page_to_pfn(page), size, vma->vm_page_prot);
+    if (ret != 0) {
+        goto out;
+    }   
+
+out:
+    return ret;
+    return 0;
+}
+
+static int rscaller_dev_release_new(struct inode *inode, struct file *filp)
+{
+    struct mmap_info *info;
+
+    RSC_LOG("rscaller: release\n");
+
+    info = filp->private_data;
+    free_page((unsigned long)info->data);
+    kfree(info);
+    filp->private_data = NULL;
+
+	mutex_unlock(&ctl_buffer_mutex);
+
+    return 0;
+}
+
 
 static int __init rscaller_init(void)
 {
 	int ret;
 
-	printk("Rscaller init");
+	RSC_LOG("Rscaller init");
 
-	if (ret = init_hooks()) {
-		pr_err("Failed to register hooks");
-		return ret;
-	}
+	// if (ret = init_hooks()) {
+	// 	pr_err("Failed to register hooks");
+	// 	return ret;
+	// }
 	
-	control_buffer_init(&global_control_buffer);
+	control_buffer_init(&global_ctl_buffer);
     proc_create(DEVICE_NAME, 0, NULL, rscaller_ops_ptr);
 
     return 0;
@@ -358,11 +418,6 @@ static void __exit rscaller_cleanup(void)
 	remove_proc_entry(DEVICE_NAME, NULL);
 }
 
-
-struct mmap_info {
-    char *data;
-};
-
 /* After unmap. */
 static void vm_close(struct vm_area_struct *vma)
 {
@@ -370,64 +425,36 @@ static void vm_close(struct vm_area_struct *vma)
 }
 
 /* First page access. */
-static vm_fault_t vm_fault(struct vm_fault *vmf)
-{
-    struct page *page;
-    struct mmap_info *info;
+// static vm_fault_t vm_fault(struct vm_fault *vmf)
+// {
+//     struct page *page;
+//     struct mmap_info *info;
 
-    RSC_LOG("vm_fault\n");
-    info = (struct mmap_info *)vmf->vma->vm_private_data;
-    if (info->data) {
-        page = virt_to_page(info->data);
-        get_page(page);
-        vmf->page = page;
-    }
-    return 0;
-}
+//     RSC_LOG("vm_fault\n");
+//     info = (struct mmap_info *)vmf->vma->vm_private_data;
+//     if (info->data) {
+//         page = virt_to_page(info->data);
+//         get_page(page);
+//         vmf->page = page;
+//     }
+//     return 0;
+// }
 
 /* After mmap. TODO vs mmap, when can this happen at a different time than mmap? */
-static void vm_open(struct vm_area_struct *vma)
-{
-    RSC_LOG("vm_open\n");
-}
+// static void rscaller_dev_open_new(struct vm_area_struct *vma)
+// {
+//     RSC_LOG("vm_open\n");
+// }
 
-static struct vm_operations_struct vm_ops =
-{
-    .close = vm_close,
-    .fault = vm_fault,
-    .open = vm_open,
-};
+// static struct vm_operations_struct vm_ops =
+// {
+//     .close = vm_close,
+//     .fault = vm_fault,
+//     .open = vm_open,
+// };
 
 // https://github.com/cirosantilli/linux-kernel-module-cheat/blob/2ea5e17d23553334c23934d83965de8a47df3780/kernel_modules/mmap.c
 
-
-
-static int rscaller_dev_mmap_old(struct inode *inodp, struct file *filp) {
-    RSC_LOG("rscaller_dev_mmap_old");
-	return 0;
-}
-
-static int rscaller_dev_mmap_new(struct file *filp, struct vm_area_struct *vma)
-{
-    // RSC_LOG("mmap\n");
-    // vma->vm_ops = &vm_ops;
-    // // vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
-    // vma->vm_private_data = filp->private_data;
-    vm_open(vma);
-    return 0;
-}
-
-static int rscaller_dev_release_new(struct inode *inode, struct file *filp)
-{
-    struct mmap_info *info;
-
-    RSC_LOG("release\n");
-    info = filp->private_data;
-    free_page((unsigned long)info->data);
-    kfree(info);
-    filp->private_data = NULL;
-    return 0;
-}
 
 
 module_init(rscaller_init);

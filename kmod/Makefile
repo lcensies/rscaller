@@ -13,7 +13,7 @@ obj-m += rscaller.o
 # buffer.o
 # obj-m += ${MODULE_NAME}.o 
 # rscaller-y +=  $(KHOOK_GOALS)
-rscaller-y += main.o syscalls.o buffer.o $(KHOOK_GOALS) 
+rscaller-y += buffer.o  buffer_device.o syscalls.o  $(KHOOK_GOALS) main.o
 # rscaller-y += buffer.o
 ccflags-y += -std=gnu99 $(KHOOK_CCFLAGS)
 
@@ -23,11 +23,15 @@ ldflags-y  += $(KHOOK_LDFLAGS) # use LDFLAGS for old kernels
 all:
 	$(MAKE) -C $(KDIR) M=${KMOD_DIR} modules 
 
-insert:
+
+unload:
 	rmmod  ${MODULE_NAME} || :
+
+insert: unload
 	insmod ${MODULE_NAME}.ko
 
 reload: all insert
+
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean

@@ -23,6 +23,16 @@ typedef unsigned short umode_t;
     #include <asm/posix_types.h>
 #endif
 
+#ifdef __USERSPACE__
+#define RSC_LOG printf
+#define RSC_MALLOC(n) malloc(n)
+#define RSC_FREE(n) free(n)
+#else
+#define RSC_LOG pr_info
+#define RSC_MALLOC(n) kmalloc(n, GFP_KERNEL)
+#define RSC_FREE(n) kfree(n)
+#endif
+
 #ifndef RSCALLER_TYPES
 
 #define RSCALLER_TYPES
@@ -40,6 +50,7 @@ typedef struct {
   int n_params;
   ParamMeta params_meta[6]; 
 } SyscallSignature;
+
 
 #include "handler_wrappers.h"
 

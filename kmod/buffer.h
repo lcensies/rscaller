@@ -10,16 +10,6 @@
 #include <stdlib.h>
 #endif
 
-#ifdef __USERSPACE__
-#define RSC_LOG printf
-#define RSC_MALLOC(n) malloc(n)
-#define RSC_FREE(n) free(n)
-#else
-#define RSC_LOG pr_debug
-#define RSC_MALLOC(n) kmalloc(n, GFP_KERNEL)
-#define RSC_FREE(n) kfree(n)
-#endif
-
 
 #define BUFFER_SIZE 1024
 
@@ -35,7 +25,9 @@ typedef struct ControlBuffer {
     MemoryQueue user_to_kernel;
 } ControlBuffer;
 
-static ControlBuffer global_control_buffer;
+static ControlBuffer global_ctl_buffer;
+static DEFINE_MUTEX(ctl_buffer_mutex);
+
 
 // ControlBuffer* control_buffer_new(void);
 void control_buffer_init(ControlBuffer *cb);

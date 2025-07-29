@@ -50,6 +50,9 @@ kmod:
 kmod_reload: 
 	cd ${KMOD_DIR} && sudo make reload
 
+kmod_unload: 
+	cd ${KMOD_DIR} && sudo make unload
+
 dev-env:
 	docker build -t rscaller-devcont -f docker/devcontainer.Dockerfile .
 	docker volume create rscaller_cache 2>/dev/null || :

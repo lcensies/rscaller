@@ -4,6 +4,8 @@
 #define BUFFER_PATH "/tmp/rscaller_buf"
 
 void control_buffer_init(ControlBuffer *cb) {
+    RSC_LOG("rscaller: Initializing control buffer");
+    
     cb->kernel_to_user.size = 0;
     cb->user_to_kernel.size = 0;
 }
