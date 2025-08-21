@@ -3,19 +3,11 @@
 // TODO: parametrize
 #define BUFFER_PATH "/tmp/rscaller_buf"
 
-void control_buffer_init(ControlBuffer *cb) {
-    RSC_LOG("rscaller: Initializing control buffer");
-    
-    cb->kernel_to_user.size = 0;
-    cb->user_to_kernel.size = 0;
+void mem_queue_init(MemoryQueue *queue) {
+    memset(queue, 0, sizeof(MemoryQueue));
+    queue->max_size = BUFFER_SIZE;
+    mutex_init(&queue->lock);
 }
-
-int control_buffer_submit_syscall(ControlBuffer *cb, Syscall *syscall) {
-    RSC_LOG("Submitting syscall to control buffer");
-    mem_queue_push(&cb->kernel_to_user, syscall);
-    return 0;
-}
-
 
 MemoryQueue* mem_queue_new(void)
 {
@@ -23,9 +15,7 @@ MemoryQueue* mem_queue_new(void)
     if (!queue)
         return NULL;
 
-    queue->head = queue->nodes;
-    queue->size = 0;
-
+    mem_queue_init(queue);
     return queue;
 }
 
@@ -48,7 +38,16 @@ inline void mem_queue_node_free(Syscall *node) {
 Syscall* mem_queue_node_copy(Syscall *src) {
     Syscall *ret;
 
+    if (!src) {
+        RSC_LOG("rscaller: mem_queue_node_copy: src is NULL");
+        return NULL;
+    }
+
     ret = RSC_MALLOC(sizeof(Syscall));
+    if (!ret) {
+        RSC_LOG("rscaller: mem_queue_node_copy: allocation failed");
+        return NULL;
+    }
     memcpy(ret, src, sizeof(Syscall));
 
     return ret;
@@ -56,38 +55,65 @@ Syscall* mem_queue_node_copy(Syscall *src) {
 
 int mem_queue_push(MemoryQueue *queue, Syscall *syscall)
 {
-    Syscall *node;
-
-    if (queue->size == BUFFER_SIZE) {
-        RSC_LOG("Memory queue is full");
-        return -1;
+    int ret = 0;
+    mutex_lock(&queue->lock);
+    if (queue->size == queue->max_size) {
+        RSC_LOG("rscaller: Memory queue is full");
+        ret = -1;
+        goto out;
     }
 
-
+    queue->tail_idx = (queue->tail_idx + queue->max_size - 1) % queue->max_size;
+    mem_queue_node_init(&(queue->nodes[queue->tail_idx]), syscall);
     queue->size += 1;
-    node = queue->head + sizeof(Syscall);
-    queue->head = node;
 
-    mem_queue_node_init(node, syscall);
-
-    return 0;
+out:
+    mutex_unlock(&queue->lock);
+    return ret;
 }
 
 Syscall* mem_queue_pop(MemoryQueue *queue)
 {
     Syscall *node, *ret;
     
+    mutex_lock(&queue->lock);
     if (queue->size == 0) {
-        return NULL;
+        RSC_LOG("rscaller: Memory queue is empty");
+        ret = NULL;
+        goto out;
     }
 
-    node = queue->head;
+    queue->head_idx = (queue->head_idx + queue->max_size - 1) % queue->max_size;
     queue->size -= 1;
-    queue->head -= sizeof(Syscall);
+    ret = mem_queue_node_copy(&(queue->nodes[queue->head_idx]));
 
-    ret = mem_queue_node_copy(node);
-    mem_queue_node_free(node);
+out:
+    mutex_unlock(&queue->lock);
+    return ret;
+}
 
+
+void control_buffer_init(ControlBuffer *cb) {
+    RSC_LOG("rscaller: control_buffer_init");
+    mem_queue_init(&cb->kernel_to_user);
+    mem_queue_init(&cb->user_to_kernel);
+}
+
+ControlBuffer* control_buffer_new() {
+    ControlBuffer *buf;
+
+    RSC_LOG("rscaller: control_buffer_new");
+
+    buf = RSC_MALLOC(sizeof(ControlBuffer));
+    control_buffer_init(buf);
+
+    return buf;
+}
+
+int control_buffer_submit_syscall(ControlBuffer *cb, Syscall *syscall) {
+    int ret;
+    RSC_LOG("Submitting syscall to control buffer");
+    ret = mem_queue_push(&(cb->kernel_to_user), syscall);
     return ret;
 }
 

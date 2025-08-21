@@ -183,7 +183,7 @@ Syscall* save_syscall(unsigned long *params, const SyscallSignature *signature) 
 		return NULL;
 	}
 
-	smap_rw_disable();
+	// smap_rw_disable();
 	for(i = 0; i < signature->n_params; i++) {
 
 		RSC_LOG("rscaller: Trying to save param %d", i);
@@ -193,7 +193,7 @@ Syscall* save_syscall(unsigned long *params, const SyscallSignature *signature) 
 			return NULL;
 		}
 	}
-	smap_rw_enable();
+	// smap_rw_enable();
 
 	RSC_LOG("rscaller: Saved syscall params");
 
@@ -275,12 +275,9 @@ inline int handle_syscall_common(const struct pt_regs *pt_regs,
 		// return orig_syscall(pt_regs);
 	}
 
-
-	// // smap_write_disable();
 	syscall = save_syscall((unsigned long*)&params, signature);
-	// // smap_write_enable();
 
-	*ret = control_buffer_submit_syscall(&global_ctl_buffer, syscall);
+	*ret = control_buffer_submit_syscall(global_ctl_buffer, syscall);
 
 	smap_rw_enable();
 	return 0;
@@ -400,12 +397,13 @@ static int __init rscaller_init(void)
 
 	RSC_LOG("Rscaller init");
 
-	// if (ret = init_hooks()) {
-	// 	pr_err("Failed to register hooks");
-	// 	return ret;
-	// }
+	global_ctl_buffer = control_buffer_new();
+
+	if (ret = init_hooks()) {
+		pr_err("Failed to register hooks");
+		return ret;
+	}
 	
-	control_buffer_init(&global_ctl_buffer);
     proc_create(DEVICE_NAME, 0, NULL, rscaller_ops_ptr);
 
     return 0;

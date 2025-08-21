@@ -10,14 +10,21 @@
 #include <stdlib.h>
 #endif
 
+#ifndef __USERSPACE__
+#include <linux/mutex.h>
+#endif
 
-#define BUFFER_SIZE 1024
+
+#define BUFFER_SIZE 10
 
 
 typedef struct MemoryQueue{
-    Syscall* head;
-    int size; // defaulted to BUFFER_SIZE
+    int size;
+    int max_size;  // defaulted to BUFFER_SIZE
+    int tail_idx;
+    int head_idx;
     Syscall nodes[BUFFER_SIZE];
+    struct mutex lock;
 } MemoryQueue;
 
 typedef struct ControlBuffer {
@@ -25,11 +32,12 @@ typedef struct ControlBuffer {
     MemoryQueue user_to_kernel;
 } ControlBuffer;
 
-static ControlBuffer global_ctl_buffer;
+static ControlBuffer *global_ctl_buffer;
 static DEFINE_MUTEX(ctl_buffer_mutex);
 
 
 // ControlBuffer* control_buffer_new(void);
+ControlBuffer* control_buffer_new(void);
 void control_buffer_init(ControlBuffer *cb);
 void control_buffer_free(ControlBuffer *cb);
 
@@ -38,6 +46,7 @@ int control_buffer_submit_syscall(ControlBuffer *cb, Syscall *syscall);
 
 // Initialize ring buffer
 MemoryQueue* mem_queue_new(void);
+void mem_queue_init(MemoryQueue *queue);
 void mem_queue_free(MemoryQueue *buf);
 
 // Push syscall to the user-space
