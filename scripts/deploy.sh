@@ -1,38 +1,54 @@
 #!/usr/bin/env bash
-# Deploy rscaller to the remote kmod VM
+# deploy.sh — alias for bootstrap.sh (rsync + build only, skips apt/rust install)
+#
+# Usage: bash scripts/deploy.sh [SSH_HOST] [REMOTE_DIR]
+# For first-time setup use bootstrap.sh instead.
+
 set -euo pipefail
-REMOTE="${1:-${REMOTE:-dev-vm-rscaller}}"
-REMOTE_DIR="/home/ubuntu/rscaller"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+REMOTE="${1:-${REMOTE:-rscaller}}"
+REMOTE_DIR="${2:-/home/ubuntu/rscaller}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-echo "=== Deploying rscaller to $REMOTE:$REMOTE_DIR ==="
+step() { echo ""; echo "==> $*"; }
+ok()   { echo "    [ok] $*"; }
 
-echo "--- Syncing files ---"
-rsync -avz --delete \
+step "Syncing repo to $REMOTE:$REMOTE_DIR"
+rsync -az --delete \
   --exclude='.git/' \
   --exclude='target/' \
   --exclude='kmod/*.ko' \
   --exclude='kmod/*.o' \
-  --exclude='kmod/*.mod*' \
+  --exclude='kmod/*.mod.c' \
+  --exclude='kmod/*.symvers' \
   --exclude='kmod/modules.order' \
-  --exclude='kmod/Module.symvers' \
   --exclude='kmod/.tmp_versions/' \
   --exclude='vms/' \
   --exclude='.workmux-prompts/' \
   --exclude='certs/' \
   --exclude='lib/khook/' \
   "$REPO_ROOT/" "$REMOTE:$REMOTE_DIR/"
+ok "rsync done"
 
-echo "--- Initializing submodules on remote ---"
-ssh "$REMOTE" "cd $REMOTE_DIR && git submodule update --init lib/khook 2>/dev/null || true"
+step "Generating kmod headers + building kmod + Rust workspace on $REMOTE"
+ssh "$REMOTE" "bash -s" << ENDSSH
+set -euo pipefail
+source "\$HOME/.cargo/env" 2>/dev/null || true
+cd "$REMOTE_DIR"
 
-echo "--- Building kmod on remote ---"
-ssh "$REMOTE" "cd $REMOTE_DIR && make kmod 2>&1"
+# Regenerate C headers
+cargo run -p codegen --release -- \
+  --tbl-dir files --forwarded files/forwarded_syscalls --out kmod 2>&1 | grep -v '^warning' || true
 
-echo "--- Building Rust workspace on remote ---"
-ssh "$REMOTE" "source ~/.cargo/env 2>/dev/null; cd $REMOTE_DIR && cargo build --workspace --release 2>&1 | tail -20"
+# Build kmod
+cd kmod && make clean 2>/dev/null || true && make all 2>&1 | grep -E 'error:|LD \[M\]|Error [0-9]'
+ls -lh rscaller.ko && cd ..
 
-echo "=== Deploy complete ==="
-echo "Load kmod:  ssh $REMOTE 'cd $REMOTE_DIR/kmod && sudo insmod rscaller.ko'"
-echo "Run tests:  REMOTE=$REMOTE make test-remote"
+# Build Rust workspace
+cargo build --workspace --release 2>&1 | grep -E '^error|Finished'
+ls -lh target/release/rsclient target/release/rsbeacon
+ENDSSH
+ok "all built"
+
+echo ""
+echo "==> Deploy done. Load kmod:"
+echo "    ssh $REMOTE 'cd $REMOTE_DIR/kmod && sudo insmod rscaller.ko'"
