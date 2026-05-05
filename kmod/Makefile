@@ -20,7 +20,13 @@ ccflags-y += -std=gnu99 $(KHOOK_CCFLAGS)
 ldflags-y  += $(KHOOK_LDFLAGS) # use LDFLAGS for old kernels
 
 
-all:
+headers:
+	@if [ ! -d /lib/modules/$(shell uname -r)/build ]; then \
+		echo "Kernel headers not found. Run: sudo apt-get install linux-headers-$(shell uname -r)"; \
+		exit 1; \
+	fi
+
+all: headers
 	$(MAKE) -C $(KDIR) M=${KMOD_DIR} modules 
 
 

@@ -15,13 +15,14 @@ MAKE_CMD := docker run --rm -it ${COMMON_VOLUMES} -w /app ${MAKE_IMAGE} make
 
 BUFFER_HEADER_PATH := ${KMOD_ABS_DIR}/buffer_header_only.h
 
-.PHONY: kmod kmod_reload
+.PHONY: kmod kmod_native kmod_docker kmod_reload
 
 # TODO: download linux kernel sources
 # TODO2: use syscall table based on kernel sourcecs
 
 configure: btf bindings handlers
 # 	sudo dnf install kernel-devel-$(uname -r)
+	bash $(SCRIPTS_DIR)/setup_host.sh
 	git submodule update --init --remote
 	cargo install --git https://github.com/lcensies/libloading-bindgen --bin cargo-libloading-bindgen
 	cargo install single-header
@@ -44,7 +45,13 @@ btf:
 	docker ps > /dev/null 2>/dev/null
 	docker run --privileged calico/bpftool /bpftool btf dump file /sys/kernel/btf/vmlinux format c > kmod/vmlinux.h
 
-kmod: 
+kmod:
+	$(MAKE) -C $(KMOD_DIR)
+
+kmod_native:
+	$(MAKE) -C $(KMOD_DIR)
+
+kmod_docker:
 	${MAKE_CMD} -C ${KMOD_DIR}
 
 kmod_reload: 
