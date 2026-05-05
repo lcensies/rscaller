@@ -42,3 +42,7 @@ reload: all insert
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
+
+# Skip objtool for khook assembly stub (has naked rets that objtool doesn't understand)
+OBJECT_FILES_NON_STANDARD_stub.o := y
+OBJECT_FILES_NON_STANDARD := y

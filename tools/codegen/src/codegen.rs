@@ -230,22 +230,11 @@ pub fn generate_header(
             .get(name.as_str())
             .ok_or_else(|| anyhow::anyhow!("No metadata for syscall '{}'", name))?;
 
-        let buf_idx = meta.buf_idx;
-        // buf_size_arg_idx: the arg after buf_idx (if it exists); else -1
-        // For our hardcoded syscalls there's no explicit size arg — pass -1
-        let buf_size_idx: i32 = -1;
-
-        out.push_str(&format!(
-            "__attribute__((__unused__)) static int handle_syscall_{}(\n",
-            syscall_num
-        ));
-        out.push_str("    struct kprobe* kp, struct pt_regs *regs,\n");
-        out.push_str("    int buf_arg_idx, int buf_size_arg_idx) {\n");
-        out.push_str(&format!(
-            "  return handler_entry_wrapper({}, kp, regs, {}, {});\n",
-            syscall_num, buf_idx, buf_size_idx
-        ));
-        out.push_str("}\n\n");
+        // buf_idx and syscall_num are kept for future use but the dead wrapper
+        // functions (handle_syscall_N) are intentionally omitted — they were
+        // __unused__ and referenced an undefined handler_entry_wrapper() symbol
+        // which caused -Wimplicit-function-declaration errors in the kernel build.
+        let _ = (syscall_num, meta.buf_idx);
     }
 
     out.push_str("#endif /* HANDLER_WRAPPERS_H */\n");
