@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Configuration
+IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+IMAGE_NAME="noble-server-cloudimg-amd64.img"
+OUTPUT_DIR="../vms/images"
+BOX_NAME="noble-server-cloudimg-amd64.box"
+VAGRANT_BOX_NAME="noble-server"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Error handling
+error() {
+    echo -e "${RED}==> ERROR: ${1}${NC}" >&2
+    exit 1
+}
+
+info() {
+    echo -e "${GREEN}==> INFO: ${1}${NC}"
+}
+
+warn() {
+    echo -e "${YELLOW}==> WARN: ${1}${NC}"
+}
+
+# Check if required tools are available
+check_dependencies() {
+    local missing_deps=()
+    
+    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+        missing_deps+=("wget or curl")
+    fi
+    
+    if ! command -v qemu-img >/dev/null 2>&1; then
+        missing_deps+=("qemu-img")
+    fi
+    
+    if [ ${#missing_deps[@]} -ne 0 ]; then
+        error "Missing required dependencies: ${missing_deps[*]}"
+    fi
+}
+
+# Download image if it doesn't exist
+download_image() {
+    local image_path="${OUTPUT_DIR}/${IMAGE_NAME}"
+    
+    if [ -f "$image_path" ]; then
+        info "Image already exists: $image_path"
+        return 0
+    fi
+    
+    info "Downloading image from $IMAGE_URL"
+    info "Output directory: $OUTPUT_DIR"
+    
+    # Create output directory if it doesn't exist
+    mkdir -p "$OUTPUT_DIR"
+    
+    # Download the image
+    if command -v wget >/dev/null 2>&1; then
+        wget -O "$image_path" "$IMAGE_URL"
+    elif command -v curl >/dev/null 2>&1; then
+        curl -L -o "$image_path" "$IMAGE_URL"
+    fi
+    
+    if [ ! -f "$image_path" ]; then
+        error "Failed to download image"
+    fi
+    
+    info "Successfully downloaded image: $image_path"
+}
+
+# Create Vagrant box using create_box.sh
+create_vagrant_box() {
+    local image_path="${OUTPUT_DIR}/${IMAGE_NAME}"
+    local box_path="${OUTPUT_DIR}/${BOX_NAME}"
+    local script_dir="$(dirname "$0")"
+    local create_box_script="$(realpath "${script_dir}/create_box.sh")"
+    
+    if [ ! -f "$create_box_script" ]; then
+        error "create_box.sh script not found at: $create_box_script"
+    fi
+    
+    if [ ! -x "$create_box_script" ]; then
+        warn "create_box.sh is not executable, making it executable"
+        chmod +x "$create_box_script"
+    fi
+    
+    if [ -f "$box_path" ]; then
+        warn "Vagrant box already exists: $box_path"
+        read -p "Do you want to overwrite it? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            info "Skipping box creation"
+            return 0
+        fi
+        rm -f "$box_path"
+    fi
+    
+    info "Creating Vagrant box using create_box.sh"
+    info "Image: $image_path"
+    info "Box: $box_path"
+    
+    # Change to images directory and run create_box.sh script
+    cd "$OUTPUT_DIR"
+    "$create_box_script" "$IMAGE_NAME" "$BOX_NAME"
+    
+    if [ -f "$BOX_NAME" ]; then
+        info "Successfully created Vagrant box: $box_path"
+        info "You can now add the box with:"
+        info "  vagrant box add $box_path --name noble-server"
+    else
+        error "Failed to create Vagrant box"
+    fi
+}
+
+# Check if Vagrant is installed
+check_vagrant() {
+    if ! command -v vagrant >/dev/null 2>&1; then
+        error "Vagrant is not installed. Please install Vagrant first."
+    fi
+    info "Vagrant is available"
+}
+
+# Check if box is already added to Vagrant
+check_existing_vagrant_box() {
+    if vagrant box list | grep -q "^${VAGRANT_BOX_NAME} "; then
+        warn "Box '$VAGRANT_BOX_NAME' already exists in Vagrant"
+        read -p "Do you want to remove and re-add it? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            info "Removing existing box..."
+            vagrant box remove "$VAGRANT_BOX_NAME" --force
+        else
+            info "Keeping existing box"
+            return 0
+        fi
+    fi
+}
+
+# Add box to Vagrant
+add_box_to_vagrant() {
+    local box_path="${OUTPUT_DIR}/${BOX_NAME}"
+    
+    info "Adding box to Vagrant..."
+    vagrant box add "$box_path" --name "$VAGRANT_BOX_NAME"
+    
+    if vagrant box list | grep -q "^${VAGRANT_BOX_NAME} "; then
+        info "Successfully added box '$VAGRANT_BOX_NAME' to Vagrant"
+        info "You can now use 'vagrant up' to start the VM"
+    else
+        error "Failed to add box to Vagrant"
+    fi
+}
+
+# Main function
+main() {
+    info "Starting VM download, box creation, and Vagrant setup process"
+    
+    # Check dependencies
+    check_dependencies
+    
+    # Check Vagrant
+    check_vagrant
+    
+    # Download image if needed
+    download_image
+    
+    # Create Vagrant box
+    create_vagrant_box
+    
+    # Check for existing Vagrant box
+    check_existing_vagrant_box
+    
+    # Add box to Vagrant
+    add_box_to_vagrant
+    
+    info "Process completed successfully!"
+    info "You can now run 'vagrant up' to start the VM."
+}
+
+# Run main function
+main "$@"

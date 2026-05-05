@@ -1,34 +1,85 @@
-use io_uring::{IoUring, opcode, types};
-use std::os::unix::io::AsRawFd;
-use std::{fs, io};
-use std::mem;
-// use bindings::*;
-// use crate::bindings::System;
+use anyhow::Result;
+use clap::Parser;
+use memmap2::MmapOptions;
+use std::fs::OpenOptions;
+use std::net::SocketAddr;
+use tokio::net::TcpStream;
+use tracing::info;
 
-// use bindings::bindings::Syscall;
+mod kmod;
+mod relay;
 
-use std::path::PathBuf;
+#[derive(Parser)]
+#[command(name = "rsclient", about = "rscaller userspace relay client")]
+struct Args {
+    /// Address of rsbeacon
+    #[arg(long, default_value = "127.0.0.1:9999")]
+    beacon: String,
 
-use utils::*;
-use std::ffi::OsStr;
-// use libloading::{Library, Symbol};
+    /// Enable TLS for beacon connection
+    #[arg(long)]
+    tls: bool,
 
-use bindings::bindings::Bindings;
+    /// CA cert for TLS verification (PEM)
+    #[arg(long)]
+    ca_cert: Option<String>,
 
-const IO_URING: &str = "/tmp/uring";
+    /// Path to rscaller proc device
+    #[arg(long, default_value = "/proc/rscaller")]
+    proc_path: String,
+}
 
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("rsclient=debug".parse()?),
+        )
+        .init();
 
-fn main() -> io::Result<()> {
-    let git_root = get_git_root().unwrap();
-    let so_path = format!("{}/kmod/rsc_userspace_buffer.so", git_root);
-    
-    // let library_path: &OsStr = OsStr::new(kek.as_str());
-    // let lib = unsafe {Library::new(library_path).unwrap() };
-    unsafe {Bindings::load_from_path(so_path).unwrap()};
+    let args = Args::parse();
 
-    
-    
-    // let plugin = unsafe { Plugin::new(library_path) };
-    
-    Ok(())
+    // Open /proc/rscaller for both mmap (read) and write (DONE signals).
+    info!("Opening {}", args.proc_path);
+    let proc_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&args.proc_path)?;
+
+    let mmap = unsafe {
+        MmapOptions::new()
+            .len(std::mem::size_of::<kmod::ControlBuffer>())
+            .map_mut(&proc_file)?
+    };
+
+    // Connect to beacon.
+    let beacon_addr: SocketAddr = args.beacon.parse()?;
+    info!("Connecting to beacon at {}", beacon_addr);
+
+    if args.tls {
+        let ca_path = args
+            .ca_cert
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--ca-cert required with --tls"))?;
+        let ca_pem = std::fs::read(ca_path)?;
+
+        let (reader, writer) =
+            rscaller_proto::transport::tls::connect_tls(beacon_addr, "rsbeacon", &ca_pem).await?;
+
+        let write_file = OpenOptions::new()
+            .write(true)
+            .open(&args.proc_path)?;
+        let mut relay = relay::Relay::new(mmap, write_file, reader, writer);
+        relay.run().await
+    } else {
+        let stream = TcpStream::connect(beacon_addr).await?;
+        let (reader, writer) = tokio::io::split(stream);
+
+        let write_file = OpenOptions::new()
+            .write(true)
+            .open(&args.proc_path)?;
+        let mut relay = relay::Relay::new(mmap, write_file, reader, writer);
+        relay.run().await
+    }
 }

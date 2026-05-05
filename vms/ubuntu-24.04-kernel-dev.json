@@ -1,0 +1,192 @@
+{
+  "builders": [
+    {
+      "accelerator": "kvm",
+      "cpus": 4,
+      "disk_interface": "virtio",
+      "disk_size": "20480",
+      "format": "qcow2",
+      "headless": true,
+      "iso_checksum": "sha256:c3514bf0056180d09376462a7a1b4f213c1d6e8ea67fae5c25099c6fd3d8274b",
+      "iso_url": "https://releases.ubuntu.com/24.04.3/ubuntu-24.04.3-live-server-amd64.iso",
+      "memory": "4096",
+      "name": "ubuntu-24.04-kernel-dev",
+      "net_device": "virtio-net",
+      "output_directory": "output-ubuntu-24.04-kernel-dev",
+      "qemu_binary": "qemu-system-x86_64",
+      "qemuargs": [
+        [
+          "-enable-kvm"
+        ],
+        [
+          "-cpu",
+          "host"
+        ],
+        [
+          "-smp",
+          "4"
+        ],
+        [
+          "-m",
+          "4096"
+        ],
+        [
+          "-machine",
+          "type=pc,accel=kvm"
+        ],
+        [
+          "-netdev",
+          "user,id=net0,hostfwd=tcp::2222-:22"
+        ],
+        [
+          "-device",
+          "virtio-net-pci,netdev=net0"
+        ]
+      ],
+      "shutdown_command": "echo 'vagrant' | sudo -S shutdown -P now",
+      "ssh_password": "vagrant",
+      "ssh_timeout": "20m",
+      "ssh_username": "vagrant",
+      "boot_wait": "10s",
+      "type": "qemu",
+      "vm_name": "ubuntu-24.04-kernel-dev.qcow2",
+      "boot_command": [
+        "<esc><wait>",
+        "<esc><wait>",
+        "<f6><wait>",
+        "<esc><wait>",
+        "<install><wait>",
+        "<enter><wait>",
+        "/install/vmlinuz<wait>",
+        " initrd=/install/initrd.gz<wait>",
+        " auto<wait>",
+        " console-setup/ask_detect=false<wait>",
+        " console-setup/layoutcode=us<wait>",
+        " console-setup/modelcode=pc105<wait>",
+        " debconf/frontend=noninteractive<wait>",
+        " debian-installer=en_US<wait>",
+        " fb=false<wait>",
+        " kbd-chooser/method=us<wait>",
+        " keyboard-configuration/layout=us<wait>",
+        " keyboard-configuration/variant=us<wait>",
+        " locale=en_US<wait>",
+        " netcfg/get_domain=vm<wait>",
+        " netcfg/get_hostname=vagrant<wait>",
+        " noapic<wait>",
+        " preseed/url=http://{{ .HTTPIP }}:{{ .HTTPPort }}/preseed.cfg<wait>",
+        " -- <wait>",
+        "<enter><wait>"
+      ],
+      "http_directory": "http",
+      "http_port_min": 8000,
+      "http_port_max": 8000
+    }
+  ],
+  "post-processors": [
+    {
+      "compression_level": 6,
+      "output": "ubuntu-24.04-kernel-dev.box",
+      "type": "vagrant"
+    }
+  ],
+  "provisioners": [
+    {
+      "execute_command": "echo 'vagrant' | {{ .Vars }} sudo -S sh -c '{{ .Path }}'",
+      "inline": [
+        "apt-get update",
+        "apt-get upgrade -y"
+      ],
+      "type": "shell"
+    },
+    {
+      "execute_command": "echo 'vagrant' | {{ .Vars }} sudo -S sh -c '{{ .Path }}'",
+      "inline": [
+        "apt-get install -y curl wget gnupg2 software-properties-common apt-transport-https ca-certificates lsb-release"
+      ],
+      "type": "shell"
+    },
+    {
+      "execute_command": "echo 'vagrant' | {{ .Vars }} sudo -S sh -c '{{ .Path }}'",
+      "inline": [
+        "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg",
+        "echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable\" | tee /etc/apt/sources.list.d/docker.list > /dev/null",
+        "apt-get update",
+        "apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin"
+      ],
+      "type": "shell"
+    },
+    {
+      "execute_command": "echo 'vagrant' | {{ .Vars }} sudo -S sh -c '{{ .Path }}'",
+      "inline": [
+        "usermod -aG docker vagrant"
+      ],
+      "type": "shell"
+    },
+    {
+      "execute_command": "echo 'vagrant' | {{ .Vars }} sudo -S sh -c '{{ .Path }}'",
+      "inline": [
+        "apt-get install -y build-essential git vim tmux htop tree unzip",
+        "apt-get install -y linux-headers-$(uname -r) linux-source",
+        "apt-get install -y libncurses-dev bison flex libssl-dev libelf-dev bc rsync dwarves pahole",
+        "apt-get install -y gdb kgdb kgdb-source",
+        "apt-get install -y python3 python3-pip python3-venv"
+      ],
+      "type": "shell"
+    },
+    {
+      "execute_command": "echo 'vagrant' | {{ .Vars }} sudo -S sh -c '{{ .Path }}'",
+      "inline": [
+        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
+        "echo 'source $HOME/.cargo/env' >> /home/vagrant/.bashrc"
+      ],
+      "type": "shell"
+    },
+    {
+      "execute_command": "echo 'vagrant' | {{ .Vars }} sudo -S sh -c '{{ .Path }}'",
+      "inline": [
+        "cd /home/vagrant",
+        "git clone https://github.com/a13xp0p0v/kernel-build-containers.git",
+        "chown -R vagrant:vagrant /home/vagrant/kernel-build-containers"
+      ],
+      "type": "shell"
+    },
+    {
+      "execute_command": "echo 'vagrant' | {{ .Vars }} sudo -S sh -c '{{ .Path }}'",
+      "inline": [
+        "mkdir -p /home/vagrant/kernel-builds",
+        "chown -R vagrant:vagrant /home/vagrant/kernel-builds"
+      ],
+      "type": "shell"
+    },
+    {
+      "execute_command": "echo 'vagrant' | {{ .Vars }} sudo -S sh -c '{{ .Path }}'",
+      "inline": [
+        "echo '#!/bin/bash' > /home/vagrant/setup-rscaller.sh",
+        "echo 'cd /home/vagrant' >> /home/vagrant/setup-rscaller.sh",
+        "echo 'if [ ! -d rscaller ]; then' >> /home/vagrant/setup-rscaller.sh",
+        "echo '  echo \"Please mount your rscaller project directory to /home/vagrant/rscaller\"' >> /home/vagrant/setup-rscaller.sh",
+        "echo '  echo \"You can do this by updating your Vagrantfile to use this custom box\"' >> /home/vagrant/setup-rscaller.sh",
+        "echo 'else' >> /home/vagrant/setup-rscaller.sh",
+        "echo '  echo \"rscaller project found, ready for development!\"' >> /home/vagrant/setup-rscaller.sh",
+        "echo '  echo \"Run: make vm-kernel to compile debug kernel\"' >> /home/vagrant/setup-rscaller.sh",
+        "echo 'fi' >> /home/vagrant/setup-rscaller.sh",
+        "chmod +x /home/vagrant/setup-rscaller.sh",
+        "chown vagrant:vagrant /home/vagrant/setup-rscaller.sh"
+      ],
+      "type": "shell"
+    },
+    {
+      "execute_command": "echo 'vagrant' | {{ .Vars }} sudo -S sh -c '{{ .Path }}'",
+      "inline": [
+        "echo 'VM setup complete!'",
+        "echo 'Kernel development tools installed'",
+        "echo 'Docker installed and configured'",
+        "echo 'Rust toolchain installed'",
+        "echo 'Kernel build containers cloned'",
+        "echo 'Ready for rscaller development!'"
+      ],
+      "type": "shell"
+    }
+  ]
+}
+

@@ -1,0 +1,13 @@
+[package]
+name = "codegen"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "codegen"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+anyhow = { workspace = true }
+regex = "1"

@@ -1,14 +1,8 @@
-#![allow(non_upper_case_globals)]
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-
 [package]
 name = "bindings"
 version = "0.1.0"
-edition = "2024"
-
+edition = "2021"
 
 [dependencies]
-bindgen = "0.71.1"
-libloading = "0.8.8"
 utils = { path = "../utils" }
+libc = "0.2"

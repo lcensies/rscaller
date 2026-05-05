@@ -1,0 +1,15 @@
+[package]
+name = "rscaller-proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+libc = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+async-trait = { workspace = true }

@@ -70,3 +70,37 @@ dev-env:
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		${KERNEL_VOLUMES}
 		rscaller-devcont
+# ---------------------------------------------------------------------------
+# Rust workspace
+# ---------------------------------------------------------------------------
+REMOTE      ?= dev-vm-rscaller
+BEACON_HOST ?= 127.0.0.1
+BEACON_PORT ?= 9999
+
+.PHONY: build test integration-tests setup-remote deploy test-remote handlers
+
+build:
+	cargo build --workspace
+
+handlers:
+	cargo run -p codegen -- --tbl-dir files --forwarded files/forwarded_syscalls --out kmod
+
+test:
+	cargo test --workspace
+
+integration-tests:
+	@echo "=== Local integration tests ==="
+	bash tests/integration/test_codegen.sh
+	bash tests/integration/test_beacon_local.sh
+	bash tests/integration/test_proto_codec.sh
+	@echo "=== All passed ==="
+
+setup-remote:
+	bash scripts/setup_remote.sh $(REMOTE)
+
+deploy:
+	bash scripts/deploy.sh $(REMOTE)
+
+test-remote: build
+	REMOTE=$(REMOTE) BEACON_HOST=$(BEACON_HOST) BEACON_PORT=$(BEACON_PORT) \
+	  bash scripts/test_remote.sh $(REMOTE)
