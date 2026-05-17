@@ -5,11 +5,11 @@ use std::time::Duration;
 use anyhow::Result;
 use memmap2::MmapMut;
 use rscaller_proto::codec::{read_message, write_message};
-use rscaller_proto::types::{SyscallRequest, SyscallResponse};
+use rscaller_proto::types::{SyscallBuf, SyscallRequest, SyscallResponse};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, info, warn};
 
-use crate::kmod::{ControlBuffer, KmodSyscall};
+use crate::kmod::{ControlBuffer, KmodSyscall, PARAM_DIR_IN, PARAM_DIR_INOUT, PARAM_DIR_OUT};
 
 const QUEUE_SIZE: usize = 10;
 
@@ -64,6 +64,60 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Relay<R, W> {
         Some((slot, syscall))
     }
 
+    /// Collect IN/INOUT pointer buffers from the per-slot ParamBuf array.
+    pub fn read_in_bufs(&mut self, slot: usize, n_params: usize) -> Vec<SyscallBuf> {
+        let cb = self.ctl_buffer();
+        let mut bufs = Vec::new();
+        let slot_bufs = &cb.bufs[slot];
+        for i in 0..n_params {
+            let pb = &slot_bufs.params[i];
+            if pb.direction == PARAM_DIR_IN || pb.direction == PARAM_DIR_INOUT {
+                if pb.size > 0 && pb.user_ptr != 0 {
+                    let len = pb.size as usize;
+                    bufs.push(SyscallBuf {
+                        arg_idx: i as u8,
+                        data: pb.data[..len].to_vec(),
+                    });
+                }
+            }
+        }
+        bufs
+    }
+
+    /// Collect (arg_idx, size) entries for OUT/INOUT pointer buffers so the
+    /// beacon knows what to allocate.
+    pub fn read_out_sizes(&mut self, slot: usize, n_params: usize) -> Vec<(u8, u64)> {
+        let cb = self.ctl_buffer();
+        let mut sizes = Vec::new();
+        let slot_bufs = &cb.bufs[slot];
+        for i in 0..n_params {
+            let pb = &slot_bufs.params[i];
+            if pb.direction == PARAM_DIR_OUT || pb.direction == PARAM_DIR_INOUT {
+                if pb.user_ptr != 0 {
+                    sizes.push((i as u8, pb.size as u64));
+                }
+            }
+        }
+        sizes
+    }
+
+    /// Write beacon-returned OUT/INOUT buffer contents back into the shared
+    /// `ParamBuf.data` so the kmod can copy_to_user them.
+    pub fn write_out_bufs(&mut self, slot: usize, out_bufs: &[SyscallBuf]) {
+        let cb = self.ctl_buffer();
+        let slot_bufs = &mut cb.bufs[slot];
+        for sb in out_bufs {
+            let idx = sb.arg_idx as usize;
+            if idx >= slot_bufs.params.len() {
+                continue;
+            }
+            let pb = &mut slot_bufs.params[idx];
+            let n = sb.data.len().min(pb.data.len());
+            pb.data[..n].copy_from_slice(&sb.data[..n]);
+            pb.size = n as u32;
+        }
+    }
+
     /// Write `"DONE {slot_idx} {retval}\n"` to `/proc/rscaller` so the kmod
     /// can wake the blocked process and deliver the return value.
     pub fn signal_done(&mut self, slot_idx: u32, retval: i64) -> Result<()> {
@@ -85,6 +139,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Relay<R, W> {
             slot_idx: slot_idx as u64,
             number: sc.number as u64,
             args,
+            in_bufs: Vec::new(),
+            out_sizes: Vec::new(),
         }
     }
 
@@ -106,7 +162,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Relay<R, W> {
                         "dispatching syscall to beacon"
                     );
 
-                    let req = Self::to_request(slot as u32, &sc);
+                    let n_params = sc.n_params as usize;
+                    let in_bufs = self.read_in_bufs(slot, n_params);
+                    let out_sizes = self.read_out_sizes(slot, n_params);
+
+                    let mut req = Self::to_request(slot as u32, &sc);
+                    req.in_bufs = in_bufs;
+                    req.out_sizes = out_sizes;
 
                     if let Err(e) = write_message(&mut self.beacon_writer, &req).await {
                         warn!(error = %e, "failed to send request to beacon");
@@ -122,6 +184,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Relay<R, W> {
                                 ret = resp.ret,
                                 "beacon response received"
                             );
+                            self.write_out_bufs(resp.slot_idx as usize, &resp.out_bufs);
                             self.signal_done(resp.slot_idx as u32, resp.ret)?;
                         }
                         Err(e) => {

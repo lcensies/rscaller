@@ -70,8 +70,12 @@ impl CType {
 }
 
 #[derive(Debug, Clone)]
+pub enum ParamDir { In, Out, InOut }
+
+#[derive(Debug, Clone)]
 pub struct ParamMeta {
     pub ctype: CType,
+    pub dir: ParamDir,
 }
 
 #[derive(Debug, Clone)]
@@ -91,36 +95,36 @@ pub fn hardcoded_syscall_metadata() -> Vec<SyscallMeta> {
         SyscallMeta {
             name: "kill".to_string(),
             params: vec![
-                ParamMeta { ctype: CType::Int },  // pid
-                ParamMeta { ctype: CType::Int },  // sig
+                ParamMeta { ctype: CType::Int, dir: ParamDir::In },  // pid
+                ParamMeta { ctype: CType::Int, dir: ParamDir::In },  // sig
             ],
             buf_idx: -1,
         },
         SyscallMeta {
             name: "execve".to_string(),
             params: vec![
-                ParamMeta { ctype: CType::CharPtr },  // filename (buf_idx=0)
-                ParamMeta { ctype: CType::VoidPtr  }, // argv
-                ParamMeta { ctype: CType::VoidPtr  }, // envp
+                ParamMeta { ctype: CType::CharPtr, dir: ParamDir::In },  // filename (buf_idx=0)
+                ParamMeta { ctype: CType::VoidPtr, dir: ParamDir::In }, // argv
+                ParamMeta { ctype: CType::VoidPtr, dir: ParamDir::In }, // envp
             ],
             buf_idx: 0,
         },
         SyscallMeta {
             name: "open".to_string(),
             params: vec![
-                ParamMeta { ctype: CType::CharPtr  },  // filename (buf_idx=0)
-                ParamMeta { ctype: CType::Int      },  // flags
-                ParamMeta { ctype: CType::UnsignedInt }, // mode
+                ParamMeta { ctype: CType::CharPtr, dir: ParamDir::In },  // filename (buf_idx=0)
+                ParamMeta { ctype: CType::Int, dir: ParamDir::In },  // flags
+                ParamMeta { ctype: CType::UnsignedInt, dir: ParamDir::In }, // mode
             ],
             buf_idx: 0,
         },
         SyscallMeta {
             name: "openat".to_string(),
             params: vec![
-                ParamMeta { ctype: CType::Int      },  // dfd
-                ParamMeta { ctype: CType::CharPtr  },  // filename (buf_idx=1)
-                ParamMeta { ctype: CType::Int      },  // flags
-                ParamMeta { ctype: CType::UnsignedInt }, // mode
+                ParamMeta { ctype: CType::Int, dir: ParamDir::In },  // dfd
+                ParamMeta { ctype: CType::CharPtr, dir: ParamDir::In },  // filename (buf_idx=1)
+                ParamMeta { ctype: CType::Int, dir: ParamDir::In },  // flags
+                ParamMeta { ctype: CType::UnsignedInt, dir: ParamDir::In }, // mode
             ],
             buf_idx: 1,
         },
@@ -281,9 +285,14 @@ pub fn generate_source(
             let enum_val = param.ctype.enum_variant();
             let size_expr = param.ctype.size_expr();
             let is_ptr = if param.ctype.is_ptr() { "true" } else { "false" };
+            let dir_val = match param.dir {
+                ParamDir::In    => "PARAM_DIR_IN",
+                ParamDir::Out   => "PARAM_DIR_OUT",
+                ParamDir::InOut => "PARAM_DIR_INOUT",
+            };
             out.push_str(&format!(
-                "\t\t{{ {}, {}, {} }},\n",
-                enum_val, size_expr, is_ptr
+                "\t\t{{ {}, {}, {}, {} }},\n",
+                enum_val, size_expr, is_ptr, dir_val
             ));
         }
 

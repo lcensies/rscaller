@@ -9,6 +9,8 @@ fn test_execute_getpid() {
         slot_idx: 0,
         number: libc::SYS_getpid as u64,
         args: [0; 6],
+        in_bufs: Vec::new(),
+        out_sizes: Vec::new(),
     };
     let resp = execute_syscall(&req);
     assert!(
@@ -27,6 +29,8 @@ fn test_execute_kill_sig0() {
         slot_idx: 1,
         number: libc::SYS_kill as u64,
         args: [pid, 0, 0, 0, 0, 0],
+        in_bufs: Vec::new(),
+        out_sizes: Vec::new(),
     };
     let resp = execute_syscall(&req);
     assert_eq!(resp.ret, 0, "kill(self, 0) should succeed");
@@ -38,6 +42,8 @@ fn test_blocked_syscall_returns_eperm() {
         slot_idx: 99,
         number: 169, // reboot
         args: [0; 6],
+        in_bufs: Vec::new(),
+        out_sizes: Vec::new(),
     };
     let resp = execute_syscall(&req);
     assert_eq!(resp.ret, -(libc::EPERM as i64));
@@ -67,6 +73,8 @@ async fn test_beacon_roundtrip_plain() {
         slot_idx: 42,
         number: libc::SYS_getpid as u64,
         args: [0; 6],
+        in_bufs: Vec::new(),
+        out_sizes: Vec::new(),
     };
     write_message(&mut writer, &req).await.unwrap();
 

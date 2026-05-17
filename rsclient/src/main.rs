@@ -2,9 +2,8 @@ use anyhow::Result;
 use clap::Parser;
 use memmap2::MmapOptions;
 use std::fs::OpenOptions;
-use std::net::SocketAddr;
 use tokio::net::TcpStream;
-use tracing::info;
+use tracing::{info, warn};
 
 mod kmod;
 mod relay;
@@ -40,46 +39,58 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Open /proc/rscaller for both mmap (read) and write (DONE signals).
+    // Open /proc/rscaller once — keeps rsclient_active=1 for the kmod.
     info!("Opening {}", args.proc_path);
     let proc_file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(&args.proc_path)?;
 
-    let mmap = unsafe {
-        MmapOptions::new()
-            .len(std::mem::size_of::<kmod::ControlBuffer>())
-            .map_mut(&proc_file)?
-    };
+    // Resolve beacon address (supports both IP:port and hostname:port).
+    let beacon_addr = tokio::net::lookup_host(&args.beacon)
+        .await?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve beacon address: {}", args.beacon))?;
 
-    // Connect to beacon.
-    let beacon_addr: SocketAddr = args.beacon.parse()?;
-    info!("Connecting to beacon at {}", beacon_addr);
+    loop {
+        info!("Connecting to beacon at {}", beacon_addr);
 
-    if args.tls {
-        let ca_path = args
-            .ca_cert
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--ca-cert required with --tls"))?;
-        let ca_pem = std::fs::read(ca_path)?;
+        // Each relay iteration gets its own dup of the fd and a fresh mmap.
+        // Closing the relay's fd won't trigger kmod release() as long as the
+        // original proc_file remains open.
+        let relay_file = proc_file.try_clone()?;
+        let relay_mmap = unsafe {
+            MmapOptions::new()
+                .len(std::mem::size_of::<kmod::ControlBuffer>())
+                .map_mut(&relay_file)?
+        };
 
-        let (reader, writer) =
-            rscaller_proto::transport::tls::connect_tls(beacon_addr, "rsbeacon", &ca_pem).await?;
+        let result = if args.tls {
+            let ca_path = args
+                .ca_cert
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--ca-cert required with --tls"))?;
+            let ca_pem = std::fs::read(ca_path)?;
+            match rscaller_proto::transport::tls::connect_tls(beacon_addr, "rsbeacon", &ca_pem).await {
+                Ok((reader, writer)) => {
+                    let mut relay = relay::Relay::new(relay_mmap, relay_file, reader, writer);
+                    relay.run().await
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            match TcpStream::connect(beacon_addr).await {
+                Ok(stream) => {
+                    let (reader, writer) = tokio::io::split(stream);
+                    let mut relay = relay::Relay::new(relay_mmap, relay_file, reader, writer);
+                    relay.run().await
+                }
+                Err(e) => Err(e.into()),
+            }
+        };
 
-        let write_file = OpenOptions::new()
-            .write(true)
-            .open(&args.proc_path)?;
-        let mut relay = relay::Relay::new(mmap, write_file, reader, writer);
-        relay.run().await
-    } else {
-        let stream = TcpStream::connect(beacon_addr).await?;
-        let (reader, writer) = tokio::io::split(stream);
-
-        let write_file = OpenOptions::new()
-            .write(true)
-            .open(&args.proc_path)?;
-        let mut relay = relay::Relay::new(mmap, write_file, reader, writer);
-        relay.run().await
+        warn!("Relay ended: {:?} — reconnecting in 1s", result);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
+

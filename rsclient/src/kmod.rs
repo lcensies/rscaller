@@ -65,15 +65,58 @@ pub struct MemoryQueue {
     pub nodes: [KmodSyscall; 10],
 }
 
+// ---------------------------------------------------------------------------
+// Per-slot per-param buffers (mirrors the C `ParamBuf` / `SlotBufs` structs)
+// ---------------------------------------------------------------------------
+
+pub const MAX_PARAM_BUF: usize = 4096;
+pub const MAX_PARAMS: usize = 6;
+pub const BUFFER_SIZE: usize = 10;
+
+pub const PARAM_DIR_IN:    u32 = 0;
+pub const PARAM_DIR_OUT:   u32 = 1;
+pub const PARAM_DIR_INOUT: u32 = 2;
+
+/// Mirror of the C `ParamBuf` struct (8 + 4 + 4 + 4096 = 4112 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ParamBuf {
+    pub user_ptr:  u64,
+    pub size:      u32,
+    pub direction: u32,
+    pub data:      [u8; MAX_PARAM_BUF],
+}
+
+impl Default for ParamBuf {
+    fn default() -> Self {
+        unsafe { mem::zeroed() }
+    }
+}
+
+/// Mirror of the C `SlotBufs` struct (6 * 4112 = 24672 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SlotBufs {
+    pub params: [ParamBuf; MAX_PARAMS],
+}
+
+impl Default for SlotBufs {
+    fn default() -> Self {
+        unsafe { mem::zeroed() }
+    }
+}
+
 /// Mirror of the C `ControlBuffer` struct.
 ///
 /// Layout:
 ///   kernel_to_user: MemoryQueue (kmod writes, rsclient reads)
 ///   user_to_kernel: MemoryQueue (reserved / not yet used)
+///   bufs:           SlotBufs[BUFFER_SIZE] (kmod writes IN, rsclient writes OUT)
 #[repr(C)]
 pub struct ControlBuffer {
     pub kernel_to_user: MemoryQueue,
     pub user_to_kernel: MemoryQueue,
+    pub bufs: [SlotBufs; BUFFER_SIZE],
 }
 
 // ---------------------------------------------------------------------------
@@ -83,4 +126,8 @@ const _: () = {
     assert!(mem::size_of::<SyscallParam>() == 8);
     // 4+4+4+4 + 6*8 = 64
     assert!(mem::size_of::<KmodSyscall>() == 64);
+    // 8 + 4 + 4 + 4096 = 4112
+    assert!(mem::size_of::<ParamBuf>() == 4112,);
+    // 6 * 4112 = 24672
+    assert!(mem::size_of::<SlotBufs>() == 24672);
 };

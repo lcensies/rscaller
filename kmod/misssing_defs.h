@@ -2,6 +2,18 @@
 typedef int utrap_entry_t;
 typedef void *utrap_handler_t;
 
+/* cgroup_namespace is defined in linux/cgroup.h (not linux/cgroup_namespace.h) */
+#include <linux/cgroup.h>
+
+/* vm_flags_set() / vm_flags_clear() introduced in 6.3 (vm_flags made const).
+ * In 6.15+ these are GPL-only; use vm_flags_reset() for non-GPL modules on 6.15+.
+ * For < 6.3: direct assignment is fine. */
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
+#define vm_flags_set(vma, flags)   ((vma)->vm_flags |= (flags))
+#define vm_flags_clear(vma, flags) ((vma)->vm_flags &= ~(flags))
+#endif
+
 enum pl_code {
 	PL_SET = 1, PL_FSET = 2,
 	PL_GET = 3, PL_FGET = 4,

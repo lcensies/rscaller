@@ -15,6 +15,8 @@ async fn test_codec_multiple_frames_in_order() {
             slot_idx: i,
             number: 59 + i,
             args: [i; 6],
+            in_bufs: Vec::new(),
+            out_sizes: Vec::new(),
         })
         .collect();
 
@@ -37,7 +39,7 @@ async fn test_codec_multiple_frames_in_order() {
 async fn test_codec_response_negative_ret() {
     let (mut writer_side, mut reader_side) = duplex(1024);
 
-    let resp = SyscallResponse { slot_idx: 7, ret: -1 };
+    let resp = SyscallResponse { slot_idx: 7, ret: -1, out_bufs: Vec::new() };
     write_message(&mut writer_side, &resp).await.unwrap();
     drop(writer_side);
 
@@ -54,6 +56,8 @@ async fn test_codec_max_args() {
         slot_idx: u64::MAX,
         number: u64::MAX,
         args: [u64::MAX; 6],
+        in_bufs: Vec::new(),
+        out_sizes: Vec::new(),
     };
     write_message(&mut writer_side, &req).await.unwrap();
     drop(writer_side);
@@ -70,14 +74,14 @@ async fn test_codec_interleaved_request_response() {
     let (mut client_w, mut server_r) = duplex(4096);
     let (mut server_w, mut client_r) = duplex(4096);
 
-    let req = SyscallRequest { slot_idx: 11, number: 62, args: [0; 6] };
+    let req = SyscallRequest { slot_idx: 11, number: 62, args: [0; 6], in_bufs: Vec::new(), out_sizes: Vec::new() };
 
     // Client sends request
     write_message(&mut client_w, &req).await.unwrap();
 
     // Server reads and echoes back
     let decoded_req: SyscallRequest = read_message(&mut server_r).await.unwrap();
-    let resp = SyscallResponse { slot_idx: decoded_req.slot_idx, ret: 0 };
+    let resp = SyscallResponse { slot_idx: decoded_req.slot_idx, ret: 0, out_bufs: Vec::new() };
     write_message(&mut server_w, &resp).await.unwrap();
 
     // Client reads response
@@ -112,13 +116,13 @@ async fn test_tls_roundtrip() {
         let tls_stream = tls::accept_tls(tcp, &cert_pem2, &key_pem2).await.unwrap();
         let (mut r, mut w) = tokio::io::split(tls_stream);
         let req: SyscallRequest = read_message(&mut r).await.unwrap();
-        let resp = SyscallResponse { slot_idx: req.slot_idx, ret: 42 };
+        let resp = SyscallResponse { slot_idx: req.slot_idx, ret: 42, out_bufs: Vec::new() };
         write_message(&mut w, &resp).await.unwrap();
     });
 
     // Client
     let (mut r, mut w) = tls::connect_tls(addr, "rsbeacon", &ca_pem).await.unwrap();
-    let req = SyscallRequest { slot_idx: 5, number: 39, args: [0; 6] };
+    let req = SyscallRequest { slot_idx: 5, number: 39, args: [0; 6], in_bufs: Vec::new(), out_sizes: Vec::new() };
     write_message(&mut w, &req).await.unwrap();
 
     let resp: SyscallResponse = read_message(&mut r).await.unwrap();

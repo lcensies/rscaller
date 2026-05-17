@@ -1,0 +1,14 @@
+[package]
+name = "rscaller-run"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rscaller-run"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+ociman = { git = "https://github.com/mbj/mrs" }

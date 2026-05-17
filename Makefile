@@ -74,10 +74,16 @@ dev-env:
 # Rust workspace
 # ---------------------------------------------------------------------------
 REMOTE      ?= dev-vm-rscaller
-BEACON_HOST ?= 127.0.0.1
+CLIENT      ?=
+BEACON_HOST ?= 0.0.0.0
 BEACON_PORT ?= 9999
+# Libvirt domain names (default to SSH host names)
+VM_DOMAIN        ?= $(REMOTE)
+VM_SNAPSHOT      ?= clean-base
+VM_DOMAIN_CLIENT ?= $(CLIENT)
 
-.PHONY: build test integration-tests setup-remote deploy test-remote handlers
+.PHONY: build test integration-tests setup-remote deploy deploy-remote test-remote handlers \
+        snapshot-create snapshot-restore
 
 build:
 	cargo build --workspace
@@ -101,6 +107,23 @@ setup-remote:
 deploy:
 	bash scripts/deploy.sh $(REMOTE)
 
-test-remote: build
-	REMOTE=$(REMOTE) BEACON_HOST=$(BEACON_HOST) BEACON_PORT=$(BEACON_PORT) \
+# Create a clean-state snapshot (run once on a freshly booted VM with no kmod loaded)
+snapshot-create:
+	virsh snapshot-create-as $(VM_DOMAIN) $(VM_SNAPSHOT) \
+	  --description "clean boot, no kmod loaded" --atomic
+	$(if $(VM_DOMAIN_CLIENT),virsh snapshot-create-as $(VM_DOMAIN_CLIENT) $(VM_SNAPSHOT) \
+	  --description "clean boot" --atomic,)
+
+# Revert to clean snapshot before deploy+test (prevents stuck-module artifacts)
+snapshot-restore:
+	bash scripts/vm_restore.sh $(VM_DOMAIN) $(VM_SNAPSHOT)
+	$(if $(VM_DOMAIN_CLIENT),bash scripts/vm_restore.sh $(VM_DOMAIN_CLIENT) $(VM_SNAPSHOT),)
+
+deploy-remote: snapshot-restore
+	bash scripts/deploy.sh $(REMOTE)
+	$(if $(CLIENT),bash scripts/deploy.sh $(CLIENT),)
+	cargo build --release -p rsbeacon
+
+test-remote: deploy-remote
+	REMOTE=$(REMOTE) CLIENT=$(CLIENT) BEACON_HOST=$(BEACON_HOST) BEACON_PORT=$(BEACON_PORT) \
 	  bash scripts/test_remote.sh $(REMOTE)

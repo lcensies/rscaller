@@ -1,4 +1,4 @@
-use rsclient::kmod::{ControlBuffer, KmodSyscall, MemoryQueue, SyscallParam};
+use rsclient::kmod::{ControlBuffer, KmodSyscall, MemoryQueue, ParamBuf, SlotBufs, SyscallParam, BUFFER_SIZE};
 use std::mem;
 
 #[test]
@@ -33,11 +33,24 @@ fn test_memory_queue_size() {
 }
 
 #[test]
+fn test_param_buf_size() {
+    // 8 + 4 + 4 + 4096 = 4112
+    assert_eq!(mem::size_of::<ParamBuf>(), 4112, "ParamBuf must be 4112 bytes");
+}
+
+#[test]
+fn test_slot_bufs_size() {
+    // 6 * 4112 = 24672
+    assert_eq!(mem::size_of::<SlotBufs>(), 6 * 4112, "SlotBufs must be 24672 bytes");
+}
+
+#[test]
 fn test_control_buffer_size() {
+    let expected = 2 * mem::size_of::<MemoryQueue>() + BUFFER_SIZE * mem::size_of::<SlotBufs>();
     assert_eq!(
         mem::size_of::<ControlBuffer>(),
-        2 * mem::size_of::<MemoryQueue>(),
-        "ControlBuffer must be exactly 2 MemoryQueues"
+        expected,
+        "ControlBuffer must be 2 MemoryQueues + BUFFER_SIZE SlotBufs"
     );
 }
 
@@ -46,6 +59,8 @@ fn print_layout_sizes() {
     println!("SyscallParam  : {} bytes", mem::size_of::<SyscallParam>());
     println!("KmodSyscall   : {} bytes", mem::size_of::<KmodSyscall>());
     println!("MemoryQueue   : {} bytes", mem::size_of::<MemoryQueue>());
+    println!("ParamBuf      : {} bytes", mem::size_of::<ParamBuf>());
+    println!("SlotBufs      : {} bytes", mem::size_of::<SlotBufs>());
     println!("ControlBuffer : {} bytes", mem::size_of::<ControlBuffer>());
 }
 

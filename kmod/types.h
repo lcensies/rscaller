@@ -39,11 +39,16 @@ typedef unsigned short umode_t;
 #define PTR true
 #define NOT_PTR false
 
+#define PARAM_DIR_IN    0
+#define PARAM_DIR_OUT   1
+#define PARAM_DIR_INOUT 2
+
 // Compile time
 typedef struct {
   int type;
   size_t size;
   int is_ptr;
+  int direction;   /* PARAM_DIR_* */
 } ParamMeta;
 
 typedef struct {

@@ -3,9 +3,14 @@ members = [
     "rscaller-proto",
     "rsbeacon",
     "rsclient",
+    "rscaller-run",
     "tools/codegen",
 ]
+exclude = []
 resolver = "2"
+
+# To build only the core members offline (without rscaller-run / ociman):
+#   cargo build --workspace --exclude rscaller-run
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

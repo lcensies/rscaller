@@ -5,6 +5,7 @@
 
 #ifdef __USERSPACE__
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,22 @@
 
 #define BUFFER_SIZE 10
 
+#define MAX_PARAM_BUF 4096
+#define MAX_PARAMS    6
+
+/* Per-slot per-param buffer — lives in shared memory, written by kmod for IN
+ * params and by rsclient for OUT params. */
+typedef struct {
+    uint64_t user_ptr;          /* original userspace VA (for copy_to_user) */
+    uint32_t size;              /* byte count of valid data in `data` */
+    uint32_t direction;         /* PARAM_DIR_* */
+    uint8_t  data[MAX_PARAM_BUF];
+} ParamBuf;                     /* 8+4+4+4096 = 4112 bytes */
+
+typedef struct {
+    ParamBuf params[MAX_PARAMS];
+} SlotBufs;                     /* 6 * 4112 = 24672 bytes */
+
 
 typedef struct MemoryQueue{
     int size;
@@ -25,16 +42,14 @@ typedef struct MemoryQueue{
     int tail_idx;
     int head_idx;
     Syscall nodes[BUFFER_SIZE];
-#ifndef __USERSPACE__
-    struct mutex lock;
-    struct completion slot_completions[BUFFER_SIZE];
-    long slot_retvals[BUFFER_SIZE];
-#endif
+    /* NOTE: mutex/completion/retvals live in static arrays in buffer.c
+     * (not here) so the shared mmap layout matches the Rust ControlBuffer. */
 } MemoryQueue;
 
 typedef struct ControlBuffer {
     MemoryQueue kernel_to_user;
     MemoryQueue user_to_kernel;
+    SlotBufs    bufs[BUFFER_SIZE];  /* indexed by slot_idx */
 } ControlBuffer;
 
 /* Bug C fix: extern declarations — defined once in buffer.c */

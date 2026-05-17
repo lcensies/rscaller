@@ -4,6 +4,12 @@
 ControlBuffer *global_ctl_buffer;
 #ifndef __USERSPACE__
 DEFINE_MUTEX(ctl_buffer_mutex);
+
+/* Kernel-only synchronisation state — NOT in the mmap'd ControlBuffer so that
+ * the Rust ControlBuffer mirror stays layout-compatible with the kernel view. */
+static struct mutex          ktu_lock;
+static struct completion     ktu_completions[BUFFER_SIZE];
+static long                  ktu_retvals[BUFFER_SIZE];
 #endif
 
 /* TODO: parametrize */
@@ -14,11 +20,7 @@ void mem_queue_init(MemoryQueue *queue) {
     memset(queue, 0, sizeof(MemoryQueue));
     queue->max_size = BUFFER_SIZE;
 #ifndef __USERSPACE__
-    mutex_init(&queue->lock);
-    for (i = 0; i < BUFFER_SIZE; i++) {
-        init_completion(&queue->slot_completions[i]);
-        queue->slot_retvals[i] = 0;
-    }
+    (void)i;
 #else
     (void)i;
 #endif
@@ -70,7 +72,7 @@ int mem_queue_push(MemoryQueue *queue, Syscall *syscall)
 {
     int ret = 0;
 #ifndef __USERSPACE__
-    mutex_lock(&queue->lock);
+    mutex_lock(&ktu_lock);
 #endif
     if (queue->size == queue->max_size) {
         RSC_LOG("rscaller: Memory queue is full");
@@ -84,7 +86,7 @@ int mem_queue_push(MemoryQueue *queue, Syscall *syscall)
 
 out:
 #ifndef __USERSPACE__
-    mutex_unlock(&queue->lock);
+    mutex_unlock(&ktu_lock);
 #endif
     return ret;
 }
@@ -94,7 +96,7 @@ Syscall* mem_queue_pop(MemoryQueue *queue)
     Syscall *ret;
 
 #ifndef __USERSPACE__
-    mutex_lock(&queue->lock);
+    mutex_lock(&ktu_lock);
 #endif
     if (queue->size == 0) {
         RSC_LOG("rscaller: Memory queue is empty");
@@ -108,16 +110,35 @@ Syscall* mem_queue_pop(MemoryQueue *queue)
 
 out:
 #ifndef __USERSPACE__
-    mutex_unlock(&queue->lock);
+    mutex_unlock(&ktu_lock);
 #endif
     return ret;
 }
 
 
+void control_buffer_free(ControlBuffer *cb) {
+#ifndef __USERSPACE__
+    free_pages((unsigned long)cb, get_order(sizeof(ControlBuffer)));
+#else
+    RSC_FREE(cb);
+#endif
+}
+
 void control_buffer_init(ControlBuffer *cb) {
+    int i;
     RSC_LOG("rscaller: control_buffer_init");
     mem_queue_init(&cb->kernel_to_user);
     mem_queue_init(&cb->user_to_kernel);
+    memset(cb->bufs, 0, sizeof(cb->bufs));
+#ifndef __USERSPACE__
+    mutex_init(&ktu_lock);
+    for (i = 0; i < BUFFER_SIZE; i++) {
+        init_completion(&ktu_completions[i]);
+        ktu_retvals[i] = 0;
+    }
+#else
+    (void)i;
+#endif
 }
 
 ControlBuffer* control_buffer_new(void) {
@@ -125,7 +146,14 @@ ControlBuffer* control_buffer_new(void) {
 
     RSC_LOG("rscaller: control_buffer_new");
 
+#ifndef __USERSPACE__
+    /* Must use page allocator (not slab/kmalloc) so virt_to_page() returns
+     * a properly refcounted page that vm_insert_page() will accept. */
+    buf = (ControlBuffer *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
+                                             get_order(sizeof(ControlBuffer)));
+#else
     buf = RSC_MALLOC(sizeof(ControlBuffer));
+#endif
     if (!buf)
         return NULL;
     control_buffer_init(buf);
@@ -145,22 +173,25 @@ int control_buffer_submit_syscall(ControlBuffer *cb, Syscall *syscall) {
     RSC_LOG("Submitting syscall to control buffer");
 
 #ifndef __USERSPACE__
-    mutex_lock(&queue->lock);
+    mutex_lock(&ktu_lock);
 #endif
     if (queue->size == queue->max_size) {
         RSC_LOG("rscaller: Memory queue is full");
 #ifndef __USERSPACE__
-        mutex_unlock(&queue->lock);
+        mutex_unlock(&ktu_lock);
 #endif
         return -1;
     }
 
-    queue->tail_idx = (queue->tail_idx + queue->max_size - 1) % queue->max_size;
-    mem_queue_node_init(&(queue->nodes[queue->tail_idx]), syscall);
-    queue->size += 1;
+    /* Write at current tail, then advance forward — consistent with pop reading
+     * from head and advancing forward.  Previous code went backward (tail-1)
+     * while pop went forward, so slot_idx never matched head_idx. */
     slot_idx = queue->tail_idx;
+    mem_queue_node_init(&(queue->nodes[slot_idx]), syscall);
+    queue->tail_idx = (queue->tail_idx + 1) % queue->max_size;
+    queue->size += 1;
 #ifndef __USERSPACE__
-    mutex_unlock(&queue->lock);
+    mutex_unlock(&ktu_lock);
 #endif
 
     return slot_idx;
@@ -168,13 +199,15 @@ int control_buffer_submit_syscall(ControlBuffer *cb, Syscall *syscall) {
 
 #ifndef __USERSPACE__
 long control_buffer_wait_result(ControlBuffer *cb, int slot_idx) {
-    wait_for_completion_interruptible(&cb->kernel_to_user.slot_completions[slot_idx]);
-    return cb->kernel_to_user.slot_retvals[slot_idx];
+    (void)cb;
+    wait_for_completion_interruptible(&ktu_completions[slot_idx]);
+    return ktu_retvals[slot_idx];
 }
 
 void control_buffer_complete(ControlBuffer *cb, int slot_idx, long retval) {
-    cb->kernel_to_user.slot_retvals[slot_idx] = retval;
-    complete(&cb->kernel_to_user.slot_completions[slot_idx]);
+    (void)cb;
+    ktu_retvals[slot_idx] = retval;
+    complete(&ktu_completions[slot_idx]);
 }
 #endif
 
@@ -183,3 +216,4 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("your mom");
 MODULE_DESCRIPTION("Rscaller kmod");
 #endif
+
