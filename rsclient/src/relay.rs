@@ -67,6 +67,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Relay<R, W> {
         q.head_idx = (q.head_idx + 1) % QUEUE_SIZE as i32;
         q.size -= 1;
 
+        // n_params<0: kmod cancelled this slot — drain without processing.
+        if syscall.n_params < 0 {
+            return self.pop_syscall();
+        }
+
         Some((slot, syscall))
     }
 

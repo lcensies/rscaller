@@ -25,6 +25,11 @@ pub fn execute_syscall(req: &SyscallRequest) -> SyscallResponse {
     let num = req.number;
     let mut args = req.args;
 
+    debug!("execute_syscall: num={} in_bufs={} out_sizes={}", num, req.in_bufs.len(), req.out_sizes.len());
+    for ib in &req.in_bufs {
+        debug!("  in_buf arg_idx={} data_len={} data={:?}", ib.arg_idx, ib.data.len(), String::from_utf8_lossy(&ib.data));
+    }
+
     if BLOCKED_SYSCALLS.contains(&num) {
         warn!("Blocked syscall {}", num);
         return SyscallResponse {
@@ -84,7 +89,7 @@ pub fn execute_syscall(req: &SyscallRequest) -> SyscallResponse {
         )
     };
 
-    debug!("Syscall {} returned {}", num, ret);
+    debug!("Syscall {} returned {} (errno={})", num, ret, unsafe { *libc::__errno_location() });
 
     // Collect OUT/INOUT results from the local buffers (must happen before
     // local_bufs is dropped so the raw pointers we passed remain valid for

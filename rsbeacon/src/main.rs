@@ -5,55 +5,95 @@ use std::net::SocketAddr;
 mod executor;
 mod server;
 
+// Certs embedded at compile time by build.rs
+const EMBEDDED_CERT_PEM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cert.pem"));
+const EMBEDDED_KEY_PEM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/key.pem"));
+pub const EMBEDDED_CA_PEM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ca.pem"));
+
 #[derive(Parser)]
 #[command(name = "rsbeacon", about = "Remote syscall execution beacon")]
 struct Args {
-    /// Address to listen on
     #[arg(long, default_value = "0.0.0.0:9999")]
     listen: String,
 
-    /// Enable TLS mode
-    #[arg(long)]
-    tls: bool,
+    #[arg(long, default_value = "tcp", help = "Transport: tcp|uds")]
+    transport: String,
 
-    /// Path to TLS certificate (PEM) — required if --tls
-    #[arg(long)]
-    tls_cert: Option<String>,
+    #[arg(long, default_value = "tls", help = "Encryption: none|tls")]
+    encryption: String,
 
-    /// Path to TLS private key (PEM) — required if --tls
+    /// Override embedded TLS certificate (PEM)
     #[arg(long)]
-    tls_key: Option<String>,
+    cert: Option<String>,
 
-    /// Maximum concurrent connections (informational; not enforced yet)
+    /// Override embedded TLS private key (PEM)
+    #[arg(long)]
+    key: Option<String>,
+
+    /// UDS socket path (only with --transport uds)
+    #[arg(long)]
+    uds_path: Option<String>,
+
     #[arg(long, default_value = "10")]
     max_connections: usize,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Ensure fd 0/1/2 stay occupied so remote file opens don't get fd<3
+    unsafe {
+        for fd in 0i32..3 {
+            if libc::fcntl(fd, libc::F_GETFD) == -1 {
+                let null = libc::open(
+                    b"/dev/null\0".as_ptr() as *const libc::c_char,
+                    libc::O_RDWR,
+                );
+                if null >= 0 && null != fd {
+                    libc::dup2(null, fd);
+                    libc::close(null);
+                }
+            }
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("rsbeacon=warn".parse()?),
+                .add_directive("rsbeacon=debug".parse()?),
         )
         .init();
 
     let args = Args::parse();
-    let addr: SocketAddr = args.listen.parse()?;
 
-    if args.tls {
-        let cert_path = args
-            .tls_cert
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--tls-cert required with --tls"))?;
-        let key_path = args
-            .tls_key
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--tls-key required with --tls"))?;
-        let cert_pem = std::fs::read(cert_path)?;
-        let key_pem = std::fs::read(key_path)?;
-        server::run_tls(addr, cert_pem, key_pem).await
+    let cert_pem = if let Some(p) = &args.cert {
+        std::fs::read(p)?
     } else {
-        server::run_plain(addr).await
+        EMBEDDED_CERT_PEM.to_vec()
+    };
+    let key_pem = if let Some(p) = &args.key {
+        std::fs::read(p)?
+    } else {
+        EMBEDDED_KEY_PEM.to_vec()
+    };
+
+    let use_tls = args.encryption == "tls";
+
+    match args.transport.as_str() {
+        "tcp" => {
+            let addr: SocketAddr = args.listen.parse()?;
+            if use_tls {
+                server::run_tls(addr, cert_pem, key_pem).await
+            } else {
+                server::run_plain(addr).await
+            }
+        }
+        "uds" => {
+            let path = args
+                .uds_path
+                .as_deref()
+                .unwrap_or("/tmp/rsbeacon.sock");
+            server::run_uds(path, use_tls, cert_pem, key_pem).await
+        }
+        other => anyhow::bail!("Unknown transport: {}", other),
     }
 }
