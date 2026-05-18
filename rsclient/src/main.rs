@@ -2,7 +2,6 @@ use anyhow::Result;
 use clap::Parser;
 use memmap2::MmapOptions;
 use std::fs::OpenOptions;
-use tokio::net::TcpStream;
 use tracing::{info, warn};
 
 mod kmod;
@@ -15,17 +14,32 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:9999")]
     beacon: String,
 
-    /// Enable TLS for beacon connection
+    /// Target name written to kmod via TARGET command
     #[arg(long)]
-    tls: bool,
+    name: Option<String>,
 
-    /// CA cert for TLS verification (PEM)
+    /// Transport: tcp|uds
+    #[arg(long, default_value = "tcp")]
+    transport: String,
+
+    /// Encryption: none|tls
+    #[arg(long, default_value = "tls")]
+    encryption: String,
+
+    /// Path to CA cert PEM for TLS verification
     #[arg(long)]
     ca_cert: Option<String>,
 
     /// Path to rscaller proc device
     #[arg(long, default_value = "/proc/rscaller")]
     proc_path: String,
+}
+
+/// Default CA cert location for TLS when --ca-cert is not specified.
+fn default_ca_cert_path() -> std::path::PathBuf {
+    let mut p = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("~/.config"));
+    p.push("rscaller/ca.pem");
+    p
 }
 
 #[tokio::main]
@@ -41,16 +55,25 @@ async fn main() -> Result<()> {
 
     // Open /proc/rscaller once — keeps rsclient_active=1 for the kmod.
     info!("Opening {}", args.proc_path);
-    let proc_file = OpenOptions::new()
+    let mut proc_file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(&args.proc_path)?;
+
+    // Send TARGET keepalive if --name provided.
+    if let Some(ref name) = args.name {
+        let msg = format!("TARGET {}\n", name);
+        std::io::Write::write_all(&mut proc_file, msg.as_bytes())?;
+        info!("Set target name: {}", name);
+    }
 
     // Resolve beacon address (supports both IP:port and hostname:port).
     let beacon_addr = tokio::net::lookup_host(&args.beacon)
         .await?
         .next()
         .ok_or_else(|| anyhow::anyhow!("could not resolve beacon address: {}", args.beacon))?;
+
+    let use_tls = args.encryption == "tls";
 
     loop {
         info!("Connecting to beacon at {}", beacon_addr);
@@ -65,13 +88,23 @@ async fn main() -> Result<()> {
                 .map_mut(&relay_file)?
         };
 
-        let result = if args.tls {
-            let ca_path = args
-                .ca_cert
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("--ca-cert required with --tls"))?;
-            let ca_pem = std::fs::read(ca_path)?;
-            match rscaller_proto::transport::tls::connect_tls(beacon_addr, "rsbeacon", &ca_pem).await {
+        let result = if use_tls {
+            // Load CA cert from --ca-cert or ~/.config/rscaller/ca.pem.
+            let ca_pem = if let Some(ref path) = args.ca_cert {
+                std::fs::read(path)?
+            } else {
+                let default = default_ca_cert_path();
+                std::fs::read(&default).map_err(|e| {
+                    anyhow::anyhow!(
+                        "TLS requires a CA cert: pass --ca-cert or place it at {}: {}",
+                        default.display(),
+                        e
+                    )
+                })?
+            };
+            match rscaller_proto::transport::tls::connect_tls(beacon_addr, "rsbeacon", &ca_pem)
+                .await
+            {
                 Ok((reader, writer)) => {
                     let mut relay = relay::Relay::new(relay_mmap, relay_file, reader, writer);
                     relay.run().await
@@ -79,6 +112,7 @@ async fn main() -> Result<()> {
                 Err(e) => Err(e),
             }
         } else {
+            use tokio::net::TcpStream;
             match TcpStream::connect(beacon_addr).await {
                 Ok(stream) => {
                     let _ = stream.set_nodelay(true);
@@ -94,4 +128,3 @@ async fn main() -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
-

@@ -1,51 +1,59 @@
 use anyhow::Result;
-use async_trait::async_trait;
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-/// Trait for pluggable transports.
-/// Each transport provides an AsyncRead + AsyncWrite pair.
-/// Future implementations: TlsTransport, ObfsTransport, etc.
-#[async_trait]
-pub trait Transport: Send + Sync {
-    type Reader: AsyncRead + Unpin + Send;
-    type Writer: AsyncWrite + Unpin + Send;
-
-    async fn connect(addr: SocketAddr) -> Result<(Self::Reader, Self::Writer)>
-    where
-        Self: Sized;
+#[derive(Clone, Debug)]
+pub enum Transport {
+    Tcp,
+    Uds,
 }
 
-/// Plain TCP transport (development)
-pub struct TcpTransport;
-
-#[async_trait]
-impl Transport for TcpTransport {
-    type Reader = tokio::io::ReadHalf<TcpStream>;
-    type Writer = tokio::io::WriteHalf<TcpStream>;
-
-    async fn connect(addr: SocketAddr) -> Result<(Self::Reader, Self::Writer)> {
-        let stream = TcpStream::connect(addr).await?;
-        let (reader, writer) = tokio::io::split(stream);
-        Ok((reader, writer))
-    }
+#[derive(Clone, Debug)]
+pub enum Encryption {
+    None,
+    Tls { ca_cert_pem: Vec<u8> },
 }
 
-/// TLS transport (production)
-pub struct TlsTransport {
-    _priv: (),
+// ── Client side ───────────────────────────────────────────────────────────────
+
+pub async fn connect_tcp_plain(
+    addr: SocketAddr,
+) -> Result<(impl AsyncRead + Unpin + Send, impl AsyncWrite + Unpin + Send)> {
+    let s = TcpStream::connect(addr).await?;
+    let _ = s.set_nodelay(true);
+    let (r, w) = tokio::io::split(s);
+    Ok((r, w))
 }
 
-impl TlsTransport {
-    /// Create a TLS transport with a custom root cert (for self-signed certs)
-    pub fn with_root_cert(_cert_der: &[u8]) -> Result<Self> {
-        Ok(TlsTransport { _priv: () })
-    }
+pub async fn connect_tcp_tls(
+    addr: SocketAddr,
+    server_name: &str,
+    ca_cert_pem: &[u8],
+) -> Result<(impl AsyncRead + Unpin + Send, impl AsyncWrite + Unpin + Send)> {
+    tls::connect_tls(addr, server_name, ca_cert_pem).await
 }
 
-/// TLS helpers using tokio-rustls.
-/// Uses rustls with custom cert verifier for self-signed certs.
+pub async fn connect_uds_plain(
+    path: &std::path::Path,
+) -> Result<(impl AsyncRead + Unpin + Send, impl AsyncWrite + Unpin + Send)> {
+    let s = tokio::net::UnixStream::connect(path).await?;
+    let (r, w) = tokio::io::split(s);
+    Ok((r, w))
+}
+
+// ── Server side ───────────────────────────────────────────────────────────────
+
+pub async fn accept_tls(
+    stream: TcpStream,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<impl AsyncRead + Unpin + Send + AsyncWrite + Unpin + Send> {
+    tls::accept_tls(stream, cert_pem, key_pem).await
+}
+
+// ── TLS helpers ───────────────────────────────────────────────────────────────
+
 pub mod tls {
     use super::*;
     use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -75,9 +83,10 @@ pub mod tls {
 
         let connector = TlsConnector::from(Arc::new(config));
         let tcp = TcpStream::connect(addr).await?;
+        let _ = tcp.set_nodelay(true);
         let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())?;
-        let tls_stream = connector.connect(server_name, tcp).await?;
-        let (r, w) = tokio::io::split(tls_stream);
+        let tls = connector.connect(server_name, tcp).await?;
+        let (r, w) = tokio::io::split(tls);
         Ok((r, w))
     }
 
@@ -93,9 +102,7 @@ pub mod tls {
         let mut keys: Vec<_> = pkcs8_private_keys(&mut BufReader::new(key_pem))
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        if keys.is_empty() {
-            anyhow::bail!("No private keys found in key PEM");
-        }
+        anyhow::ensure!(!keys.is_empty(), "No private keys found");
 
         let config = ServerConfig::builder()
             .with_no_client_auth()

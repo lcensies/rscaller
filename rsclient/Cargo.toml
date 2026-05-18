@@ -16,6 +16,8 @@ rscaller-proto = { path = "../rscaller-proto" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+libc = { workspace = true }
 memmap2 = "0.9"
+dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -50,6 +50,29 @@ pub async fn run_tls(addr: SocketAddr, cert_pem: Vec<u8>, key_pem: Vec<u8>) -> R
     }
 }
 
+pub async fn run_uds(
+    path: &str,
+    _use_tls: bool, // UDS+TLS is unusual; always run plain for UDS
+    _cert_pem: Vec<u8>,
+    _key_pem: Vec<u8>,
+) -> Result<()> {
+    use tokio::net::UnixListener;
+
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path)?;
+    info!("rsbeacon listening (UDS) on {}", path);
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            let (mut r, mut w) = tokio::io::split(stream);
+            if let Err(e) = handle_connection(&mut r, &mut w).await {
+                warn!("UDS connection error: {}", e);
+            }
+        });
+    }
+}
+
 async fn handle_connection<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
 where
     R: AsyncRead + Unpin,

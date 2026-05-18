@@ -20,6 +20,9 @@ libc = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[build-dependencies]
+rcgen = "0.13"
+
 [dev-dependencies]
 tokio = { workspace = true }
 libc = { workspace = true }
