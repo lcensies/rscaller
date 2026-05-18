@@ -1,0 +1,22 @@
+[package]
+name = "rscfuse"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rscfuse"
+path = "src/main.rs"
+
+[dependencies]
+rscaller-proto = { path = "../rscaller-proto" }
+fuser = "0.15"
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
