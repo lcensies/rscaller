@@ -3,9 +3,16 @@
 //! Two filter modes:
 //!   --image <ref>          start a container, filter by cgroup namespace inode
 //!   --progs-folder <path>  filter by host binary path prefix (no container)
+//!
+//! Add `--microvm` to either mode to launch an ephemeral QEMU microVM instead
+//! of relying on a pre-provisioned VM.  The microVM boots rsbeacon inside,
+//! handles the workload, then is destroyed on exit.
+
+mod microvm;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::path::PathBuf;
 use std::process::Stdio;
 
 #[derive(Parser)]
@@ -23,13 +30,38 @@ struct Args {
     #[arg(long, default_value = "auto")]
     backend: String,
 
-    /// rsbeacon address (host:port)
+    /// rsbeacon address (host:port).  Overridden automatically when --microvm is set.
     #[arg(long, default_value = "127.0.0.1:9999")]
     beacon: String,
 
     /// Path to rscaller proc entry
     #[arg(long, default_value = "/proc/rscaller")]
     proc_path: String,
+
+    // ── microVM flags ──────────────────────────────────────────────────────────
+
+    /// Launch an ephemeral QEMU/Firecracker microVM instead of a pre-provisioned VM.
+    /// The microVM boots, runs the workload, then is destroyed on exit.
+    #[arg(long)]
+    microvm: bool,
+
+    /// microVM hypervisor backend: "auto" (default), "qemu", or "firecracker".
+    /// "auto" prefers Firecracker if found, falls back to QEMU.
+    #[arg(long, default_value = "auto")]
+    microvm_backend: String,
+
+    /// Path to the uncompressed guest kernel (vmlinux / bzImage).
+    /// Falls back to the RSCALLER_KERNEL environment variable.
+    #[arg(long)]
+    microvm_kernel: Option<PathBuf>,
+
+    /// Guest RAM in MiB (default: 512).
+    #[arg(long, default_value_t = 512)]
+    microvm_mem: u32,
+
+    /// Guest vCPU count (default: 1).
+    #[arg(long, default_value_t = 1)]
+    microvm_cpus: u32,
 
     /// Command to run (container exec for --image, direct spawn for --progs-folder)
     #[arg(last = true)]
@@ -66,7 +98,54 @@ async fn spawn_rsclient(beacon: &str, proc_path: &str) -> Result<std::process::C
     Ok(child)
 }
 
+// ── microVM helper ────────────────────────────────────────────────────────────
+
+/// Build `MicroVmConfig` from parsed CLI args, launch the VM, and return the
+/// effective beacon address (`127.0.0.1:<host_port>`).
+async fn maybe_launch_microvm(
+    args: &Args,
+    image: &str,
+) -> Result<Option<(microvm::MicroVmHandle, String)>> {
+    if !args.microvm {
+        return Ok(None);
+    }
+
+    // Resolve the guest kernel path.
+    let kernel = args.microvm_kernel.clone()
+        .or_else(|| std::env::var("RSCALLER_KERNEL").ok().map(PathBuf::from))
+        .context("--microvm requires a guest kernel path; \
+                  pass --microvm-kernel <path> or set RSCALLER_KERNEL")?;
+
+    let backend: microvm::MicroVmBackend = args.microvm_backend.parse()
+        .context("parsing --microvm-backend")?;
+
+    let cfg = microvm::MicroVmConfig {
+        backend,
+        kernel,
+        mem_mb: args.microvm_mem,
+        cpus: args.microvm_cpus,
+        beacon_timeout_secs: 60,
+    };
+
+    let handle = microvm::launch_microvm(&cfg, image).await?;
+    let beacon_addr = format!("127.0.0.1:{}", handle.host_port);
+    Ok(Some((handle, beacon_addr)))
+}
+
+// ── run_image ─────────────────────────────────────────────────────────────────
+
 async fn run_image(args: Args, image: String) -> Result<()> {
+    // Launch microVM if requested, overriding the beacon address.
+    let (beacon, _vm_handle) = if args.microvm {
+        let (handle, addr) = maybe_launch_microvm(&args, &image)
+            .await?
+            .expect("microvm=true guaranteed Some");
+        (addr, Some(handle))
+    } else {
+        (args.beacon.clone(), None)
+    };
+    // _vm_handle dropped at end of scope → kills microVM.
+
     let backend = match args.backend.as_str() {
         "docker" => ociman::backend::resolve::docker().await?,
         "podman" => ociman::backend::resolve::podman().await?,
@@ -79,7 +158,6 @@ async fn run_image(args: Args, image: String) -> Result<()> {
     backend.pull_image_if_absent(&reference).await.context("pulling image")?;
 
     // Notify dir bind-mounted into container. Container writes "ready" file inside it.
-    // (Docker creates target as directory; file-to-file bind-mounts don't work reliably.)
     let notify_dir = "/tmp/rscaller-notify-dir".to_string();
     std::fs::create_dir_all(&notify_dir).context("creating notify dir")?;
     let notify_flag = format!("{}/ready", notify_dir);
@@ -94,7 +172,7 @@ async fn run_image(args: Args, image: String) -> Result<()> {
         .run_detached()
         .await;
 
-    // Get container PID, then stat its cgroup namespace to get the inode
+    // Get container PID, then stat its cgroup namespace to get the inode.
     let pid_str = container.inspect_format("{{.State.Pid}}").await
         .context("getting container PID")?;
     let container_pid: u64 = pid_str.trim().parse()
@@ -112,7 +190,7 @@ async fn run_image(args: Args, image: String) -> Result<()> {
         .with_context(|| format!("writing cgns inum to {}", cgns_param))?;
     println!("Set container_cgns_inum = {}", cgns_inum);
 
-    let mut rsclient = spawn_rsclient(&args.beacon, &args.proc_path).await?;
+    let mut rsclient = spawn_rsclient(&beacon, &args.proc_path).await?;
 
     // Background task: wait for container to write ready flag, then enable forwarding.
     let notify_flag_clone = notify_flag.clone();
@@ -129,8 +207,6 @@ async fn run_image(args: Args, image: String) -> Result<()> {
     });
 
     let cmd = if args.cmd.is_empty() { vec!["/bin/sh".to_string()] } else { args.cmd };
-    // Wrapper: create ready flag (runc is done), wait for host to enable forwarding,
-    // then exec the real command.
     let wrapped = format!(
         "touch /run/rscaller-notify/ready && sleep 0.2 && exec {}",
         cmd.iter().map(|a| shell_escape(a)).collect::<Vec<_>>().join(" ")
@@ -144,6 +220,7 @@ async fn run_image(args: Args, image: String) -> Result<()> {
     let _ = std::fs::remove_dir_all(&notify_dir);
     let _ = container.stop().await; let _ = container.remove().await;
     let _ = std::fs::write(cgns_param, "0");
+    // _vm_handle dropped here → microVM killed + scratch dir removed.
 
     status.context("container exec failed")
 }
