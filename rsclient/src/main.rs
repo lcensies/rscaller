@@ -26,6 +26,10 @@ struct Args {
     /// Path to rscaller proc device
     #[arg(long, default_value = "/proc/rscaller")]
     proc_path: String,
+
+    /// Target name written to kmod via TARGET command (used for /rsc/<name>/ path routing)
+    #[arg(long)]
+    name: Option<String>,
 }
 
 #[tokio::main]
@@ -41,10 +45,18 @@ async fn main() -> Result<()> {
 
     // Open /proc/rscaller once — keeps rsclient_active=1 for the kmod.
     info!("Opening {}", args.proc_path);
-    let proc_file = OpenOptions::new()
+    let mut proc_file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(&args.proc_path)?;
+
+    // Notify kmod of the target name for /rsc/<name>/ path routing.
+    if let Some(ref name) = args.name {
+        use std::io::Write as _;
+        let msg = format!("TARGET {}\n", name);
+        proc_file.write_all(msg.as_bytes())?;
+        info!("Set target name: {}", name);
+    }
 
     // Resolve beacon address (supports both IP:port and hostname:port).
     let beacon_addr = tokio::net::lookup_host(&args.beacon)
