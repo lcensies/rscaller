@@ -17,7 +17,7 @@ obj-m += rscaller.o
 # buffer.o
 # obj-m += ${MODULE_NAME}.o 
 # rscaller-y +=  $(KHOOK_GOALS)
-rscaller-y += buffer.o  buffer_device.o syscalls.o  $(KHOOK_GOALS) main.o
+rscaller-y += buffer.o  buffer_device.o syscalls.o  $(KHOOK_GOALS) main.o remote_fs.o shadow_fd.o
 # rscaller-y += buffer.o
 ccflags-y += -std=gnu99 $(KHOOK_CCFLAGS)
 

@@ -1,7 +1,9 @@
+#include <linux/module.h>
 #include "buffer.h"
 
 /* Bug C fix: define globals once here */
 ControlBuffer *global_ctl_buffer;
+EXPORT_SYMBOL(global_ctl_buffer);
 #ifndef __USERSPACE__
 DEFINE_MUTEX(ctl_buffer_mutex);
 
