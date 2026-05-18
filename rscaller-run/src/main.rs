@@ -248,7 +248,6 @@ async fn run_image(args: Args, image: String) -> Result<()> {
         .with_context(|| format!("writing cgns inum to {}", cgns_param))?;
     println!("Set container_cgns_inum = {}", cgns_inum);
 
-    let mut rsclient = spawn_rsclient(&beacon, &args.proc_path).await?;
     let derived_name = derive_name(&args);
     let mut rsclient = spawn_rsclient(&args.beacon, &args.proc_path, Some(&derived_name)).await?;
 
