@@ -3,14 +3,13 @@
 #include <linux/syscalls.h>
 #include <linux/dirent.h>
 #include <linux/slab.h>
-#include <linux/version.h>
+#include <linux/version.h> 
 
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
 
 #include <linux/fs.h>
-#include <linux/fcntl.h>   /* AT_FDCWD, AT_SYMLINK_NOFOLLOW */
 #include <linux/nsproxy.h>
 #include "misssing_defs.h"
 #include <linux/delay.h>
@@ -23,8 +22,6 @@
 
 #include <khook/engine.h>
 #include <linux/kprobes.h>
-#include "remote_fs.h"
-#include "shadow_fd.h"
 
 
 #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
@@ -68,45 +65,6 @@ MODULE_PARM_DESC(remote_progs_folder, "Host path prefix of binaries whose syscal
 static unsigned long forwarding_enabled = 0;
 module_param(forwarding_enabled, ulong, 0644);
 MODULE_PARM_DESC(forwarding_enabled, "1 = forward syscalls from matching container; 0 = disabled");
-
-/* Target name written by rsclient via "TARGET <name>" to /proc/rscaller.
- * Used to identify /rsc/<target>/ prefix paths. */
-static char rsc_target_name[RSC_MAX_TARGET] = "";
-static DEFINE_SPINLOCK(target_name_lock);
-
-/* Per-slot remote open tracking: if slot was a remote open, remember target. */
-static struct { bool active; char target[RSC_MAX_TARGET]; } slot_remote[BUFFER_SIZE];
-static DEFINE_SPINLOCK(slot_remote_lock);
-
-static void rsc_slot_set_remote(int slot_idx, const char *target)
-{
-    unsigned long flags;
-    spin_lock_irqsave(&slot_remote_lock, flags);
-    slot_remote[slot_idx].active = true;
-    strncpy(slot_remote[slot_idx].target, target, RSC_MAX_TARGET - 1);
-    slot_remote[slot_idx].target[RSC_MAX_TARGET - 1] = '\0';
-    spin_unlock_irqrestore(&slot_remote_lock, flags);
-}
-
-static bool rsc_slot_get_remote(int slot_idx, char *out_target)
-{
-    unsigned long flags;
-    bool active;
-    spin_lock_irqsave(&slot_remote_lock, flags);
-    active = slot_remote[slot_idx].active;
-    if (active && out_target)
-        strncpy(out_target, slot_remote[slot_idx].target, RSC_MAX_TARGET - 1);
-    spin_unlock_irqrestore(&slot_remote_lock, flags);
-    return active;
-}
-
-static void rsc_slot_clear_remote(int slot_idx)
-{
-    unsigned long flags;
-    spin_lock_irqsave(&slot_remote_lock, flags);
-    slot_remote[slot_idx].active = false;
-    spin_unlock_irqrestore(&slot_remote_lock, flags);
-}
 
 /* Set to 1 during module exit so new submissions are rejected and in-flight
  * threads can drain before khook_cleanup(). */
@@ -306,11 +264,6 @@ bool filter_binary(void) {
 		char *buf, *path;
 		bool filter_out = true;
 		size_t prefix_len = strlen(remote_progs_folder);
-		/* Strip trailing whitespace/newlines written by sysfs tee */
-		while (prefix_len > 0 && (remote_progs_folder[prefix_len - 1] == '\n' ||
-		                           remote_progs_folder[prefix_len - 1] == '\r' ||
-		                           remote_progs_folder[prefix_len - 1] == ' '))
-			prefix_len--;
 
 		if (!current->mm)
 			return true;
@@ -331,88 +284,8 @@ bool filter_binary(void) {
 		return filter_out;
 	}
 
-	/* nothing configured: intercept all, rely on path pre-filter */
-	return false;
-}
-
-/* Syscall/param pairs that hold pathname strings */
-static bool rsc_param_is_path(int nr, int param_idx)
-{
-	/* open: arg0=pathname */
-	if (nr == 2 && param_idx == 0) return true;
-	/* openat: arg1=pathname */
-	if (nr == 257 && param_idx == 1) return true;
-	/* stat: arg0=pathname */
-	if (nr == 4 && param_idx == 0) return true;
-	/* lstat: arg0=pathname */
-	if (nr == 6 && param_idx == 0) return true;
-	/* newfstatat: arg1=pathname */
-	if (nr == 262 && param_idx == 1) return true;
-	/* chdir: arg0=pathname */
-	if (nr == 80 && param_idx == 0) return true;
-	return false;
-}
-
-/* Returns true if any path param was resolved to a remote path.
- * Fills out_target with the target name (from the first remote path found). */
-static bool rsc_fixup_paths(int slot_idx, int nr, char *out_target)
-{
-	int i;
-	bool found_remote = false;
-
-	for (i = 0; i < MAX_PARAMS; i++) {
-		ParamBuf *pb = &global_ctl_buffer->bufs[slot_idx].params[i];
-		char target[RSC_MAX_TARGET];
-		char resolved[512];
-
-		if (!rsc_param_is_path(nr, i))
-			continue;
-		if (pb->size == 0 || pb->user_ptr == 0)
-			continue;
-
-		pb->data[pb->size < MAX_PARAM_BUF ? pb->size : MAX_PARAM_BUF - 1] = '\0';
-
-		if (rsc_resolve_kpath((char *)pb->data, target, resolved, sizeof(resolved))) {
-			size_t rlen = strlen(resolved) + 1;
-			if (rlen > MAX_PARAM_BUF) rlen = MAX_PARAM_BUF;
-			memcpy(pb->data, resolved, rlen);
-			pb->size = (uint32_t)(rlen - 1);
-			if (!found_remote) {
-				strncpy(out_target, target, RSC_MAX_TARGET - 1);
-				out_target[RSC_MAX_TARGET - 1] = '\0';
-				found_remote = true;
-			}
-		} else if ((char)pb->data[0] != '/' &&
-			   rsc_resolve_relative((char *)pb->data, target, resolved, sizeof(resolved))) {
-			size_t rlen = strlen(resolved) + 1;
-			if (rlen > MAX_PARAM_BUF) rlen = MAX_PARAM_BUF;
-			memcpy(pb->data, resolved, rlen);
-			pb->size = (uint32_t)(rlen - 1);
-			if (!found_remote) {
-				strncpy(out_target, target, RSC_MAX_TARGET - 1);
-				out_target[RSC_MAX_TARGET - 1] = '\0';
-				found_remote = true;
-			}
-		} else if (strncmp((char *)pb->data, "/proc/", 6) == 0) {
-			/* /proc remapping: forward absolute /proc/ paths to remote when CWD is remote.
-			 * Whitelist /proc/self, /proc/<current-pid>/, /proc/sys/ — those must stay local. */
-			char pid_prefix[32];
-			char cwd_target[RSC_MAX_TARGET];
-			snprintf(pid_prefix, sizeof(pid_prefix), "/proc/%d/", (int)current->pid);
-			if (strncmp((char *)pb->data, "/proc/self", 10) != 0 &&
-			    strncmp((char *)pb->data, pid_prefix, strlen(pid_prefix)) != 0 &&
-			    strncmp((char *)pb->data, "/proc/sys/", 10) != 0 &&
-			    rsc_cwd_get(current->pid, cwd_target, NULL)) {
-				/* Keep path as-is: rsbeacon opens /proc/xxx on the remote machine */
-				if (!found_remote) {
-					strncpy(out_target, cwd_target, RSC_MAX_TARGET - 1);
-					out_target[RSC_MAX_TARGET - 1] = '\0';
-					found_remote = true;
-				}
-			}
-		}
-	}
-	return found_remote;
+	/* nothing configured */
+	return true;
 }
 
 inline int handle_syscall_common(const struct pt_regs *pt_regs,
@@ -496,50 +369,9 @@ inline int handle_syscall_common(const struct pt_regs *pt_regs,
 		kvfree(syscall);
 	}
 
-	/* Remote path resolution: scan path-type params, resolve /rsc/<target>/ prefixes */
-	{
-		char resolved_target[RSC_MAX_TARGET] = "";
-		bool is_remote = rsc_fixup_paths(slot_idx, (int)pt_regs->orig_ax, resolved_target);
-
-		/* chdir with remote path: don't forward, just update CWD */
-		if (is_remote && pt_regs->orig_ax == 80) {
-			ParamBuf *pb = &global_ctl_buffer->bufs[slot_idx].params[0];
-			pb->data[pb->size < MAX_PARAM_BUF ? pb->size : MAX_PARAM_BUF - 1] = '\0';
-			rsc_cwd_set(current->pid, resolved_target, (char *)pb->data);
-			pr_info("rscaller: remote chdir %s:%s\n", resolved_target, (char *)pb->data);
-			/* Mark slot as cancelled (-1) so rsclient drains and discards it */
-			global_ctl_buffer->kernel_to_user.nodes[slot_idx].n_params = -1;
-			*ret = 0;
-			smap_rw_enable();
-			return 0;
-		}
-
-		/* For open/openat: remember we need to wrap the remote fd */
-		if (is_remote && (pt_regs->orig_ax == 2 || pt_regs->orig_ax == 257)) {
-			rsc_slot_set_remote(slot_idx, resolved_target);
-		}
-	}
-
 	atomic_inc(&in_flight);
 	*ret = (int)control_buffer_wait_result(global_ctl_buffer, slot_idx);
 	atomic_dec(&in_flight);
-
-	/* If this was a remote open, wrap the remote fd in an anon_inode */
-	{
-		char open_target[RSC_MAX_TARGET];
-		if ((pt_regs->orig_ax == 2 || pt_regs->orig_ax == 257) &&
-		    rsc_slot_get_remote(slot_idx, open_target) &&
-		    *ret >= 0) {
-			int remote_fd = *ret;
-			int local_fd = rsc_shadow_fd_create(remote_fd, open_target);
-			if (local_fd >= 0) {
-				pr_info("rscaller: remote open -> remote_fd=%d local_anon_fd=%d target=%s\n",
-					remote_fd, local_fd, open_target);
-				*ret = local_fd;
-			}
-			rsc_slot_clear_remote(slot_idx);
-		}
-	}
 
 	/* Skip OUT copy if we were aborted (rsclient disconnect, rmmod, or signal). */
 	if (*ret == -ECONNRESET || *ret == -EINTR) {
@@ -599,132 +431,16 @@ static long khook_x64_sys_call(const struct pt_regs *regs, unsigned int nr)
 		return KHOOK_ORIGIN(x64_sys_call, regs, nr);
 	}
 
-	/* Remote FS: only intercept for matching processes */
-	if (!atomic_read(&rsclient_active) || atomic_read(&shutting_down) || filter_binary()) {
+	sig = rscaller_find_signature(nr);
+	if (!sig) {
 		atomic_dec(&hooks_executing);
 		return KHOOK_ORIGIN(x64_sys_call, regs, nr);
 	}
-
-	/* --- fd-using syscalls: only forward if fd is a shadow fd --- */
-	if (nr == 0 || nr == 1 || nr == 5 || nr == 81 || nr == 217) {
-		int fd = (int)regs->di;
-		int rfd = rsc_shadow_fd_lookup(fd);
-		if (rfd >= 0) {
-			struct pt_regs fake = *regs;
-			fake.di = (unsigned long)(unsigned int)rfd;
-			sig = rscaller_find_signature(nr);
-			if (sig && handle_syscall_common(&fake, sig, &ret) == 0) {
-				atomic_dec(&hooks_executing);
-				return ret;
-			}
-		}
-		/* Not a shadow fd: let kernel handle locally */
+	if (handle_syscall_common(regs, sig, &ret) == 0) {
 		atomic_dec(&hooks_executing);
-		return KHOOK_ORIGIN(x64_sys_call, regs, nr);
+		return ret;
 	}
 
-	/* close(3): forward close(remote_fd) if shadow fd, then close anon_inode */
-	if (nr == 3) {
-		int fd = (int)regs->di;
-		int rfd = rsc_shadow_fd_lookup(fd);
-		if (rfd >= 0) {
-			struct pt_regs fake = *regs;
-			fake.di = (unsigned long)(unsigned int)rfd;
-			sig = rscaller_find_signature(nr);
-			if (sig) handle_syscall_common(&fake, sig, &ret);
-		}
-		atomic_dec(&hooks_executing);
-		return KHOOK_ORIGIN(x64_sys_call, regs, nr);
-	}
-
-	/* --- path-based syscalls: only forward if path resolves to /rsc/ or has remote CWD --- */
-	if (nr == 2 || nr == 4 || nr == 6 || nr == 80 ||
-	    nr == 257 || nr == 262) {
-		const char __user *upath;
-		char kpath[512];
-		char target[RSC_MAX_TARGET];
-		char resolved[512];
-		bool is_remote = false;
-
-		/* arg0 holds path for: open(2), stat(4), lstat(6), chdir(80) */
-		/* arg1 holds path for: openat(257), newfstatat(262) */
-		if (nr == 2 || nr == 4 || nr == 6 || nr == 80)
-			upath = (const char __user *)regs->di;
-		else
-			upath = (const char __user *)regs->si;
-
-		if (upath && strncpy_from_user(kpath, upath, sizeof(kpath)) >= 0) {
-			kpath[sizeof(kpath) - 1] = '\0';
-			if (rsc_resolve_kpath(kpath, target, resolved, sizeof(resolved))) {
-				is_remote = true;
-			} else if (kpath[0] != '/' && rsc_cwd_get(current->pid, NULL, NULL)) {
-				is_remote = true;
-			} else if (strncmp(kpath, "/proc/", 6) == 0) {
-				/* /proc remapping: forward if remote CWD set and path not whitelisted */
-				char pid_prefix[32];
-				snprintf(pid_prefix, sizeof(pid_prefix), "/proc/%d/", (int)current->pid);
-				if (strncmp(kpath, "/proc/self", 10) != 0 &&
-				    strncmp(kpath, pid_prefix, strlen(pid_prefix)) != 0 &&
-				    strncmp(kpath, "/proc/sys/", 10) != 0 &&
-				    rsc_cwd_get(current->pid, NULL, NULL))
-					is_remote = true;
-			}
-		}
-
-		if (!is_remote) {
-			atomic_dec(&hooks_executing);
-			return KHOOK_ORIGIN(x64_sys_call, regs, nr);
-		}
-
-		/* Remap stat(4)/lstat(6) → newfstatat(262).
-		 * stat/lstat use __old_kernel_stat which is broken on modern 64-bit kernels.
-		 * newfstatat with AT_FDCWD is equivalent and always works.
-		 * stat(path@di, buf@si)  → newfstatat(AT_FDCWD@di, path@si, buf@dx, flags@r10)
-		 */
-		if (nr == 4 || nr == 6) {
-			struct pt_regs fake = *regs;
-			fake.orig_ax = 262;
-			fake.di  = (unsigned long)(long)AT_FDCWD;
-			fake.si  = regs->di;   /* path */
-			fake.dx  = regs->si;   /* buf */
-			fake.r10 = (nr == 6) ? AT_SYMLINK_NOFOLLOW : 0;
-			sig = rscaller_find_signature(262);
-			if (sig && handle_syscall_common(&fake, sig, &ret) == 0) {
-				atomic_dec(&hooks_executing);
-				return ret;
-			}
-			atomic_dec(&hooks_executing);
-			return KHOOK_ORIGIN(x64_sys_call, regs, nr);
-		}
-
-		sig = rscaller_find_signature(nr);
-		if (!sig) {
-			atomic_dec(&hooks_executing);
-			return KHOOK_ORIGIN(x64_sys_call, regs, nr);
-		}
-		if (handle_syscall_common(regs, sig, &ret) == 0) {
-			atomic_dec(&hooks_executing);
-			return ret;
-		}
-		atomic_dec(&hooks_executing);
-		return KHOOK_ORIGIN(x64_sys_call, regs, nr);
-	}
-
-	/* --- kill/tkill/tgkill: forward only if process has remote CWD --- */
-	if (nr == 62 || nr == 200 || nr == 234) {
-		char cwd_target[RSC_MAX_TARGET];
-		if (rsc_cwd_get(current->pid, cwd_target, NULL)) {
-			sig = rscaller_find_signature(nr);
-			if (sig && handle_syscall_common(regs, sig, &ret) == 0) {
-				atomic_dec(&hooks_executing);
-				return ret;
-			}
-		}
-		atomic_dec(&hooks_executing);
-		return KHOOK_ORIGIN(x64_sys_call, regs, nr);
-	}
-
-	/* All other syscalls: local only */
 	atomic_dec(&hooks_executing);
 	return KHOOK_ORIGIN(x64_sys_call, regs, nr);
 }
@@ -806,14 +522,12 @@ static ssize_t rscaller_proc_read(struct file *file, char __user *buf,
 	return 0;
 }
 
-/* Format: "DONE <slot_idx> <retval>\n" or "TARGET <name>\n" */
+/* Format: "DONE <slot_idx> <retval>\n" */
 ssize_t rscaller_proc_write(struct file *file, const char __user *buf,
                              size_t count, loff_t *ppos) {
 	char kbuf[64];
-	pr_info("rscaller: proc_write count=%zu\n", count);
 	int slot_idx;
 	long retval;
-	char tname[RSC_MAX_TARGET];
 
 	if (count >= sizeof(kbuf))
 		return -EINVAL;
@@ -825,13 +539,6 @@ ssize_t rscaller_proc_write(struct file *file, const char __user *buf,
 		if (slot_idx >= 0 && slot_idx < BUFFER_SIZE) {
 			control_buffer_complete(global_ctl_buffer, slot_idx, retval);
 		}
-	} else if (sscanf(kbuf, "TARGET %63s", tname) == 1) {
-		unsigned long flags;
-		spin_lock_irqsave(&target_name_lock, flags);
-		strncpy(rsc_target_name, tname, RSC_MAX_TARGET - 1);
-		rsc_target_name[RSC_MAX_TARGET - 1] = '\0';
-		spin_unlock_irqrestore(&target_name_lock, flags);
-		pr_info("rscaller: target set to '%s'\n", rsc_target_name);
 	}
 	return count;
 }
@@ -842,9 +549,6 @@ static int __init rscaller_init(void)
 	int ret = 0;
 
 	RSC_LOG("Rscaller init");
-
-	rsc_remote_fs_init();
-	memset(slot_remote, 0, sizeof(slot_remote));
 
 	global_ctl_buffer = control_buffer_new();
 
@@ -891,7 +595,6 @@ static void __exit rscaller_cleanup(void)
 	synchronize_rcu();
 	remove_proc_entry(DEVICE_NAME, NULL);
 	control_buffer_free(global_ctl_buffer);
-	rsc_remote_fs_exit();
 }
 
 static void vm_close(struct vm_area_struct *vma)
