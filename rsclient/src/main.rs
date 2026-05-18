@@ -33,10 +33,6 @@ struct Args {
     /// Path to rscaller proc device
     #[arg(long, default_value = "/proc/rscaller")]
     proc_path: String,
-
-    /// Target name written to kmod via TARGET command (used for /rsc/<name>/ path routing)
-    #[arg(long)]
-    name: Option<String>,
 }
 
 /// Default CA cert location for TLS when --ca-cert is not specified.
@@ -64,11 +60,6 @@ async fn main() -> Result<()> {
         .write(true)
         .open(&args.proc_path)?;
 
-    // Notify kmod of the target name for /rsc/<name>/ path routing.
-    if let Some(ref name) = args.name {
-        use std::io::Write as _;
-        let msg = format!("TARGET {}\n", name);
-        proc_file.write_all(msg.as_bytes())?;
     // Send TARGET keepalive if --name provided.
     if let Some(ref name) = args.name {
         let msg = format!("TARGET {}\n", name);
