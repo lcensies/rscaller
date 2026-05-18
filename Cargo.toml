@@ -5,6 +5,7 @@ members = [
     "rsclient",
     "rscaller-run",
     "rscaller-runner",
+    "rscfuse",
     "tools/codegen",
 ]
 exclude = []
