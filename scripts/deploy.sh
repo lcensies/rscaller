@@ -23,7 +23,7 @@ ok "sudoers done"
 # Build local binaries first so rsbeacon is always fresh on the host side.
 step "Building local Rust workspace (rsbeacon + rsclient, skip rscaller-run)"
 cd "$REPO_ROOT"
-cargo build --workspace --release --exclude rscaller-run 2>&1 | grep -E '^error|Finished'
+cargo build --workspace --release --exclude rscaller-run --exclude rscfuse 2>&1 | grep -E '^error|Finished'
 ok "local build done"
 
 step "Syncing repo to $REMOTE:$REMOTE_DIR"
