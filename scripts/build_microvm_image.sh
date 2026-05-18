@@ -26,6 +26,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Ensure cargo is on PATH (rustup default install location)
+export PATH="${HOME}/.cargo/bin:${PATH}"
+if ! command -v cargo &>/dev/null; then
+    # Try common locations
+    for candidate in /home/ubuntu/.cargo/bin /usr/local/bin /root/.cargo/bin; do
+        [[ -x "$candidate/cargo" ]] && export PATH="$candidate:$PATH" && break
+    done
+fi
+
 OUTPUT_IMG="${OUTPUT_IMG:-$REPO_ROOT/microvm-rootfs.img}"
 IMG_SIZE="${IMG_SIZE:-768M}"
 ALPINE_VERSION="${ALPINE_VERSION:-3.19}"
