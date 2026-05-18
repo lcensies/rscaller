@@ -78,9 +78,19 @@ async fn run_image(args: Args, image: String) -> Result<()> {
         .context("parsing image reference")?;
     backend.pull_image_if_absent(&reference).await.context("pulling image")?;
 
+    // Notify dir bind-mounted into container. Container writes "ready" file inside it.
+    // (Docker creates target as directory; file-to-file bind-mounts don't work reliably.)
+    let notify_dir = "/tmp/rscaller-notify-dir".to_string();
+    std::fs::create_dir_all(&notify_dir).context("creating notify dir")?;
+    let notify_flag = format!("{}/ready", notify_dir);
+    let _ = std::fs::remove_file(&notify_flag);
+
     let mut container = ociman::Definition::new(backend, reference)
         .entrypoint("sleep")
         .argument("infinity")
+        .mount(ociman::container::Mount::from(
+            format!("type=bind,source={},target=/run/rscaller-notify", notify_dir)
+        ))
         .run_detached()
         .await;
 
@@ -104,16 +114,42 @@ async fn run_image(args: Args, image: String) -> Result<()> {
 
     let mut rsclient = spawn_rsclient(&args.beacon, &args.proc_path).await?;
 
+    // Background task: wait for container to write ready flag, then enable forwarding.
+    let notify_flag_clone = notify_flag.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if std::path::Path::new(&notify_flag_clone).exists() {
+                let _ = std::fs::write(
+                    "/sys/module/rscaller/parameters/forwarding_enabled", "1");
+                println!("Forwarding enabled.");
+                break;
+            }
+        }
+    });
+
     let cmd = if args.cmd.is_empty() { vec!["/bin/sh".to_string()] } else { args.cmd };
-    let mut exec = container.exec(&cmd[0]);
-    for arg in &cmd[1..] { exec = exec.argument(arg); }
+    // Wrapper: create ready flag (runc is done), wait for host to enable forwarding,
+    // then exec the real command.
+    let wrapped = format!(
+        "touch /run/rscaller-notify/ready && sleep 0.2 && exec {}",
+        cmd.iter().map(|a| shell_escape(a)).collect::<Vec<_>>().join(" ")
+    );
+    let mut exec = container.exec("/bin/sh");
+    exec = exec.argument("-c").argument(&wrapped);
     let status = exec.tty().interactive().status().await;
 
     let _ = rsclient.kill(); let _ = rsclient.wait();
+    let _ = std::fs::write("/sys/module/rscaller/parameters/forwarding_enabled", "0");
+    let _ = std::fs::remove_dir_all(&notify_dir);
     let _ = container.stop().await; let _ = container.remove().await;
     let _ = std::fs::write(cgns_param, "0");
 
     status.context("container exec failed")
+}
+
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 async fn run_progs_folder(args: Args, folder: String) -> Result<()> {

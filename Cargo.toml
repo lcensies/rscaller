@@ -4,6 +4,7 @@ members = [
     "rsbeacon",
     "rsclient",
     "rscaller-run",
+    "rscaller-runner",
     "tools/codegen",
 ]
 exclude = []

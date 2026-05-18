@@ -58,6 +58,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Relay<R, W> {
         let slot = q.head_idx as usize % QUEUE_SIZE;
         let syscall = q.nodes[slot];
 
+        // n_params==0 means the kmod submitted the placeholder but hasn't filled
+        // params yet — wait until the real entry is written.
+        if syscall.n_params == 0 {
+            return None;
+        }
+
         q.head_idx = (q.head_idx + 1) % QUEUE_SIZE as i32;
         q.size -= 1;
 
@@ -71,6 +77,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Relay<R, W> {
         let slot_bufs = &cb.bufs[slot];
         for i in 0..n_params {
             let pb = &slot_bufs.params[i];
+            debug!(slot, param = i, direction = pb.direction, size = pb.size, user_ptr = pb.user_ptr, "param_buf");
             if pb.direction == PARAM_DIR_IN || pb.direction == PARAM_DIR_INOUT {
                 if pb.size > 0 && pb.user_ptr != 0 {
                     let len = pb.size as usize;
@@ -177,8 +184,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Relay<R, W> {
                         continue;
                     }
 
-                    match read_message::<SyscallResponse, _>(&mut self.beacon_reader).await {
-                        Ok(resp) => {
+                    let resp_result = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        read_message::<SyscallResponse, _>(&mut self.beacon_reader),
+                    ).await;
+                    match resp_result {
+                        Ok(Ok(resp)) => {
                             debug!(
                                 slot = resp.slot_idx,
                                 ret = resp.ret,
@@ -187,16 +198,20 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Relay<R, W> {
                             self.write_out_bufs(resp.slot_idx as usize, &resp.out_bufs);
                             self.signal_done(resp.slot_idx as u32, resp.ret)?;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             warn!(error = %e, "failed to read response from beacon");
                             self.signal_done(slot as u32, -EINVAL)?;
+                            return Err(e);
+                        }
+                        Err(_) => {
+                            warn!(slot, "beacon response timeout — signaling EINVAL");
+                            self.signal_done(slot as u32, -EINVAL)?;
+                            return Err(anyhow::anyhow!("beacon response timeout"));
                         }
                     }
                 }
                 None => {
-                    // Queue is empty — yield the async executor so we don't
-                    // spin-burn the CPU.
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    tokio::task::yield_now().await;
                 }
             }
         }

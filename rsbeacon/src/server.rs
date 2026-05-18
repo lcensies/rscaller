@@ -16,6 +16,7 @@ pub async fn run_plain(addr: SocketAddr) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         info!("Connection from {}", peer);
+        let _ = stream.set_nodelay(true);
         tokio::spawn(async move {
             let (mut reader, mut writer) = tokio::io::split(stream);
             if let Err(e) = handle_connection(&mut reader, &mut writer).await {

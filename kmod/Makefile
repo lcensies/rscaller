@@ -6,6 +6,10 @@ PWD := $(shell pwd)
 KMOD_DIR := ${PWD}
 LIB_DIR := ${KMOD_DIR}/lib
 EXTRA_CFLAGS += -DDIRTY=no
+# Pass RSC_DEBUG=1 on the make command line to enable verbose kmod logging
+ifdef RSC_DEBUG
+ccflags-y += -DRSC_DEBUG
+endif
 # Kernel source directory 
 KDIR := /lib/modules/$(shell uname -r)/build
 # Alternatively, create Kbuild file with contents:

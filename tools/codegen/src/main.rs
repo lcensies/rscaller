@@ -1,16 +1,14 @@
-mod codegen;
-mod syscall_table;
-mod version;
-
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use codegen::{generate_header, generate_source, metadata_map};
-use syscall_table::{build_name_map, parse_tbl};
-use version::{select_tbl_path, KernelVersion};
+use codegen::codegen::{generate_header, generate_source, metadata_map, ParamMeta, SyscallMeta};
+use codegen::syscall_table::{build_name_map, parse_tbl};
+use codegen::tracefs::{infer_params, parse_format};
+use codegen::version::{select_tbl_path, KernelVersion};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -34,6 +32,12 @@ struct Args {
     /// Override kernel version (e.g. "6.14.0"); detected via uname -r if omitted
     #[arg(long)]
     kernel_version: Option<String>,
+
+    /// Tracefs format directory (typically /sys/kernel/tracing/events/syscalls
+    /// or a snapshot of it fetched from a remote VM). If unset or files are
+    /// missing the codegen falls back to hardcoded metadata.
+    #[arg(long, default_value = "/sys/kernel/tracing/events/syscalls")]
+    tracefs_dir: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,13 +76,13 @@ fn main() -> Result<()> {
 
     eprintln!("Forwarded syscalls: {:?}", forwarded);
 
-    // 4. Load hardcoded metadata
-    let meta = metadata_map();
+    // 4. Build metadata: prefer tracefs, fall back to hardcoded per-syscall.
+    let meta = build_metadata(&forwarded, &args.tracefs_dir);
 
     // 5. Generate files
     let header = generate_header(&forwarded, &name_map, &meta)
         .context("Failed to generate handler_wrappers.h")?;
-    let source = generate_source(&forwarded, &meta)
+    let source = generate_source(&forwarded, &name_map, &meta)
         .context("Failed to generate syscalls.c")?;
 
     // 6. Write output
@@ -97,4 +101,72 @@ fn main() -> Result<()> {
     eprintln!("Generated: {}", source_path.display());
 
     Ok(())
+}
+
+/// Build the per-syscall metadata map. For each forwarded syscall try tracefs
+/// first; on failure, fall back to hardcoded metadata. Syscalls missing from
+/// both are skipped with a warning.
+fn build_metadata(forwarded: &[String], tracefs_dir: &Path) -> HashMap<String, SyscallMeta> {
+    let fallback = metadata_map();
+    let mut out: HashMap<String, SyscallMeta> = HashMap::new();
+
+    for name in forwarded {
+        let format_path = tracefs_dir
+            .join(format!("sys_enter_{}", name))
+            .join("format");
+        match fs::read_to_string(&format_path) {
+            Ok(content) => {
+                let fields = parse_format(&content);
+                if fields.is_empty() {
+                    eprintln!(
+                        "warning: tracefs format empty for '{}'; falling back to hardcoded",
+                        name
+                    );
+                    if let Some(m) = fallback.get(name) {
+                        out.insert(name.clone(), m.clone());
+                    }
+                    continue;
+                }
+                let inferred = infer_params(name, &fields);
+                let params: Vec<ParamMeta> = inferred.into_iter().map(|ip| ip.meta).collect();
+                // buf_idx: first pointer param, or -1
+                let buf_idx = params
+                    .iter()
+                    .position(|p| p.ctype.is_ptr())
+                    .map(|i| i as i32)
+                    .unwrap_or(-1);
+                eprintln!(
+                    "tracefs: '{}' -> {} params (buf_idx={})",
+                    name,
+                    params.len(),
+                    buf_idx
+                );
+                out.insert(
+                    name.clone(),
+                    SyscallMeta {
+                        name: name.clone(),
+                        params,
+                        buf_idx,
+                    },
+                );
+            }
+            Err(_) => {
+                if let Some(m) = fallback.get(name) {
+                    eprintln!(
+                        "tracefs: '{}' not found at {}; using hardcoded fallback",
+                        name,
+                        format_path.display()
+                    );
+                    out.insert(name.clone(), m.clone());
+                } else {
+                    eprintln!(
+                        "warning: no metadata for syscall '{}' (tracefs + fallback both missing)",
+                        name
+                    );
+                }
+            }
+        }
+    }
+
+    out
 }

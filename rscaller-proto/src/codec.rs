@@ -26,21 +26,17 @@ where
 }
 
 /// Write a length-prefixed bincode message to an async writer.
+/// Serializes into a single buffer (len ++ body) so the kernel sends one TCP segment.
 pub async fn write_message<T, W>(writer: &mut W, msg: &T) -> Result<()>
 where
     T: Serialize,
     W: AsyncWrite + Unpin,
 {
-    let buf = bincode::serialize(msg).context("serializing message")?;
-    let len = buf.len() as u32;
-    writer
-        .write_all(&len.to_le_bytes())
-        .await
-        .context("writing message length")?;
-    writer
-        .write_all(&buf)
-        .await
-        .context("writing message body")?;
-    writer.flush().await.context("flushing writer")?;
+    let body = bincode::serialize(msg).context("serializing message")?;
+    let len = body.len() as u32;
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&body);
+    writer.write_all(&frame).await.context("writing framed message")?;
     Ok(())
 }

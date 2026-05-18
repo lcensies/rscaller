@@ -1,0 +1,16 @@
+# Manual overrides for syscall parameter metadata.
+# Overrides the tracefs-inferred metadata for specific syscalls when heuristics
+# are wrong. Each [[syscall]] entry replaces the ENTIRE param list for that
+# syscall. Leave this file empty (or all entries commented out) to rely fully
+# on tracefs introspection.
+
+# Example: force fstat's statbuf to be an OUT pointer with a static 144-byte size.
+# [[syscall]]
+# name = "fstat"
+# [[syscall.param]]
+# type = "int"
+# dir = "in"
+# [[syscall.param]]
+# type = "void*"
+# dir = "out"
+# static_bytes = 144

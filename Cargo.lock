@@ -694,6 +694,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rscaller-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "codegen",
+]
+
+[[package]]
 name = "rsclient"
 version = "0.1.0"
 dependencies = [

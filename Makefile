@@ -79,7 +79,7 @@ BEACON_HOST ?= 0.0.0.0
 BEACON_PORT ?= 9999
 # Libvirt domain names (default to SSH host names)
 VM_DOMAIN        ?= $(REMOTE)
-VM_SNAPSHOT      ?= clean-base
+VM_SNAPSHOT      ?= clean-base-docker-nokmod
 VM_DOMAIN_CLIENT ?= $(CLIENT)
 
 .PHONY: build test integration-tests setup-remote deploy deploy-remote test-remote handlers \

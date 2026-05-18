@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 // ---------------------------------------------------------------------------
 // Metadata types
@@ -76,6 +76,10 @@ pub enum ParamDir { In, Out, InOut }
 pub struct ParamMeta {
     pub ctype: CType,
     pub dir: ParamDir,
+    /// If Some(i), buffer size is determined at runtime from params[i].
+    pub size_from_arg: Option<usize>,
+    /// If Some(n), use this fixed byte count for the buffer (overrides ctype default).
+    pub static_buf_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,46 +91,144 @@ pub struct SyscallMeta {
 }
 
 // ---------------------------------------------------------------------------
-// Hardcoded metadata for the 4 forwarded syscalls
+// Hardcoded metadata — used as a fallback when tracefs is unavailable.
+// Prefer tracefs introspection; this is kept for tests and offline builds.
 // ---------------------------------------------------------------------------
+
+/// Convenience constructor for non-pointer params (no size hints).
+fn pm(ctype: CType, dir: ParamDir) -> ParamMeta {
+    ParamMeta { ctype, dir, size_from_arg: None, static_buf_bytes: None }
+}
+
+/// Convenience constructor for pointer params with a runtime size source.
+fn pm_dynbuf(ctype: CType, dir: ParamDir, size_from_arg: usize) -> ParamMeta {
+    ParamMeta { ctype, dir, size_from_arg: Some(size_from_arg), static_buf_bytes: None }
+}
+
+/// Convenience constructor for pointer params with a static byte size.
+fn pm_staticbuf(ctype: CType, dir: ParamDir, bytes: usize) -> ParamMeta {
+    ParamMeta { ctype, dir, size_from_arg: None, static_buf_bytes: Some(bytes) }
+}
 
 pub fn hardcoded_syscall_metadata() -> Vec<SyscallMeta> {
     vec![
         SyscallMeta {
+            name: "read".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                              // fd
+                pm_dynbuf(CType::CharPtr, ParamDir::Out, 2),                // buf (size = arg2)
+                pm(CType::UnsignedLong, ParamDir::In),                     // count
+            ],
+            buf_idx: 1,
+        },
+        SyscallMeta {
+            name: "write".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                              // fd
+                pm_dynbuf(CType::CharPtr, ParamDir::In, 2),                 // buf (size = arg2)
+                pm(CType::UnsignedLong, ParamDir::In),                     // count
+            ],
+            buf_idx: 1,
+        },
+        SyscallMeta {
+            name: "close".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                              // fd
+            ],
+            buf_idx: -1,
+        },
+        SyscallMeta {
             name: "kill".to_string(),
             params: vec![
-                ParamMeta { ctype: CType::Int, dir: ParamDir::In },  // pid
-                ParamMeta { ctype: CType::Int, dir: ParamDir::In },  // sig
+                pm(CType::Int, ParamDir::In),  // pid
+                pm(CType::Int, ParamDir::In),  // sig
             ],
             buf_idx: -1,
         },
         SyscallMeta {
             name: "execve".to_string(),
             params: vec![
-                ParamMeta { ctype: CType::CharPtr, dir: ParamDir::In },  // filename (buf_idx=0)
-                ParamMeta { ctype: CType::VoidPtr, dir: ParamDir::In }, // argv
-                ParamMeta { ctype: CType::VoidPtr, dir: ParamDir::In }, // envp
+                pm_staticbuf(CType::CharPtr, ParamDir::In, 4096),   // filename
+                pm(CType::VoidPtr, ParamDir::In),                   // argv
+                pm(CType::VoidPtr, ParamDir::In),                   // envp
             ],
             buf_idx: 0,
         },
         SyscallMeta {
             name: "open".to_string(),
             params: vec![
-                ParamMeta { ctype: CType::CharPtr, dir: ParamDir::In },  // filename (buf_idx=0)
-                ParamMeta { ctype: CType::Int, dir: ParamDir::In },  // flags
-                ParamMeta { ctype: CType::UnsignedInt, dir: ParamDir::In }, // mode
+                pm_staticbuf(CType::CharPtr, ParamDir::In, 4096),  // filename
+                pm(CType::Int, ParamDir::In),                      // flags
+                pm(CType::UnsignedInt, ParamDir::In),              // mode
             ],
             buf_idx: 0,
         },
         SyscallMeta {
             name: "openat".to_string(),
             params: vec![
-                ParamMeta { ctype: CType::Int, dir: ParamDir::In },  // dfd
-                ParamMeta { ctype: CType::CharPtr, dir: ParamDir::In },  // filename (buf_idx=1)
-                ParamMeta { ctype: CType::Int, dir: ParamDir::In },  // flags
-                ParamMeta { ctype: CType::UnsignedInt, dir: ParamDir::In }, // mode
+                pm(CType::Int, ParamDir::In),                       // dfd
+                pm_staticbuf(CType::CharPtr, ParamDir::In, 4096),   // filename
+                pm(CType::Int, ParamDir::In),                       // flags
+                pm(CType::UnsignedInt, ParamDir::In),               // mode
             ],
             buf_idx: 1,
+        },
+        SyscallMeta {
+            name: "stat".to_string(),
+            params: vec![
+                pm_staticbuf(CType::CharPtr, ParamDir::In, 4096),   // pathname
+                pm_staticbuf(CType::VoidPtr, ParamDir::Out, 144),   // statbuf
+            ],
+            buf_idx: 0,
+        },
+        SyscallMeta {
+            name: "fstat".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                       // fd
+                pm_staticbuf(CType::VoidPtr, ParamDir::Out, 144),   // statbuf
+            ],
+            buf_idx: -1,
+        },
+        SyscallMeta {
+            name: "lstat".to_string(),
+            params: vec![
+                pm_staticbuf(CType::CharPtr, ParamDir::In, 4096),   // pathname
+                pm_staticbuf(CType::VoidPtr, ParamDir::Out, 144),   // statbuf
+            ],
+            buf_idx: 0,
+        },
+        SyscallMeta {
+            name: "getdents64".to_string(),
+            params: vec![
+                pm(CType::UnsignedInt, ParamDir::In),               // fd
+                pm_dynbuf(CType::VoidPtr, ParamDir::Out, 2),         // dirp (size = arg2)
+                pm(CType::UnsignedInt, ParamDir::In),               // count
+            ],
+            buf_idx: 1,
+        },
+        SyscallMeta {
+            name: "newfstatat".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                       // dfd
+                pm_staticbuf(CType::CharPtr, ParamDir::In, 4096),   // filename
+                pm_staticbuf(CType::VoidPtr, ParamDir::Out, 144),   // statbuf
+                pm(CType::Int, ParamDir::In),                       // flag
+            ],
+            buf_idx: 1,
+        },
+        SyscallMeta {
+            name: "chdir".to_string(),
+            params: vec![
+                pm_staticbuf(CType::CharPtr, ParamDir::In, 4096),   // path
+            ],
+            buf_idx: 0,
+        },
+        SyscallMeta {
+            name: "fchdir".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),  // fd
+            ],
+            buf_idx: -1,
         },
     ]
 }
@@ -214,7 +316,7 @@ pub fn generate_header(
     out.push_str("\t*param = (void*)&src->char_ptr_type; param_type = sizeof(src->char_ptr_type);\n");
     out.push_str("}\n\n");
 
-    // 5. extern SyscallSignature declarations
+    // 5. extern SyscallSignature declarations + dispatch function declaration
     for name in forwarded {
         out.push_str(&format!(
             "extern SyscallSignature signature__x64_sys_{};\n",
@@ -222,6 +324,8 @@ pub fn generate_header(
         ));
     }
     out.push('\n');
+    out.push_str("const SyscallSignature *rscaller_find_signature(unsigned int nr);\n");
+    out.push_str("void rscaller_patch_ptr_params(int nr, const unsigned long *params, int slot_idx);\n\n");
 
     // 6. Handler wrapper functions
     for name in forwarded {
@@ -263,11 +367,19 @@ fn variant_to_member(variant: &str) -> &'static str {
 
 pub fn generate_source(
     forwarded: &[String],
+    name_to_num: &HashMap<String, u32>,
     meta_map: &HashMap<String, SyscallMeta>,
 ) -> Result<String> {
     let mut out = String::new();
 
-    out.push_str("#include \"types.h\"\n\n");
+    out.push_str("#include \"types.h\"\n");
+    out.push_str("#include \"buffer.h\"\n");
+    out.push_str("#include \"handler_wrappers.h\"\n");
+    out.push_str("#ifndef __USERSPACE__\n");
+    out.push_str("#include <linux/kernel.h>\n");
+    out.push_str("#include <linux/string.h>\n");
+    out.push_str("#include <linux/uaccess.h>\n");
+    out.push_str("#endif\n\n");
 
     for name in forwarded {
         let meta = meta_map
@@ -283,7 +395,13 @@ pub fn generate_source(
 
         for param in &meta.params {
             let enum_val = param.ctype.enum_variant();
-            let size_expr = param.ctype.size_expr();
+            // Prefer static_buf_bytes when present, else fall back to ctype's
+            // default size expression.
+            let size_expr = if let Some(n) = param.static_buf_bytes {
+                format!("{}", n)
+            } else {
+                param.ctype.size_expr().to_string()
+            };
             let is_ptr = if param.ctype.is_ptr() { "true" } else { "false" };
             let dir_val = match param.dir {
                 ParamDir::In    => "PARAM_DIR_IN",
@@ -299,6 +417,152 @@ pub fn generate_source(
         out.push_str("\t},\n");
         out.push_str("};\n\n");
     }
+
+    // Dispatch table: maps syscall number → signature pointer.
+    // Used by rscaller_find_signature() in main.c instead of a hand-written switch.
+    out.push_str("static const struct { unsigned int nr; const SyscallSignature *sig; }\n");
+    out.push_str("dispatch_table[] = {\n");
+    for name in forwarded {
+        let nr = name_to_num
+            .get(name.as_str())
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Syscall '{}' not found in .tbl", name))?;
+        out.push_str(&format!("\t{{ {}, &signature__x64_sys_{} }},\n", nr, name));
+    }
+    out.push_str("};\n\n");
+
+    out.push_str("const SyscallSignature *rscaller_find_signature(unsigned int nr) {\n");
+    out.push_str("\tsize_t i;\n");
+    out.push_str("\tfor (i = 0; i < sizeof(dispatch_table)/sizeof(dispatch_table[0]); i++)\n");
+    out.push_str("\t\tif (dispatch_table[i].nr == nr)\n");
+    out.push_str("\t\t\treturn dispatch_table[i].sig;\n");
+    out.push_str("\treturn NULL;\n");
+    out.push_str("}\n\n");
+
+    // rscaller_patch_ptr_params: populate per-slot ParamBuf entries for
+    // syscalls with pointer args, based on the generated metadata.
+    out.push_str("/* AUTO-GENERATED: patch pointer-param ParamBufs before save_syscall(). */\n");
+    out.push_str("void rscaller_patch_ptr_params(int nr, const unsigned long *params, int slot_idx)\n");
+    out.push_str("{\n");
+    out.push_str("#ifndef __USERSPACE__\n");
+    out.push_str("\tParamBuf *pb;\n");
+    out.push_str("\tsize_t sz;\n");
+    out.push_str("\t(void)pb; (void)sz;\n");
+    out.push_str("\tswitch (nr) {\n");
+
+    for name in forwarded {
+        let nr = name_to_num
+            .get(name.as_str())
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Syscall '{}' not found in .tbl", name))?;
+        let meta = meta_map
+            .get(name.as_str())
+            .ok_or_else(|| anyhow::anyhow!("No metadata for syscall '{}'", name))?;
+
+        // Skip syscalls with no pointer params — nothing to patch.
+        let has_ptr = meta.params.iter().any(|p| p.ctype.is_ptr());
+        if !has_ptr {
+            continue;
+        }
+
+        out.push_str(&format!("\tcase {}: /* {} */\n", nr, name));
+        for (i, param) in meta.params.iter().enumerate() {
+            if !param.ctype.is_ptr() {
+                continue;
+            }
+            let dir_str = match param.dir {
+                ParamDir::In => "PARAM_DIR_IN",
+                ParamDir::Out => "PARAM_DIR_OUT",
+                ParamDir::InOut => "PARAM_DIR_INOUT",
+            };
+            let is_in = matches!(param.dir, ParamDir::In | ParamDir::InOut);
+            let is_charptr = matches!(param.ctype, CType::CharPtr);
+
+            match (param.size_from_arg, param.static_buf_bytes) {
+                (Some(j), _) => {
+                    // Dynamic size from another arg.
+                    out.push_str(&format!(
+                        "\t\tsz = min((unsigned long)params[{}], (unsigned long)MAX_PARAM_BUF);\n",
+                        j
+                    ));
+                    out.push_str(&format!(
+                        "\t\tpb = &global_ctl_buffer->bufs[slot_idx].params[{}];\n",
+                        i
+                    ));
+                    out.push_str(&format!(
+                        "\t\tpb->user_ptr = params[{}]; pb->size = (uint32_t)sz; pb->direction = {};\n",
+                        i, dir_str
+                    ));
+                    if is_in {
+                        out.push_str(&format!(
+                            "\t\tif (sz && params[{}]) copy_from_user(pb->data, (const void __user *)params[{}], sz);\n",
+                            i, i
+                        ));
+                    } else {
+                        out.push_str("\t\tmemset(pb->data, 0, sz);\n");
+                    }
+                }
+                (None, Some(bytes)) => {
+                    out.push_str(&format!(
+                        "\t\tpb = &global_ctl_buffer->bufs[slot_idx].params[{}];\n",
+                        i
+                    ));
+                    if is_in && is_charptr {
+                        // NUL-terminated string copy.
+                        out.push_str(&format!(
+                            "\t\tpb->user_ptr = params[{}]; pb->size = (uint32_t){}; pb->direction = {};\n",
+                            i, bytes, dir_str
+                        ));
+                        out.push_str(&format!(
+                            "\t\tif (params[{}]) strncpy_from_user((char *)pb->data, (const char __user *)params[{}], {});\n",
+                            i, i, bytes
+                        ));
+                    } else if is_in {
+                        out.push_str(&format!(
+                            "\t\tpb->user_ptr = params[{}]; pb->size = (uint32_t){}; pb->direction = {};\n",
+                            i, bytes, dir_str
+                        ));
+                        out.push_str(&format!(
+                            "\t\tif (params[{}]) copy_from_user(pb->data, (const void __user *)params[{}], {});\n",
+                            i, i, bytes
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "\t\tpb->user_ptr = params[{}]; pb->size = (uint32_t){}; pb->direction = {};\n",
+                            i, bytes, dir_str
+                        ));
+                        out.push_str(&format!("\t\tmemset(pb->data, 0, {});\n", bytes));
+                    }
+                }
+                (None, None) => {
+                    // No size hint — best-effort default: treat as IN string (4096).
+                    out.push_str(&format!(
+                        "\t\tpb = &global_ctl_buffer->bufs[slot_idx].params[{}];\n",
+                        i
+                    ));
+                    out.push_str(&format!(
+                        "\t\tpb->user_ptr = params[{}]; pb->size = (uint32_t)MAX_PARAM_BUF; pb->direction = {};\n",
+                        i, dir_str
+                    ));
+                    if is_in && is_charptr {
+                        out.push_str(&format!(
+                            "\t\tif (params[{}]) strncpy_from_user((char *)pb->data, (const char __user *)params[{}], MAX_PARAM_BUF);\n",
+                            i, i
+                        ));
+                    }
+                }
+            }
+        }
+        out.push_str("\t\tbreak;\n");
+    }
+
+    out.push_str("\tdefault:\n");
+    out.push_str("\t\tbreak;\n");
+    out.push_str("\t}\n");
+    out.push_str("#else\n");
+    out.push_str("\t(void)nr; (void)params; (void)slot_idx;\n");
+    out.push_str("#endif\n");
+    out.push_str("}\n");
 
     Ok(out)
 }
@@ -337,19 +601,30 @@ mod tests {
             header.contains("signature__x64_sys_execve"),
             "Missing execve extern"
         );
+        assert!(
+            header.contains("rscaller_patch_ptr_params"),
+            "Missing rscaller_patch_ptr_params decl"
+        );
     }
 
     #[test]
     fn test_generate_source_contains_signatures() {
+        let name_map = tbl_name_map();
         let meta = metadata_map();
-        let forwarded = vec!["kill".to_string()];
+        let forwarded = vec!["kill".to_string(), "read".to_string()];
 
-        let src = generate_source(&forwarded, &meta).expect("codegen failed");
+        let src = generate_source(&forwarded, &name_map, &meta).expect("codegen failed");
 
         assert!(
             src.contains("signature__x64_sys_kill"),
             "Missing signature definition"
         );
         assert!(src.contains("n_params = 2"), "kill should have 2 params");
+        assert!(
+            src.contains("rscaller_patch_ptr_params"),
+            "Missing rscaller_patch_ptr_params definition"
+        );
+        // read's buf is OUT and its size comes from params[2]
+        assert!(src.contains("params[2]"), "read patch should reference params[2]");
     }
 }

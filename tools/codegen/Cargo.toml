@@ -3,6 +3,10 @@ name = "codegen"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "codegen"
+path = "src/lib.rs"
+
 [[bin]]
 name = "codegen"
 path = "src/main.rs"

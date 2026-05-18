@@ -24,11 +24,19 @@ typedef unsigned short umode_t;
 #endif
 
 #ifdef __USERSPACE__
+#ifdef RSC_DEBUG
 #define RSC_LOG printf
+#else
+#define RSC_LOG(...) do {} while (0)
+#endif
 #define RSC_MALLOC(n) malloc(n)
 #define RSC_FREE(n) free(n)
 #else
+#ifdef RSC_DEBUG
 #define RSC_LOG pr_info
+#else
+#define RSC_LOG(...) do {} while (0)
+#endif
 #define RSC_MALLOC(n) kmalloc(n, GFP_KERNEL)
 #define RSC_FREE(n) kfree(n)
 #endif

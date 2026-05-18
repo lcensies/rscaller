@@ -199,8 +199,11 @@ int control_buffer_submit_syscall(ControlBuffer *cb, Syscall *syscall) {
 
 #ifndef __USERSPACE__
 long control_buffer_wait_result(ControlBuffer *cb, int slot_idx) {
+    long r;
     (void)cb;
-    wait_for_completion_interruptible(&ktu_completions[slot_idx]);
+    r = wait_for_completion_interruptible(&ktu_completions[slot_idx]);
+    if (r != 0)
+        return -EINTR;
     return ktu_retvals[slot_idx];
 }
 

@@ -81,6 +81,7 @@ async fn main() -> Result<()> {
         } else {
             match TcpStream::connect(beacon_addr).await {
                 Ok(stream) => {
+                    let _ = stream.set_nodelay(true);
                     let (reader, writer) = tokio::io::split(stream);
                     let mut relay = relay::Relay::new(relay_mmap, relay_file, reader, writer);
                     relay.run().await
