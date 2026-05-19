@@ -18,7 +18,7 @@
 #   /tmp/rscaller-rootfs.img    — ext4 rootfs with rsbeacon + rscaller.ko
 #   /tmp/fc-config.json         — Firecracker config
 #
-# Guest networking: 172.16.0.2/30, host tap: 172.16.0.1/30
+# Guest networking: 172.16.0.2/30, host tap: 172.16.0.1/30 (same /30 subnet)
 # rsbeacon listens on guest :9999, reachable from host at 172.16.0.2:9999
 
 set -euo pipefail

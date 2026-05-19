@@ -57,3 +57,28 @@ Currently CLIENT and REMOTE should be the same machine unless a remote /proc mou
 Always kill rsclient before rmmod. If rsclient is killed mid-syscall (while inside the
 khook stub), `use_count` leaks and rmmod hangs. The test script enforces:
 `pkill -9 rsclient → sleep 0.5 → rmmod`.
+
+## Shell / Tmux Workflow
+
+- **Use tmux panes for all long-running commands** (deploy, build, SSH). Never use
+  `run_in_background` Bash for blocking operations — use `tmux send-keys` instead.
+- Pane map (session `rscaller`):
+  - `1.1` — Claude Code session (llm-redactor-exec) — do not run commands here
+  - `1.2` — SSH to dev-vm-rscaller (192.168.122.115), cwd `/home/ubuntu/rscaller`
+  - `1.3` — SSH to dev-vm-rscaller-clone (192.168.122.168)
+- Deploy: `tmux send-keys -t rscaller:1.2 "BECOME_PASS=ubuntu bash ~/rscaller/scripts/deploy.sh 2>&1 | tee /tmp/deploy.log" Enter`
+- Check: `tmux capture-pane -t rscaller:1.2 -p | tail -30`
+
+## VM Notes
+
+- rmmod while rsclient is connected crashes the VM — reboot, then re-insmod
+- VM IP can change on reboot — verify with `hostname -I` in pane 1.2 and update `~/.ssh/config`
+- rsbeacon accumulates CLOSE-WAIT sockets if rsclient reconnects repeatedly; kill and restart rsbeacon to clear
+- Forwarding LOCAL-path syscalls to rsbeacon breaks it (fd number collisions destroy rsbeacon epoll fd)
+
+## Remote FS Architecture
+
+- `/rsc/<target>/path` prefix: kmod intercepts path syscalls, strips prefix, forwards to rsbeacon
+- Shadow fds: `anon_inode_getfd`-backed fds that proxy read/write/close to rsbeacon's remote fd
+- Target name: written to `/proc/rscaller` as `TARGET <name>` by rsclient on startup
+- **Only forward to rsbeacon for `/rsc/` paths or shadow fds** — everything else KHOOK_ORIGIN
