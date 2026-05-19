@@ -100,7 +100,11 @@ KMOD_KO="$REPO_ROOT/kmod/rscaller.ko"
 
 if [[ "$SKIP_KMOD_BUILD" != "1" ]]; then
     echo "==> [4/7] Building rscaller.ko against kernel $KERNEL_VER headers..."
-    (cd "$REPO_ROOT/kmod" && make clean 2>/dev/null || true && make -j"$(nproc)" 2>&1)
+    KDIR="/lib/modules/${KERNEL_VER}/build"
+    [[ -d "$KDIR" ]] || { echo "ERROR: kernel headers not found at $KDIR"; exit 1; }
+    (cd "$REPO_ROOT/kmod" && \
+        make clean KDIR="$KDIR" 2>&1 | tail -3 || true && \
+        make -j"$(nproc)" KDIR="$KDIR" 2>&1)
     [[ -f "$KMOD_KO" ]] || { echo "ERROR: rscaller.ko not produced"; exit 1; }
     echo "    kmod: $(file "$KMOD_KO" | cut -d, -f1-2)"
 else
