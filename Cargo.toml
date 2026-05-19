@@ -6,6 +6,7 @@ members = [
     "rscaller-run",
     "rscaller-runner",
     "tools/codegen",
+    "rsc",
 ]
 exclude = []
 resolver = "2"
