@@ -25,8 +25,8 @@ ldflags-y  += $(KHOOK_LDFLAGS) # use LDFLAGS for old kernels
 
 
 headers:
-	@if [ ! -d /lib/modules/$(shell uname -r)/build ]; then \
-		echo "Kernel headers not found. Run: sudo apt-get install linux-headers-$(shell uname -r)"; \
+	@if [ ! -d $(KDIR) ]; then \
+		echo "Kernel headers not found at $(KDIR). Run: sudo apt-get install linux-headers-$(shell uname -r)"; \
 		exit 1; \
 	fi
 
