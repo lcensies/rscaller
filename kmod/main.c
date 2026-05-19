@@ -11,6 +11,7 @@
 
 #include <linux/fs.h>
 #include <linux/nsproxy.h>
+#include <linux/cgroup.h>
 #include "misssing_defs.h"
 #include <linux/delay.h>
 #include <linux/init.h>
@@ -44,6 +45,14 @@ unsigned long init_begin;
 #define vm_flags_set(vma, flags)   ((vma)->vm_flags |= (flags))
 #define vm_flags_clear(vma, flags) ((vma)->vm_flags &= ~(flags))
 #endif
+
+/* Cgroup directory inode for per-process forwarding (rsc wrapper mode).
+ * Written by rsc/rscaller-run after creating a dedicated cgroup subtree.
+ * 0 = disabled.
+ * TODO: extend to a bitmap/list for concurrent rsc invocations. */
+static unsigned long target_cgroup_ino = 0;
+module_param(target_cgroup_ino, ulong, 0644);
+MODULE_PARM_DESC(target_cgroup_ino, "Cgroup dir inode for per-process forwarding");
 
 /* Cgroup namespace inode number of the target container (--image mode).
  * Written by rscaller-run after starting the container.
@@ -245,6 +254,34 @@ err:
  *   - progs folder:    binary exe path starts with remote_progs_folder prefix
  * If neither is configured, nothing is forwarded. */
 bool filter_binary(void) {
+	/* --- cgroup inode mode (rsc wrapper / RSC_REMOTE env var) --- *
+	 * Checked first so it takes priority over the other filter modes.
+	 * The rsc binary creates a dedicated cgroup, moves the target process
+	 * into it, and writes the cgroup directory inode here.  We walk the
+	 * current task's default-hierarchy cgroup and compare its kernfs node
+	 * id against the stored inode.
+	 *
+	 * kn->id: on kernels < 5.1 this is a union { u64 id; struct { u32 ino;
+	 * u32 generation; }; }; on 5.1+ it is a plain u64.  We cast to
+	 * unsigned long, which holds the lower 64 bits on both layouts and
+	 * matches what userspace sees via stat(2).st_ino. */
+	if (target_cgroup_ino != 0) {
+		struct cgroup *cgrp;
+		unsigned long ino = 0;
+
+		rcu_read_lock();
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 6, 0)
+		cgrp = task_dfl_cgroup(current);
+#else
+		cgrp = current->cgroups->dfl_cgrp;
+#endif
+		if (cgrp && cgrp->kn)
+			ino = (unsigned long)cgrp->kn->id;
+		rcu_read_unlock();
+
+		return ino != target_cgroup_ino;
+	}
+
 	/* --- cgroup namespace mode --- */
 	if (container_cgns_inum != 0) {
 		struct cgroup_namespace *cgns;
