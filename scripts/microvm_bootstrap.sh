@@ -86,9 +86,9 @@ else
     ROOTFS_DIR="$(mktemp -d /tmp/rscaller-rootfs-build-XXXXXX)"
     trap 'rm -rf "$ROOTFS_DIR"' EXIT
 
-    log "  Exporting Alpine 3.19 via docker..."
-    CID="$(docker run -d alpine:3.19 sh -c 'apk add --no-cache iproute2 2>/dev/null || true; sleep 5')"
-    sleep 6
+    log "  Exporting Ubuntu 22.04 via docker (glibc — matches rsbeacon binary)..."
+    CID="$(docker run -d ubuntu:22.04 sh -c 'apt-get update -qq && apt-get install -y -qq iproute2 2>/dev/null; sleep 5')"
+    sleep 15
     docker export "$CID" | tar -x -C "$ROOTFS_DIR" 2>/dev/null
     docker rm -f "$CID" >/dev/null
 
