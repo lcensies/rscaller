@@ -314,8 +314,17 @@ bool filter_binary(void) {
 			return true;
 
 		path = d_path(&exe->f_path, buf, PATH_MAX);
-		if (!IS_ERR(path) && strncmp(path, remote_progs_folder, prefix_len) == 0)
-			filter_out = false;
+		if (IS_ERR(path)) {
+			pr_info_ratelimited("rscaller: filter_binary d_path err=%ld comm=%s\n",
+				PTR_ERR(path), current->comm);
+		} else {
+			pr_info_ratelimited("rscaller: filter_binary path=%s prefix=%s match=%d comm=%s\n",
+				path, remote_progs_folder,
+				strncmp(path, remote_progs_folder, prefix_len) == 0 ? 1 : 0,
+				current->comm);
+			if (strncmp(path, remote_progs_folder, prefix_len) == 0)
+				filter_out = false;
+		}
 
 		kfree(buf);
 		return filter_out;
@@ -527,14 +536,14 @@ static int rscaller_dev_mmap_new(struct file *filp, struct vm_area_struct *vma)
 		return -EINVAL;
 	}
 
-	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 
-	/* remap_pfn_range works correctly for multi-page __get_free_pages
-	 * allocations; vm_insert_page fails on tail pages (compound page
-	 * tail pages have refcount 0). */
+	/* VM_IO causes remap_pfn_range to reject normal RAM pages on 6.x — omit it.
+	 * remap_pfn_range works fine for __get_free_pages memory on all versions. */
 	ret = remap_pfn_range(vma, vma->vm_start,
 	                      virt_to_phys(global_ctl_buffer) >> PAGE_SHIFT,
 	                      size, vma->vm_page_prot);
+	pr_info("rscaller: mmap remap_pfn_range ret=%d\n", ret);
 	return ret;
 }
 

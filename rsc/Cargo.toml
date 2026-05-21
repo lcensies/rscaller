@@ -2,12 +2,12 @@
 name = "rsc"
 version = "0.1.0"
 edition = "2021"
+description = "rsc launcher — run a binary with syscalls forwarded to rsbeacon"
 
 [[bin]]
 name = "rsc"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
-uuid = { version = "1", features = ["v4"] }
-libc = "0.2"
+anyhow = { workspace = true }
+libc = { workspace = true }

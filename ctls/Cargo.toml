@@ -1,0 +1,21 @@
+[package]
+name = "ctls"
+version = "0.1.0"
+edition = "2021"
+description = "Syscall interception controller abstraction for rscaller"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dependencies.memmap2]
+workspace = true
+optional = true
+
+[features]
+default = ["kmod", "seccomp"]
+kmod = ["dep:memmap2"]
+seccomp = []

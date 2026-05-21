@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use std::net::SocketAddr;
+use rustls;
 
 mod executor;
 mod server;
@@ -19,7 +20,7 @@ struct Args {
     #[arg(long, default_value = "tcp", help = "Transport: tcp|uds")]
     transport: String,
 
-    #[arg(long, default_value = "tls", help = "Encryption: none|tls")]
+    #[arg(long, default_value = "none", help = "Encryption: none|tls")]
     encryption: String,
 
     /// Override embedded TLS certificate (PEM)
@@ -40,6 +41,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 0.23 with both aws-lc-rs and ring compiled in — must pick one explicitly.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Ensure fd 0/1/2 stay occupied so remote file opens don't get fd<3
     unsafe {
         for fd in 0i32..3 {

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "ctls",
     "rscaller-proto",
     "rsbeacon",
     "rsclient",
@@ -27,3 +28,5 @@ rustls-pemfile = "2"
 tokio-rustls = "0.26"
 thiserror = "1"
 async-trait = "0.1"
+memmap2 = "0.9"
+tracing = "0.1"

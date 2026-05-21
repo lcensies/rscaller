@@ -12,12 +12,13 @@ name = "rsclient"
 path = "src/lib.rs"
 
 [dependencies]
+ctls = { path = "../ctls" }
 rscaller-proto = { path = "../rscaller-proto" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 libc = { workspace = true }
-memmap2 = "0.9"
+rustls = { workspace = true }
+tracing = { workspace = true }
 dirs = "5"
-tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

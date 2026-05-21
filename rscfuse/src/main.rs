@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use rustls;
 use fuser::MountOption;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -45,6 +46,8 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -97,8 +100,6 @@ fn main() -> Result<()> {
     let options = vec![
         MountOption::RW,
         MountOption::FSName(args.name.clone()),
-        MountOption::AutoUnmount,
-        MountOption::AllowOther,
     ];
 
     tracing::info!("Mounting FUSE fs at {} ...", mount_point);

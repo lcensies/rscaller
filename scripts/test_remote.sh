@@ -91,8 +91,17 @@ if [[ -z "$LOCAL_IP" ]]; then
   LOCAL_IP="$BEACON_HOST"
 fi
 echo "  (local IP seen from client: $LOCAL_IP)"
+# Copy CA cert to CLIENT so rsclient can verify rsbeacon's TLS cert
+CA_PEM="$(find "$REPO_ROOT/target/release/build" -name "ca.pem" 2>/dev/null | head -1)"
+if [[ -n "$CA_PEM" ]]; then
+  scp -q "$CA_PEM" "$CLIENT:/tmp/rscaller-ca.pem"
+  CA_CERT_ARG="--ca-cert /tmp/rscaller-ca.pem"
+else
+  CA_CERT_ARG=""
+fi
 ssh "$CLIENT" "source ~/.cargo/env 2>/dev/null; nohup $REMOTE_DIR/target/release/rsclient \
   --beacon '${LOCAL_IP}:${BEACON_PORT}' \
+  $CA_CERT_ARG \
   --proc-path /proc/rscaller > /tmp/rsclient.log 2>&1 &"
 sleep 1
 run_test "rsclient_running"     "pgrep -fa rsclient | grep -v grep"
