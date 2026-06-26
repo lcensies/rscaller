@@ -3,6 +3,7 @@ use clap::Parser;
 use tracing::{info, warn};
 
 mod relay;
+mod veth;
 
 #[derive(Parser)]
 #[command(name = "rsclient", about = "rscaller userspace relay client")]
@@ -23,6 +24,28 @@ struct Args {
     /// Target name written to kmod via TARGET command (kmod backend)
     #[arg(long)]
     name: Option<String>,
+
+    // ── Veth auto-setup ──────────────────────────────────────────────────────
+    /// Name of the local veth end (default: rsc0); only used if --veth-ip is set
+    #[arg(long, default_value = "rsc0")]
+    veth: String,
+
+    /// IP address to assign to the local veth end (victim-subnet IP); triggers veth creation
+    #[arg(long)]
+    veth_ip: Option<String>,
+
+    /// Name of the veth peer end (default: rsc1)
+    #[arg(long, default_value = "rsc1")]
+    veth_peer: String,
+
+    // ── Filter config ────────────────────────────────────────────────────────
+    /// Subnet to intercept and forward (e.g. 192.0.2.160/29)
+    #[arg(long)]
+    filter_net: Option<String>,
+
+    /// Comma-separated ports to intercept (e.g. 80,443)
+    #[arg(long)]
+    filter_ports: Option<String>,
 
     // ── Seccomp backend options ──────────────────────────────────────────────
     /// Seccomp notify fd integer (seccomp backend).
@@ -65,6 +88,13 @@ fn load_ca_pem(ca_cert: Option<&str>) -> Result<Vec<u8>> {
     }
 }
 
+/// Write a single-line command to the kmod proc file (e.g. "FILTER_NET 192.0.2.0/29\n").
+fn write_filter_cmd(ctl: &mut ctls::kmod::KmodController, key: &str, value: &str) -> Result<()> {
+    ctl.write_cmd(&format!("{} {}\n", key, value))?;
+    info!("kmod config: {} {}", key, value);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -77,6 +107,20 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // ── Veth setup ───────────────────────────────────────────────────────────
+    // Only create veth if --veth-ip is given (opt-in).
+    if let Some(ref ip) = args.veth_ip {
+        veth::setup_veth(&args.veth, ip, &args.veth_peer)?;
+
+        // Add a host route for the filter subnet via the veth, if specified.
+        if let Some(ref net) = args.filter_net {
+            // Ignore failure — route may already exist.
+            if let Err(e) = veth::add_route(net, &args.veth) {
+                warn!("add_route skipped: {}", e);
+            }
+        }
+    }
 
     let beacon_addr = tokio::net::lookup_host(&args.beacon)
         .await?
@@ -103,6 +147,12 @@ async fn run_kmod(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()> {
     if let Some(ref name) = args.name {
         _keepalive.set_target_name(name)?;
         info!("Set kmod target name: {}", name);
+    }
+    if let Some(ref net) = args.filter_net {
+        write_filter_cmd(&mut _keepalive, "FILTER_NET", net)?;
+    }
+    if let Some(ref ports) = args.filter_ports {
+        write_filter_cmd(&mut _keepalive, "FILTER_PORTS", ports)?;
     }
 
     let use_tls = args.encryption == "tls";

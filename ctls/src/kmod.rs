@@ -155,8 +155,12 @@ impl KmodController {
 
     /// Send a `TARGET <name>` command to the kmod.
     pub fn set_target_name(&mut self, name: &str) -> Result<()> {
-        let msg = format!("TARGET {}\n", name);
-        self.proc_file.write_all(msg.as_bytes())?;
+        self.write_cmd(&format!("TARGET {}\n", name))
+    }
+
+    /// Write a raw newline-terminated command string to the kmod proc file.
+    pub fn write_cmd(&mut self, cmd: &str) -> Result<()> {
+        self.proc_file.write_all(cmd.as_bytes())?;
         Ok(())
     }
 
