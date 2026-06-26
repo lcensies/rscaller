@@ -12,3 +12,13 @@ getdents64
 newfstatat
 chdir
 fchdir
+socket
+connect
+bind
+accept4
+sendto
+recvfrom
+sendmsg
+recvmsg
+getsockopt
+setsockopt

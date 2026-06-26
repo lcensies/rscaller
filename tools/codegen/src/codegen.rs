@@ -230,6 +230,107 @@ pub fn hardcoded_syscall_metadata() -> Vec<SyscallMeta> {
             ],
             buf_idx: -1,
         },
+        SyscallMeta {
+            name: "socket".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),  // family
+                pm(CType::Int, ParamDir::In),  // type
+                pm(CType::Int, ParamDir::In),  // protocol
+            ],
+            buf_idx: -1,
+        },
+        SyscallMeta {
+            name: "connect".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                        // fd
+                pm_staticbuf(CType::VoidPtr, ParamDir::In, 128),     // uservaddr (sockaddr)
+                pm(CType::UnsignedInt, ParamDir::In),                // addrlen
+            ],
+            buf_idx: 1,
+        },
+        SyscallMeta {
+            name: "bind".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                        // fd
+                pm_staticbuf(CType::VoidPtr, ParamDir::In, 128),     // umyaddr (sockaddr)
+                pm(CType::UnsignedInt, ParamDir::In),                // addrlen
+            ],
+            buf_idx: 1,
+        },
+        SyscallMeta {
+            name: "accept4".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                        // fd
+                pm_staticbuf(CType::VoidPtr, ParamDir::Out, 128),    // upeer_sockaddr
+                pm_staticbuf(CType::VoidPtr, ParamDir::InOut, 4),    // upeer_addrlen (socklen_t*)
+                pm(CType::Int, ParamDir::In),                        // flags
+            ],
+            buf_idx: 1,
+        },
+        SyscallMeta {
+            name: "sendto".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                        // fd
+                pm_dynbuf(CType::VoidPtr, ParamDir::In, 2),          // buff (size = arg2)
+                pm(CType::UnsignedLong, ParamDir::In),               // len
+                pm(CType::UnsignedInt, ParamDir::In),                // flags
+                pm_staticbuf(CType::VoidPtr, ParamDir::In, 128),     // addr (sockaddr, optional)
+                pm(CType::UnsignedInt, ParamDir::In),                // addr_len
+            ],
+            buf_idx: 1,
+        },
+        SyscallMeta {
+            name: "recvfrom".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                        // fd
+                pm_dynbuf(CType::VoidPtr, ParamDir::Out, 2),         // ubuf (size = arg2)
+                pm(CType::UnsignedLong, ParamDir::In),               // size
+                pm(CType::UnsignedInt, ParamDir::In),                // flags
+                pm_staticbuf(CType::VoidPtr, ParamDir::Out, 128),    // addr (sockaddr, optional)
+                pm_staticbuf(CType::VoidPtr, ParamDir::InOut, 4),    // addr_len (socklen_t*)
+            ],
+            buf_idx: 1,
+        },
+        SyscallMeta {
+            name: "sendmsg".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                        // fd
+                pm_staticbuf(CType::VoidPtr, ParamDir::In, 56),      // msg (struct msghdr)
+                pm(CType::UnsignedInt, ParamDir::In),                // flags
+            ],
+            buf_idx: 1,
+        },
+        SyscallMeta {
+            name: "recvmsg".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                        // fd
+                pm_staticbuf(CType::VoidPtr, ParamDir::InOut, 56),   // msg (struct msghdr)
+                pm(CType::UnsignedInt, ParamDir::In),                // flags
+            ],
+            buf_idx: 1,
+        },
+        SyscallMeta {
+            name: "getsockopt".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                        // fd
+                pm(CType::Int, ParamDir::In),                        // level
+                pm(CType::Int, ParamDir::In),                        // optname
+                pm_staticbuf(CType::VoidPtr, ParamDir::Out, 128),    // optval
+                pm_staticbuf(CType::VoidPtr, ParamDir::InOut, 4),    // optlen (socklen_t*)
+            ],
+            buf_idx: 3,
+        },
+        SyscallMeta {
+            name: "setsockopt".to_string(),
+            params: vec![
+                pm(CType::Int, ParamDir::In),                        // fd
+                pm(CType::Int, ParamDir::In),                        // level
+                pm(CType::Int, ParamDir::In),                        // optname
+                pm_staticbuf(CType::VoidPtr, ParamDir::In, 128),     // optval
+                pm(CType::UnsignedInt, ParamDir::In),                // optlen
+            ],
+            buf_idx: 3,
+        },
     ]
 }
 
