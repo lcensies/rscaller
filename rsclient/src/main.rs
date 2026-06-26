@@ -141,6 +141,11 @@ async fn main() -> Result<()> {
 async fn run_kmod(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()> {
     use ctls::kmod::KmodController;
 
+    let filter = relay::NetFilter::parse(
+        args.filter_net.as_deref(),
+        args.filter_ports.as_deref(),
+    )?;
+
     // Keep the original fd open so kmod sees rsclient_active=1.
     info!("Opening kmod proc at {}", args.proc_path);
     let mut _keepalive = KmodController::open(&args.proc_path)?;
@@ -171,13 +176,13 @@ async fn run_kmod(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()> {
                     &ca_pem,
                 )
                 .await?;
-                relay::Relay::new(ctl, r, w).run().await
+                relay::Relay::new(ctl, r, w).with_filter(filter.clone()).run().await
             } else {
                 use tokio::net::TcpStream;
                 let stream = TcpStream::connect(beacon_addr).await?;
                 let _ = stream.set_nodelay(true);
                 let (r, w) = tokio::io::split(stream);
-                relay::Relay::new(ctl, r, w).run().await
+                relay::Relay::new(ctl, r, w).with_filter(filter.clone()).run().await
             }
         }
         .await;
@@ -209,6 +214,11 @@ async fn run_seccomp(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()
     let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     let ctl = SeccompController::from_fd(owned);
 
+    let filter = relay::NetFilter::parse(
+        args.filter_net.as_deref(),
+        args.filter_ports.as_deref(),
+    )?;
+
     info!("Connecting to beacon at {}", beacon_addr);
 
     let use_tls = args.encryption == "tls";
@@ -220,12 +230,12 @@ async fn run_seccomp(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()
             &ca_pem,
         )
         .await?;
-        relay::Relay::new(ctl, r, w).run().await
+        relay::Relay::new(ctl, r, w).with_filter(filter).run().await
     } else {
         use tokio::net::TcpStream;
         let stream = TcpStream::connect(beacon_addr).await?;
         let _ = stream.set_nodelay(true);
         let (r, w) = tokio::io::split(stream);
-        relay::Relay::new(ctl, r, w).run().await
+        relay::Relay::new(ctl, r, w).with_filter(filter).run().await
     }
 }

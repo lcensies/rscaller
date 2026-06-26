@@ -472,4 +472,27 @@ impl SyscallController for SeccompController {
 
         Ok(())
     }
+
+    async fn continue_syscall(&mut self, id: u64) -> Result<()> {
+        // SECCOMP_USER_NOTIF_FLAG_CONTINUE = 1: kernel runs the syscall itself.
+        const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
+        let fd = self.fd;
+        let resp = SeccompNotifResp {
+            id,
+            val: 0,
+            error: 0,
+            flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+        };
+        let ret = unsafe {
+            libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, &resp as *const SeccompNotifResp)
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(());
+            }
+            bail!("continue_syscall SECCOMP_IOCTL_NOTIF_SEND id={}: {}", id, err);
+        }
+        Ok(())
+    }
 }

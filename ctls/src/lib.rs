@@ -59,4 +59,15 @@ pub trait SyscallController: Send {
         out_bufs: &[(u8, Vec<u8>)],
         original_args: &SyscallArgs,
     ) -> Result<()>;
+
+    /// Resume the intercepted syscall locally — let the kernel execute it as
+    /// if it were never intercepted.
+    ///
+    /// For the seccomp backend this sends `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.
+    /// For the kmod backend there is no equivalent; the default impl returns
+    /// an error so callers know forwarding is required.
+    async fn continue_syscall(&mut self, id: u64) -> Result<()> {
+        let _ = id;
+        anyhow::bail!("continue_syscall not supported by this controller backend")
+    }
 }
