@@ -68,29 +68,26 @@ run_test "kmod_in_lsmod"        "lsmod | grep rscaller"
 run_test "proc_entry_exists"    "ls /proc/rscaller"
 run_test "dmesg_init"           "$SUDO dmesg | grep -i 'rscaller'"
 
-# --- Start local rsbeacon ---
+# --- Start local rsbeacon + SSH tunnel so VM can reach it ---
 echo ""
-echo "-- Local rsbeacon (localhost:$BEACON_PORT) --"
+echo "-- Local rsbeacon (localhost:$BEACON_PORT, tunnelled to $CLIENT) --"
 pkill rsbeacon 2>/dev/null || true
-"$REPO_ROOT/target/release/rsbeacon" --listen "${BEACON_HOST}:${BEACON_PORT}" &
+"$REPO_ROOT/target/release/rsbeacon" --listen "127.0.0.1:${BEACON_PORT}" &
 BEACON_PID=$!
-trap "kill \$BEACON_PID 2>/dev/null || true
+# Forward BEACON_PORT on the VM back to localhost here via reverse tunnel
+ssh -N -R "${BEACON_PORT}:127.0.0.1:${BEACON_PORT}" "$CLIENT" &
+TUNNEL_PID=$!
+trap "kill \$BEACON_PID \$TUNNEL_PID 2>/dev/null || true
   ssh '$CLIENT' 'pkill -9 rsclient 2>/dev/null || true' 2>/dev/null || true
   sleep 0.5
   ssh '$REMOTE' '$SUDO rmmod rscaller 2>/dev/null || $SUDO rmmod -f rscaller 2>/dev/null || true' 2>/dev/null || true" EXIT
-sleep 0.5
+sleep 1
 run_test "rsbeacon_listening"   "ss -tlnp | grep $BEACON_PORT" "local"
 
 # --- Start rsclient relay on CLIENT ---
 echo ""
-echo "-- rsclient relay ($CLIENT -> local beacon) --"
+echo "-- rsclient relay ($CLIENT -> tunnel:$BEACON_PORT) --"
 ssh "$CLIENT" "pkill -9 rsclient 2>/dev/null || true"
-# Resolve local IP reachable from CLIENT via the SSH connection source address
-LOCAL_IP="$(ssh "$CLIENT" 'echo $SSH_CLIENT' 2>/dev/null | awk '{print $1}')"
-if [[ -z "$LOCAL_IP" ]]; then
-  LOCAL_IP="$BEACON_HOST"
-fi
-echo "  (local IP seen from client: $LOCAL_IP)"
 # Copy CA cert to CLIENT so rsclient can verify rsbeacon's TLS cert
 CA_PEM="$(find "$REPO_ROOT/target/release/build" -name "ca.pem" 2>/dev/null | head -1)"
 if [[ -n "$CA_PEM" ]]; then
@@ -99,8 +96,8 @@ if [[ -n "$CA_PEM" ]]; then
 else
   CA_CERT_ARG=""
 fi
-ssh "$CLIENT" "source ~/.cargo/env 2>/dev/null; nohup $REMOTE_DIR/target/release/rsclient \
-  --beacon '${LOCAL_IP}:${BEACON_PORT}' \
+ssh "$CLIENT" "nohup $REMOTE_DIR/target/release/rsclient \
+  --beacon '127.0.0.1:${BEACON_PORT}' \
   $CA_CERT_ARG \
   --proc-path /proc/rscaller > /tmp/rsclient.log 2>&1 &"
 sleep 1

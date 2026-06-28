@@ -1,0 +1,61 @@
+---
+- name: Provision rscaller VM
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    rust_user: "{{ ansible_user }}"
+
+  tasks:
+    - name: Install apt packages
+      apt:
+        name:
+          - build-essential
+          - pkg-config
+          - libssl-dev
+          - libfuse2
+          - libfuse-dev
+          - fuse
+          - curl
+          - git
+          - make
+          - linux-headers-{{ ansible_kernel }}
+          - linux-tools-common
+        state: present
+        update_cache: true
+
+    - name: Install linux-tools for running kernel
+      apt:
+        name: linux-tools-{{ ansible_kernel }}
+        state: present
+      ignore_errors: true
+
+    - name: Check if cargo is installed
+      stat:
+        path: /home/{{ rust_user }}/.cargo/bin/cargo
+      register: cargo_bin
+
+    - name: Install rustup + stable toolchain
+      become: false
+      shell: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+      when: not cargo_bin.stat.exists
+
+    - name: Install Docker
+      block:
+        - name: Check if docker is installed
+          command: docker --version
+          register: docker_check
+          ignore_errors: true
+          changed_when: false
+
+        - name: Install Docker via get.docker.com
+          shell: curl -fsSL https://get.docker.com | sh
+          when: docker_check.rc != 0
+
+        - name: Add user to docker group
+          user:
+            name: "{{ rust_user }}"
+            groups: docker
+            append: true
+          when: docker_check.rc != 0

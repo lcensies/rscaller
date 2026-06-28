@@ -2,12 +2,19 @@
 name = "rsc"
 version = "0.1.0"
 edition = "2021"
-description = "rsc launcher — run a binary with syscalls forwarded to rsbeacon"
+description = "rsc — run binaries/images/shells with syscalls forwarded to a remote rsbeacon"
 
 [[bin]]
 name = "rsc"
 path = "src/main.rs"
 
+[features]
+default = ["container"]
+container = ["dep:tokio", "dep:ociman"]
+
 [dependencies]
 anyhow = { workspace = true }
 libc = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true, optional = true }
+ociman = { git = "https://github.com/mbj/mrs", optional = true }

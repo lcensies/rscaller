@@ -1,0 +1,9 @@
+[project]
+name = "remote"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "fabric>=3.2.3",
+    "pytest>=9.1.1",
+]

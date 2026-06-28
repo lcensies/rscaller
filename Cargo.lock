@@ -819,7 +819,10 @@ name = "rsc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "libc",
+ "ociman",
+ "tokio",
 ]
 
 [[package]]
@@ -835,25 +838,6 @@ dependencies = [
  "serde",
  "tokio",
  "tokio-rustls",
-]
-
-[[package]]
-name = "rscaller-run"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "ociman",
- "tokio",
-]
-
-[[package]]
-name = "rscaller-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "codegen",
 ]
 
 [[package]]

@@ -1,0 +1,44 @@
+services:
+  tracee:
+    image: aquasec/tracee:latest
+    container_name: tracee
+    privileged: true
+    pid: host
+    network_mode: host
+    volumes:
+      - /etc/os-release:/etc/os-release-host:ro
+      - /boot:/boot:ro
+      - /lib/modules:/lib/modules:ro
+      - /usr/src:/usr/src:ro
+      - /sys/kernel/security:/sys/kernel/security:ro
+      - /tmp/tracee:/tmp/tracee
+    command:
+      - --output=json
+      - --server=metrics
+      - --server=http-address=:3366
+      - --events=${TRACEE_EVENTS:-execve,execveat}
+    labels:
+      logging: tracee
+
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: loki
+    user: root
+    volumes:
+      - ./config/loki/loki.yml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: promtail
+    volumes:
+      - ./config/promtail/promtail.yml:/etc/promtail/config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - loki
+
+volumes:
+  loki-data:

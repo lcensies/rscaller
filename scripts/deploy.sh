@@ -20,13 +20,7 @@ ssh "$REMOTE" "echo ${BECOME_PASS} | sudo -S bash -c \
    chmod 440 /etc/sudoers.d/99-rscaller-nopasswd'" 2>/dev/null || true
 ok "sudoers done"
 
-# Build local binaries first so rsbeacon is always fresh on the host side.
-step "Building local Rust workspace (rsbeacon + rsclient, skip rscaller-run)"
-cd "$REPO_ROOT"
-cargo build --workspace --release --exclude rscaller-run --exclude rscfuse 2>&1 | grep -E '^error|Finished'
-ok "local build done"
-
-step "Syncing repo to $REMOTE:$REMOTE_DIR"
+step "Syncing repo source to $REMOTE:$REMOTE_DIR"
 rsync -az --delete \
   --exclude='.git/' \
   --exclude='target/' \
@@ -39,56 +33,16 @@ rsync -az --delete \
   --exclude='vms/' \
   --exclude='.workmux-prompts/' \
   --exclude='certs/' \
-  --exclude='lib/khook/' \
+  --exclude='lib/khook/.git/' \
   "$REPO_ROOT/" "$REMOTE:$REMOTE_DIR/"
 ok "rsync done"
 
-step "Fetching tracefs format files from $REMOTE"
-TRACEFS_TMP="$(mktemp -d)"
-trap 'rm -rf "$TRACEFS_TMP"' EXIT
-ssh -n "$REMOTE" "sudo mountpoint -q /sys/kernel/tracing || sudo mount -t tracefs nodev /sys/kernel/tracing"
-while IFS= read -r syscall; do
-    syscall="${syscall%%#*}"
-    syscall="${syscall// /}"
-    [[ -z "$syscall" ]] && continue
-    mkdir -p "$TRACEFS_TMP/sys_enter_${syscall}"
-    ssh -n "$REMOTE" "sudo cat /sys/kernel/tracing/events/syscalls/sys_enter_${syscall}/format" \
-        > "$TRACEFS_TMP/sys_enter_${syscall}/format" 2>/dev/null || true
-done < "$REPO_ROOT/files/forwarded_syscalls"
-ok "tracefs fetched to $TRACEFS_TMP"
-
-step "Generating kmod headers + building kmod + Rust workspace on $REMOTE"
-# Codegen is run locally so the freshly-fetched tracefs snapshot drives the
-# generated metadata; the produced syscalls.c / handler_wrappers.h get rsync'd
-# in the next step (we re-sync after codegen).
-cargo run -p codegen --release -- \
-  --tbl-dir files --forwarded files/forwarded_syscalls \
-  --tracefs-dir "$TRACEFS_TMP" \
-  --out kmod 2>&1 | grep -v '^warning' || true
-ok "codegen done"
-
-step "Re-syncing regenerated kmod sources to $REMOTE"
-rsync -az \
-  "$REPO_ROOT/kmod/handler_wrappers.h" \
-  "$REPO_ROOT/kmod/syscalls.c" \
-  "$REMOTE:$REMOTE_DIR/kmod/"
-ok "rsync (codegen output) done"
-
-ssh "$REMOTE" "bash -s" << ENDSSH
-set -euo pipefail
-source "\$HOME/.cargo/env" 2>/dev/null || true
-cd "$REMOTE_DIR"
-
-# Build kmod
-cd kmod && make all 2>&1 | grep -E 'error:|LD \[M\]|Error [0-9]'
-ls -lh rscaller.ko && cd ..
-
-# Build Rust workspace (includes rscaller-run on remote)
-cargo build --workspace --release 2>&1 | grep -E '^error|Finished'
-ls -lh target/release/rsclient target/release/rsbeacon target/release/rscaller-run
-ENDSSH
-ok "all built"
+step "Building Rust workspace on $REMOTE (release)"
+ssh "$REMOTE" "source \$HOME/.cargo/env 2>/dev/null; \
+  cd $REMOTE_DIR && \
+  cargo build --workspace --release --exclude rscfuse 2>&1 | grep -E '^error|Finished'"
+ok "remote build done"
 
 echo ""
-echo "==> Deploy done. Load kmod:"
-echo "    ssh $REMOTE 'cd $REMOTE_DIR/kmod && sudo insmod rscaller.ko'"
+echo "==> Deploy done."
+echo "    To build and load kmod: ssh $REMOTE 'cd $REMOTE_DIR/kmod && make all && sudo insmod rscaller.ko'"

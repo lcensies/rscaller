@@ -1,4 +1,12 @@
 PWD := $(shell pwd)
+
+# Detect NixOS and wrap cargo in nix-shell when needed
+IS_NIXOS := $(shell test -f /etc/NIXOS && echo 1 || echo 0)
+ifeq ($(IS_NIXOS),1)
+CARGO = nix-shell $(PWD)/shell.nix --run "cargo $1"
+else
+CARGO = cargo $1
+endif
 KMOD_DIR := kmod
 KMOD_ABS_DIR := ${PWD}/kmod
 SCRIPTS_DIR := scripts
@@ -15,10 +23,9 @@ MAKE_CMD := docker run --rm -it ${COMMON_VOLUMES} -w /app ${MAKE_IMAGE} make
 
 BUFFER_HEADER_PATH := ${KMOD_ABS_DIR}/buffer_header_only.h
 
-.PHONY: kmod kmod_native kmod_docker kmod_reload
+.PHONY: all kmod kmod_native kmod_docker kmod_reload configure
 
-# TODO: download linux kernel sources
-# TODO2: use syscall table based on kernel sourcecs
+all: build
 
 configure: btf bindings handlers
 # 	sudo dnf install kernel-devel-$(uname -r)
@@ -73,7 +80,7 @@ dev-env:
 # ---------------------------------------------------------------------------
 # Rust workspace
 # ---------------------------------------------------------------------------
-REMOTE      ?= dev-vm-rscaller
+REMOTE      ?= dev-vm-1
 CLIENT      ?=
 BEACON_HOST ?= 0.0.0.0
 BEACON_PORT ?= 9999
@@ -82,17 +89,17 @@ VM_DOMAIN        ?= $(REMOTE)
 VM_SNAPSHOT      ?= clean-base-docker-nokmod
 VM_DOMAIN_CLIENT ?= $(CLIENT)
 
-.PHONY: build test integration-tests setup-remote deploy deploy-remote test-remote handlers \
-        snapshot-create snapshot-restore
+.PHONY: build test integration-tests setup-remote provision deploy deploy-remote deploy-no-snap \
+        test-remote test-remote-no-snap test-vm handlers snapshot-create snapshot-restore
 
 build:
-	cargo build --workspace
+	$(call CARGO,build --workspace)
 
 handlers:
-	cargo run -p codegen -- --tbl-dir files --forwarded files/forwarded_syscalls --out kmod
+	$(call CARGO,run -p codegen -- --tbl-dir files --forwarded files/forwarded_syscalls --out kmod)
 
 test:
-	cargo test --workspace
+	$(call CARGO,test --workspace)
 
 integration-tests:
 	@echo "=== Local integration tests ==="
@@ -103,6 +110,10 @@ integration-tests:
 
 setup-remote:
 	bash scripts/setup_remote.sh $(REMOTE)
+
+provision:
+	ansible-playbook -i $(REMOTE), -u ubuntu scripts/provision.yml
+	$(if $(CLIENT),ansible-playbook -i $(CLIENT), -u ubuntu scripts/provision.yml,)
 
 deploy:
 	bash scripts/deploy.sh $(REMOTE)
@@ -122,8 +133,25 @@ snapshot-restore:
 deploy-remote: snapshot-restore
 	bash scripts/deploy.sh $(REMOTE)
 	$(if $(CLIENT),bash scripts/deploy.sh $(CLIENT),)
-	cargo build --release -p rsbeacon
+	$(call CARGO,build --release -p rsbeacon)
+
+# Like deploy-remote + test-remote but skips snapshot restore (VM has no snapshots)
+deploy-no-snap:
+	bash scripts/deploy.sh $(REMOTE)
+	$(if $(CLIENT),bash scripts/deploy.sh $(CLIENT),)
+	$(call CARGO,build --release -p rsbeacon)
 
 test-remote: deploy-remote
 	REMOTE=$(REMOTE) CLIENT=$(CLIENT) BEACON_HOST=$(BEACON_HOST) BEACON_PORT=$(BEACON_PORT) \
 	  bash scripts/test_remote.sh $(REMOTE)
+
+test-remote-no-snap: deploy-no-snap
+	REMOTE=$(REMOTE) CLIENT=$(CLIENT) BEACON_HOST=$(BEACON_HOST) BEACON_PORT=$(BEACON_PORT) \
+	  bash scripts/test_remote.sh $(REMOTE)
+
+# pytest-based VM integration tests
+# Usage: make test-vm [REMOTE=dev-vm-1] [CLIENT=dev-vm-2] [NO_DEPLOY=1]
+test-vm:
+	cd tests/remote && pytest $(if $(NO_DEPLOY),--no-deploy,) \
+	  --remote=$(REMOTE) $(if $(CLIENT),--client=$(CLIENT),) \
+	  --beacon-port=$(BEACON_PORT)

@@ -1,5 +1,5 @@
 use rsclient::kmod::{ControlBuffer, KmodSyscall, MemoryQueue, SyscallParam};
-use rsclient::relay::Relay;
+use rsclient::relay::kmod_syscall_to_request;
 use rscaller_proto::types::SyscallRequest;
 use std::mem;
 
@@ -45,7 +45,7 @@ fn test_to_request_basic_conversion() {
         },
     };
 
-    let req: SyscallRequest = Relay::<tokio::io::DuplexStream, tokio::io::DuplexStream>::to_request(7, &sc);
+    let req: SyscallRequest = kmod_syscall_to_request(7, &sc);
 
     assert_eq!(req.slot_idx, 7, "slot_idx must match");
     assert_eq!(req.number, 62, "syscall number must match kill(62)");
@@ -72,7 +72,7 @@ fn test_to_request_execve() {
         },
     };
 
-    let req = Relay::<tokio::io::DuplexStream, tokio::io::DuplexStream>::to_request(0, &sc);
+    let req = kmod_syscall_to_request(0, &sc);
 
     assert_eq!(req.number, 59);
     assert_eq!(req.args[0], fake_ptr);

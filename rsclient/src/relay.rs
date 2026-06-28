@@ -15,6 +15,7 @@ use anyhow::Result;
 use ctls::{Notification, SyscallController};
 use rscaller_proto::codec::{read_message, write_message};
 use rscaller_proto::types::{SyscallBuf, SyscallRequest, SyscallResponse};
+use crate::kmod::KmodSyscall;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, warn};
 
@@ -244,6 +245,19 @@ fn notification_to_request(n: &Notification) -> SyscallRequest {
         args: n.args,
         in_bufs,
         out_sizes: n.out_sizes.clone(),
+    }
+}
+pub fn kmod_syscall_to_request(slot_idx: u64, sc: &KmodSyscall) -> SyscallRequest {
+    let mut args = [0u64; 6];
+    for (i, p) in sc.param_bufs.iter().enumerate() {
+        args[i] = unsafe { p.ulong_type };
+    }
+    SyscallRequest {
+        slot_idx,
+        number: sc.number as u64,
+        args,
+        in_bufs: vec![],
+        out_sizes: vec![],
     }
 }
 

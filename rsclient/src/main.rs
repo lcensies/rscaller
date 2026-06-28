@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use tracing::{info, warn};
 
+mod kmod;
 mod relay;
 mod veth;
 

@@ -16,7 +16,7 @@ sleep 0.3
 
 ss -tlnp | grep "$PORT" >/dev/null || { echo "FAIL: beacon not listening on $PORT"; exit 1; }
 
-cargo test -p rsbeacon -- --test-output immediate 2>&1 | \
+cargo test -p rsbeacon -- --show-output 2>&1 | \
   grep -E "^test |^running [0-9]|test result:"
 
 echo "PASS"

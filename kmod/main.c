@@ -20,6 +20,8 @@
 #include <linux/uaccess.h> /* copy_from_user, copy_to_user */
 #include <asm/io.h>        /* virt_to_phys */
 #include <linux/slab.h>
+#include <linux/inet.h>    /* in4_pton */
+#include <linux/in.h>      /* struct sockaddr_in */
 
 #include <khook/engine.h>
 #include <linux/kprobes.h>
@@ -74,6 +76,20 @@ MODULE_PARM_DESC(remote_progs_folder, "Host path prefix of binaries whose syscal
 static unsigned long forwarding_enabled = 0;
 module_param(forwarding_enabled, ulong, 0644);
 MODULE_PARM_DESC(forwarding_enabled, "1 = forward syscalls from matching container; 0 = disabled");
+
+/* Network filter configuration — written via /proc/rscaller.
+ * Protected by a spinlock; reads in hot path use READ_ONCE. */
+struct RscConfig {
+	char     target[64];
+	__be32   filter_net_addr; /* network byte order */
+	__be32   filter_net_mask; /* network byte order */
+	uint16_t filter_ports[16];
+	int      filter_ports_count;
+	bool     net_filter_set;  /* true once FILTER_NET written */
+};
+
+static struct RscConfig rsc_config;
+static DEFINE_SPINLOCK(rsc_config_lock);
 
 /* Set to 1 during module exit so new submissions are rejected and in-flight
  * threads can drain before khook_cleanup(). */
@@ -247,6 +263,87 @@ err:
 	return NULL;
 }
 
+
+/* Returns true if addr (network byte order) matches the configured FILTER_NET.
+ * If no FILTER_NET set, returns false (don't forward). */
+static bool addr_matches_filter(__be32 addr)
+{
+	struct RscConfig cfg;
+	spin_lock(&rsc_config_lock);
+	cfg = rsc_config;
+	spin_unlock(&rsc_config_lock);
+
+	if (!cfg.net_filter_set)
+		return false;
+	return (addr & cfg.filter_net_mask) == (cfg.filter_net_addr & cfg.filter_net_mask);
+}
+
+/* Returns true if port (host byte order) passes port filter.
+ * Empty filter = all ports pass. */
+static bool port_matches_filter(uint16_t port)
+{
+	struct RscConfig cfg;
+	int i;
+	spin_lock(&rsc_config_lock);
+	cfg = rsc_config;
+	spin_unlock(&rsc_config_lock);
+
+	if (cfg.filter_ports_count == 0)
+		return true;
+	for (i = 0; i < cfg.filter_ports_count; i++)
+		if (cfg.filter_ports[i] == port)
+			return true;
+	return false;
+}
+
+/* Extract sin_addr and sin_port from a userspace sockaddr pointer.
+ * Returns false if addr is NULL, wrong family, or copy fails.
+ * out_addr is network byte order; out_port is host byte order. */
+static bool extract_sockaddr_inet(unsigned long uptr, __be32 *out_addr, uint16_t *out_port)
+{
+	struct sockaddr_in sa;
+	if (!uptr)
+		return false;
+	if (copy_from_user(&sa, (const void __user *)uptr, sizeof(sa)))
+		return false;
+	if (sa.sin_family != AF_INET)
+		return false;
+	*out_addr = sa.sin_addr.s_addr;
+	*out_port = ntohs(sa.sin_port);
+	return true;
+}
+
+/* Returns true if the syscall should be forwarded based on sockaddr filter.
+ * nr: syscall number; params: raw register args.
+ * For syscalls without a sockaddr (or non-inet), returns true (let normal
+ * filter_binary / forwarding logic decide). */
+static bool net_filter_passes(unsigned int nr, const struct pt_regs *regs)
+{
+	__be32 addr;
+	uint16_t port;
+	unsigned long sa_ptr = 0;
+
+	switch (nr) {
+	case 42: /* connect(fd, sockaddr*, addrlen) */
+		sa_ptr = regs->si;
+		break;
+	case 44: /* sendto(fd, buf, len, flags, sockaddr*, addrlen) */
+		sa_ptr = regs->r8;
+		if (!sa_ptr)
+			return true; /* no dst addr — not a net-filtered call */
+		break;
+	case 45: /* recvfrom(fd, buf, len, flags, sockaddr*, addrlen) */
+		/* src addr is OUT — check after call; skip filter here */
+		return true;
+	default:
+		return true;
+	}
+
+	if (!extract_sockaddr_inet(sa_ptr, &addr, &port))
+		return true; /* non-inet or null — pass through */
+
+	return addr_matches_filter(addr) && port_matches_filter(port);
+}
 
 /* Returns true (filter OUT / don't forward) if the current process should not
  * have its syscalls forwarded.  Two independent filter modes:
@@ -482,6 +579,14 @@ static long khook_x64_sys_call(const struct pt_regs *regs, unsigned int nr)
 		atomic_dec(&hooks_executing);
 		return KHOOK_ORIGIN(x64_sys_call, regs, nr);
 	}
+
+	/* Network syscalls (connect/sendto): apply sockaddr filter.
+	 * If FILTER_NET is set and dst doesn't match, run locally. */
+	if ((nr == 42 || nr == 44) && !net_filter_passes(nr, regs)) {
+		atomic_dec(&hooks_executing);
+		return KHOOK_ORIGIN(x64_sys_call, regs, nr);
+	}
+
 	if (handle_syscall_common(regs, sig, &ret) == 0) {
 		atomic_dec(&hooks_executing);
 		return ret;
@@ -568,10 +673,15 @@ static ssize_t rscaller_proc_read(struct file *file, char __user *buf,
 	return 0;
 }
 
-/* Format: "DONE <slot_idx> <retval>\n" */
+/* Format:
+ *   "DONE <slot_idx> <retval>\n"         — signal syscall completion
+ *   "TARGET <name>\n"                    — set target name
+ *   "FILTER_NET <addr>/<prefix>\n"       — e.g. "192.0.2.160/29"
+ *   "FILTER_PORTS <p1,p2,...>\n"         — e.g. "80,443,22"
+ */
 ssize_t rscaller_proc_write(struct file *file, const char __user *buf,
                              size_t count, loff_t *ppos) {
-	char kbuf[64];
+	char kbuf[256];
 	int slot_idx;
 	long retval;
 
@@ -581,11 +691,95 @@ ssize_t rscaller_proc_write(struct file *file, const char __user *buf,
 		return -EFAULT;
 	kbuf[count] = '\0';
 
+	/* Strip trailing newline for easier sscanf parsing */
+	if (count > 0 && kbuf[count - 1] == '\n')
+		kbuf[count - 1] = '\0';
+
 	if (sscanf(kbuf, "DONE %d %ld", &slot_idx, &retval) == 2) {
-		if (slot_idx >= 0 && slot_idx < BUFFER_SIZE) {
+		if (slot_idx >= 0 && slot_idx < BUFFER_SIZE)
 			control_buffer_complete(global_ctl_buffer, slot_idx, retval);
-		}
+		return count;
 	}
+
+	if (strncmp(kbuf, "TARGET ", 7) == 0) {
+		spin_lock(&rsc_config_lock);
+		strncpy(rsc_config.target, kbuf + 7, sizeof(rsc_config.target) - 1);
+		rsc_config.target[sizeof(rsc_config.target) - 1] = '\0';
+		spin_unlock(&rsc_config_lock);
+		pr_info("rscaller: TARGET set to '%s'\n", rsc_config.target);
+		return count;
+	}
+
+	if (strncmp(kbuf, "FILTER_NET ", 11) == 0) {
+		/* Parse "addr/prefix" e.g. "192.0.2.160/29" */
+		const char *spec = kbuf + 11;
+		const char *slash = strchr(spec, '/');
+		char addr_str[32];
+		int prefix;
+		u8 addr_bytes[4];
+
+		if (!slash || slash - spec >= (ptrdiff_t)sizeof(addr_str)) {
+			pr_err("rscaller: FILTER_NET bad format: '%s'\n", spec);
+			return -EINVAL;
+		}
+		memcpy(addr_str, spec, slash - spec);
+		addr_str[slash - spec] = '\0';
+
+		if (kstrtoint(slash + 1, 10, &prefix) || prefix < 0 || prefix > 32) {
+			pr_err("rscaller: FILTER_NET bad prefix: '%s'\n", slash + 1);
+			return -EINVAL;
+		}
+
+		if (in4_pton(addr_str, -1, addr_bytes, -1, NULL) != 1) {
+			pr_err("rscaller: FILTER_NET bad addr: '%s'\n", addr_str);
+			return -EINVAL;
+		}
+
+		spin_lock(&rsc_config_lock);
+		memcpy(&rsc_config.filter_net_addr, addr_bytes, 4);
+		/* Build mask: prefix 0 → 0x00000000, prefix 32 → 0xffffffff */
+		rsc_config.filter_net_mask = prefix
+			? htonl(~((1u << (32 - prefix)) - 1))
+			: 0;
+		rsc_config.net_filter_set = true;
+		spin_unlock(&rsc_config_lock);
+
+		pr_info("rscaller: FILTER_NET set: %s/%d\n", addr_str, prefix);
+		return count;
+	}
+
+	if (strncmp(kbuf, "FILTER_PORTS ", 13) == 0) {
+		const char *p = kbuf + 13;
+		struct RscConfig tmp;
+		int n = 0;
+
+		spin_lock(&rsc_config_lock);
+		tmp = rsc_config;
+		spin_unlock(&rsc_config_lock);
+
+		tmp.filter_ports_count = 0;
+		while (*p && n < 16) {
+			long v;
+			char *end;
+			v = simple_strtol(p, &end, 10);
+			if (end == p)
+				break;
+			if (v > 0 && v <= 65535)
+				tmp.filter_ports[n++] = (uint16_t)v;
+			p = end;
+			if (*p == ',')
+				p++;
+		}
+		tmp.filter_ports_count = n;
+
+		spin_lock(&rsc_config_lock);
+		rsc_config = tmp;
+		spin_unlock(&rsc_config_lock);
+
+		pr_info("rscaller: FILTER_PORTS set: %d ports\n", n);
+		return count;
+	}
+
 	return count;
 }
 

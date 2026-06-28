@@ -4,8 +4,6 @@ members = [
     "rscaller-proto",
     "rsbeacon",
     "rsclient",
-    "rscaller-run",
-    "rscaller-runner",
     "rscfuse",
     "tools/codegen",
     "rsc",
