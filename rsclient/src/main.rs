@@ -54,6 +54,17 @@ struct Args {
     #[arg(long)]
     notif_fd: Option<i32>,
 
+    // ── Local cgroup filter ──────────────────────────────────────────────────
+    /// Path to the per-session local cgroup (e.g. /sys/fs/cgroup/rscaller/session-<hex>).
+    /// When set, signals targeting PIDs inside this cgroup are continued locally.
+    #[arg(long)]
+    local_cgroup: Option<String>,
+
+    /// Comma-separated syscall numbers whose forwarding is gated by the local cgroup.
+    /// Only meaningful when --local-cgroup is set.
+    #[arg(long, value_delimiter = ',')]
+    cgroup_gated_nrs: Vec<u32>,
+
     // ── Transport / encryption ───────────────────────────────────────────────
     /// Transport: tcp|uds
     #[arg(long, default_value = "tcp")]
@@ -101,6 +112,7 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("rsclient=debug".parse()?),
@@ -220,10 +232,14 @@ async fn run_seccomp(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()
         args.filter_ports.as_deref(),
     )?;
 
+    let cgroup_filter = args.local_cgroup.as_deref().map(|cgroup| {
+        relay::CgroupFilter::new(cgroup.to_string(), args.cgroup_gated_nrs.clone())
+    });
+
     info!("Connecting to beacon at {}", beacon_addr);
 
     let use_tls = args.encryption == "tls";
-    if use_tls {
+    let result = if use_tls {
         let ca_pem = load_ca_pem(args.ca_cert.as_deref())?;
         let (r, w) = rscaller_proto::transport::tls::connect_tls(
             beacon_addr,
@@ -231,12 +247,29 @@ async fn run_seccomp(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()
             &ca_pem,
         )
         .await?;
-        relay::Relay::new(ctl, r, w).with_filter(filter).run().await
+        relay::Relay::new(ctl, r, w)
+            .with_filter(filter)
+            .with_cgroup_filter(cgroup_filter)
+            .run()
+            .await
     } else {
         use tokio::net::TcpStream;
         let stream = TcpStream::connect(beacon_addr).await?;
         let _ = stream.set_nodelay(true);
         let (r, w) = tokio::io::split(stream);
-        relay::Relay::new(ctl, r, w).with_filter(filter).run().await
+        relay::Relay::new(ctl, r, w)
+            .with_filter(filter)
+            .with_cgroup_filter(cgroup_filter)
+            .run()
+            .await
+    };
+
+    // Child has exited (notify fd closed). Clean up the session cgroup.
+    if let Some(ref cgroup) = args.local_cgroup {
+        if let Err(e) = std::fs::remove_dir(cgroup) {
+            warn!("cleanup session cgroup {cgroup}: {e}");
+        }
     }
+
+    result
 }

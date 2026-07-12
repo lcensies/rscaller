@@ -35,9 +35,20 @@ pub fn stat_bytes_to_attr(ino: u64, buf: &[u8]) -> FileAttr {
     let mtime = UNIX_EPOCH + Duration::new(st.st_mtime as u64, st.st_mtime_nsec as u32);
     let ctime = UNIX_EPOCH + Duration::new(st.st_ctime as u64, st.st_ctime_nsec as u32);
 
+    // /proc and other virtual files report st_size=0.  The kernel uses the
+    // cached inode size to gate reads: if size=0, read() returns 0 without
+    // ever calling our read handler, even with FOPEN_DIRECT_IO.  Return a
+    // large sentinel so the kernel issues the read; the actual EOF is signalled
+    // when our handler returns 0 bytes.
+    let size = if kind == FileType::RegularFile && st.st_size == 0 {
+        1 << 22 // 4 MiB — enough for any /proc file
+    } else {
+        st.st_size as u64
+    };
+
     FileAttr {
         ino,
-        size: st.st_size as u64,
+        size,
         blocks: st.st_blocks as u64,
         atime,
         mtime,

@@ -1,0 +1,11 @@
+name: recon
+description: "Read-only beacon discovery — /proc and /sys overlaid, no syscall forwarding"
+mounts:
+  - remote: /proc
+    local: /proc
+    type: bind
+  - remote: /sys
+    local: /sys
+    type: bind
+    optional: true
+forward: []

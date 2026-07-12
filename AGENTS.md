@@ -58,6 +58,62 @@ Always kill rsclient before rmmod. If rsclient is killed mid-syscall (while insi
 khook stub), `use_count` leaks and rmmod hangs. The test script enforces:
 `pkill -9 rsclient → sleep 0.5 → rmmod`.
 
+## Standard Deploy & Test Workflow
+
+### Two-VM topology
+- **dev-vm-1** — rsc client (build host): full Rust workspace built here via `deploy.sh`
+- **dev-vm-2** — beacon host: receives only the `rsbeacon` binary (scp'd from dev-vm-1)
+
+### Dependency: `libfuse3-dev`
+`deploy.sh` installs `libfuse3-dev` on dev-vm-1 automatically. rscfuse is now a library
+embedded in `rsc` (invoked as `rsc fuse`); no separate rscfuse binary is deployed.
+
+### Normal iteration (code changed, want to test)
+```
+make test-evasion-clean        # vm-reset → deploy-all → run tests (canonical)
+```
+Or step by step:
+```
+make vm-reset                  # purge stale snapshots + fresh deploy to both VMs
+make test-evasion NO_DEPLOY=1  # run tests, skip redundant deploy
+```
+
+### After a crashed test run (stale `pytest-clean` snapshot blocks re-run)
+```
+make vm-clean                  # delete pytest-clean snapshots from both VMs
+make test-evasion-clean        # full clean run
+```
+
+### Just re-run tests without rebuilding
+```
+make test-evasion NO_DEPLOY=1
+```
+
+### Key Makefile targets
+| Target | What it does |
+|---|---|
+| `make deploy` | rsync source + build workspace on dev-vm-1 (installs libfuse3-dev) |
+| `make deploy-beacon` | deploy + scp rsbeacon to dev-vm-2 |
+| `make vm-clean` | delete stale `pytest-clean` snapshots from both VMs |
+| `make vm-reset` | vm-clean + start VMs + deploy-beacon |
+| `make test-evasion` | run evasion tests (deploy by default, `NO_DEPLOY=1` to skip) |
+| `make test-evasion-clean` | vm-reset + test-evasion (most reliable, use after changes) |
+
+### VM snapshot strategy (used by pytest fixtures)
+- Both `client_snapshotted` and `beacon_snapshotted` fixtures **revert to a persistent
+  `baseline` snapshot** at the start of each test — no new snapshot is created per-test.
+- `vm-reset` reverts **both** VMs to their `baseline` snapshots before deploying, so tests
+  always start from clean state.
+- `VM_SNAPSHOT` and `BEACON_SNAPSHOT` both default to `baseline`.
+- **Never run tests against a dirty VM state** — always start with `make vm-reset` or
+  `make test-evasion-clean` after code changes.
+
+### FUSE reads on /proc files — known pitfall
+`/proc` files report `st_size=0`. The Linux kernel short-circuits `read()` when the cached
+inode size is 0, even with `FOPEN_DIRECT_IO`. Fix in `rscfuse/src/stat.rs`: regular files
+with `st_size=0` get a 4 MiB sentinel size so the kernel issues reads; actual EOF is
+signalled when the read handler returns 0 bytes.
+
 ## Shell / Tmux Workflow
 
 - **Use tmux panes for all long-running commands** (deploy, build, SSH). Never use

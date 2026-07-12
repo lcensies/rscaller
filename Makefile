@@ -42,7 +42,7 @@ bindings:
 	cargo-libloading-bindgen ${BUFFER_HEADER_PATH} | rustfmt > ${BINDGEN_DIR}/bindings.rs
 
 
-handlers:
+kmod-handlers:
 	cd ${SCRIPTS_DIR} && poetry install && \
 		ls && poetry run python3 generate_handler_wrappres.py
 
@@ -77,20 +77,27 @@ dev-env:
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		${KERNEL_VOLUMES}
 		rscaller-devcont
-# ---------------------------------------------------------------------------
-# Rust workspace
-# ---------------------------------------------------------------------------
+# dev-vm-1: build host / rsc client  (rsync + cargo build happens here)
+# dev-vm-2: beacon host              (rsbeacon binary only, no full build)
 REMOTE      ?= dev-vm-1
-CLIENT      ?=
-BEACON_HOST ?= 0.0.0.0
+BEACON_VM   ?= dev-vm-2
 BEACON_PORT ?= 9999
-# Libvirt domain names (default to SSH host names)
+# Libvirt domain names (match SSH aliases above by default)
 VM_DOMAIN        ?= $(REMOTE)
-VM_SNAPSHOT      ?= clean-base-docker-nokmod
-VM_DOMAIN_CLIENT ?= $(CLIENT)
+VM_DOMAIN_BEACON ?= $(BEACON_VM)
+VM_SNAPSHOT      ?= baseline
+BEACON_SNAPSHOT  ?= baseline
+# Path where rsbeacon lives on BEACON_VM
+BEACON_BIN_REMOTE ?= /home/ubuntu/rsbeacon
 
-.PHONY: build test integration-tests setup-remote provision deploy deploy-remote deploy-no-snap \
-        test-remote test-remote-no-snap test-vm handlers snapshot-create snapshot-restore
+.PHONY: build test integration-tests setup-remote provision \
+        deploy deploy-beacon deploy-all \
+        snapshot-create snapshot-restore snapshot-beacon \
+        vm-clean vm-reset \
+        test-vm test-evasion test-evasion-clean \
+        test-mount-profiles test-mount-profiles-clean \
+        handlers demo demo-auto demo-teardown \
+        poc poc-notracee
 
 build:
 	$(call CARGO,build --workspace)
@@ -113,45 +120,162 @@ setup-remote:
 
 provision:
 	ansible-playbook -i $(REMOTE), -u ubuntu scripts/provision.yml
-	$(if $(CLIENT),ansible-playbook -i $(CLIENT), -u ubuntu scripts/provision.yml,)
 
+# Rsync repo source to REMOTE and build the full workspace there.
 deploy:
 	bash scripts/deploy.sh $(REMOTE)
 
-# Create a clean-state snapshot (run once on a freshly booted VM with no kmod loaded)
+# Copy the rsbeacon binary built on REMOTE to BEACON_VM.
+# Runs scp from this host so VM-to-VM hostname resolution is not required.
+# BEACON_VM is resolved to an IP via virsh (falls back to the name itself).
+deploy-beacon: deploy
+	@BEACON_IP=$$(bash scripts/vm_ip.sh $(VM_DOMAIN_BEACON)); \
+	 echo "==> Stopping rsbeacon on $$BEACON_IP (unlock binary for overwrite)"; \
+	 ssh ubuntu@$$BEACON_IP "sudo pkill -f rsbeacon 2>/dev/null; sleep 0.3; true" 2>/dev/null || true; \
+	 echo "==> Copying rsbeacon from $(REMOTE) to ubuntu@$$BEACON_IP:$(BEACON_BIN_REMOTE)"; \
+	 scp $(REMOTE):/home/ubuntu/rscaller/target/release/rsbeacon \
+	     ubuntu@$$BEACON_IP:$(BEACON_BIN_REMOTE)
+
+# Full two-VM deploy: build on REMOTE, push rsbeacon to BEACON_VM, open ghost shell.
+deploy-all: deploy-beacon
+	@bash scripts/ghost-shell.sh
+
+# ---------------------------------------------------------------------------
+# Snapshots
+# ---------------------------------------------------------------------------
+
+# Snapshot REMOTE (dev-vm-1) — call after a clean deploy.
 snapshot-create:
 	virsh snapshot-create-as $(VM_DOMAIN) $(VM_SNAPSHOT) \
 	  --description "clean boot, no kmod loaded" --atomic
-	$(if $(VM_DOMAIN_CLIENT),virsh snapshot-create-as $(VM_DOMAIN_CLIENT) $(VM_SNAPSHOT) \
-	  --description "clean boot" --atomic,)
 
-# Revert to clean snapshot before deploy+test (prevents stuck-module artifacts)
+# Refresh the client baseline snapshot to include the currently deployed binaries.
+# Run after 'make deploy' when new binaries change the client's expected state.
+snapshot-update-client:
+	virsh snapshot-delete $(VM_DOMAIN) $(VM_SNAPSHOT) 2>/dev/null || true
+	virsh snapshot-create-as $(VM_DOMAIN) $(VM_SNAPSHOT) \
+	  --description "post-deploy baseline with rsc binaries" --atomic
+	@echo "Baseline snapshot updated for $(VM_DOMAIN)."
+
+# Revert REMOTE to its clean snapshot.
 snapshot-restore:
 	bash scripts/vm_restore.sh $(VM_DOMAIN) $(VM_SNAPSHOT)
-	$(if $(VM_DOMAIN_CLIENT),bash scripts/vm_restore.sh $(VM_DOMAIN_CLIENT) $(VM_SNAPSHOT),)
 
-deploy-remote: snapshot-restore
-	bash scripts/deploy.sh $(REMOTE)
-	$(if $(CLIENT),bash scripts/deploy.sh $(CLIENT),)
-	$(call CARGO,build --release -p rsbeacon)
+# Snapshot BEACON_VM (dev-vm-2) — call after deploy-beacon while rsbeacon is in place.
+snapshot-beacon:
+	virsh snapshot-create-as $(VM_DOMAIN_BEACON) $(BEACON_SNAPSHOT) \
+	  --description "ssh key + rsbeacon binary deployed" --atomic
 
-# Like deploy-remote + test-remote but skips snapshot restore (VM has no snapshots)
-deploy-no-snap:
-	bash scripts/deploy.sh $(REMOTE)
-	$(if $(CLIENT),bash scripts/deploy.sh $(CLIENT),)
-	$(call CARGO,build --release -p rsbeacon)
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
-test-remote: deploy-remote
-	REMOTE=$(REMOTE) CLIENT=$(CLIENT) BEACON_HOST=$(BEACON_HOST) BEACON_PORT=$(BEACON_PORT) \
-	  bash scripts/test_remote.sh $(REMOTE)
+# ---------------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------------
 
-test-remote-no-snap: deploy-no-snap
-	REMOTE=$(REMOTE) CLIENT=$(CLIENT) BEACON_HOST=$(BEACON_HOST) BEACON_PORT=$(BEACON_PORT) \
-	  bash scripts/test_remote.sh $(REMOTE)
+# Open a 3-pane tmux session + print interactive step guide.
+demo:
+	bash scripts/demo.sh
 
-# pytest-based VM integration tests
-# Usage: make test-vm [REMOTE=dev-vm-1] [CLIENT=dev-vm-2] [NO_DEPLOY=1]
+# Run the demo automatically (sends commands to each pane with pauses).
+demo-auto:
+	bash scripts/demo.sh --auto
+
+# Restore ip on dev-vm-2, unmount rscfuse, kill tmux session.
+demo-teardown:
+	bash scripts/demo.sh --teardown
+
+# ---------------------------------------------------------------------------
+# PoC manual testing
+# ---------------------------------------------------------------------------
+
+# Run PoC with all defaults: profile=proc, tracee on beacon.
+# Usage:
+#   make poc                                       # proc profile, default cmd
+#   make poc PROFILE=full CMD=hostname             # full profile
+#   make poc PROFILE=none CMD="ip -4 addr"
+poc:
+	bash scripts/poc.sh --profile $(or $(PROFILE),proc) $(if $(CMD),--cmd "$(CMD)",)
+
+# Same as poc but skip tracee (faster startup, ~3s less wait).
+poc-notracee:
+	bash scripts/poc.sh --no-tracee --profile $(or $(PROFILE),proc) $(if $(CMD),--cmd "$(CMD)",)
+
+# ---------------------------------------------------------------------------
+# VM harness — clean state management
+# ---------------------------------------------------------------------------
+
+# Delete any leftover pytest-clean snapshots from both VMs.
+# Run this after a crashed test run to unblock the next one.
+vm-clean:
+	virsh snapshot-delete $(VM_DOMAIN)        pytest-clean 2>/dev/null || true
+	virsh snapshot-delete $(VM_DOMAIN_BEACON) pytest-clean 2>/dev/null || true
+	@echo "Stale pytest-clean snapshots removed (errors above are OK)."
+
+# Full reset: restore VMs to their baseline snapshots, then deploy fresh code.
+# Standard command before running tests after a code change.
+vm-reset: vm-clean
+	@echo "==> Reverting $(VM_DOMAIN) to $(VM_SNAPSHOT)"
+	virsh snapshot-revert $(VM_DOMAIN) $(VM_SNAPSHOT) --running
+	@echo "==> Reverting $(VM_DOMAIN_BEACON) to $(BEACON_SNAPSHOT)"
+	virsh snapshot-revert $(VM_DOMAIN_BEACON) $(BEACON_SNAPSHOT) --running
+	@until ssh -o ConnectTimeout=3 $(REMOTE) echo ok 2>/dev/null; do sleep 2; done
+	@until ssh -o ConnectTimeout=3 $(BEACON_VM) echo ok 2>/dev/null; do sleep 2; done
+	@echo "==> Deploying fresh code"
+	$(MAKE) deploy-beacon
+	@echo "==> VMs ready for testing."
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+# Run evasion-specific tests (tracee on dev-vm-2; no kmod required).
+# Usage:
+#   make test-evasion                # deploy + run
+#   make test-evasion NO_DEPLOY=1    # skip deploy (use existing build)
+#   make test-evasion-clean          # vm-reset + run (fresh state, no stale snapshots)
+test-evasion:
+	cd tests/remote && uv run pytest $(if $(NO_DEPLOY),--no-deploy,) \
+	  --no-header -v -s \
+	  --log-cli-level=INFO \
+	  --remote=$(REMOTE) \
+	  --beacon-host=$(BEACON_VM) \
+	  --beacon-port=$(BEACON_PORT) \
+	  --beacon-vm-snapshot=$(BEACON_SNAPSHOT) \
+	  --client-vm-snapshot=$(VM_SNAPSHOT) \
+	  test_evasion.py
+
+# Full clean run: reset VMs, then run evasion tests without a second deploy.
+test-evasion-clean: vm-reset
+	$(MAKE) test-evasion NO_DEPLOY=1
+
+# Run mount profile overlay tests.
+# Usage:
+#   make test-mount-profiles                # deploy + run
+#   make test-mount-profiles NO_DEPLOY=1    # skip deploy
+#   make test-mount-profiles-clean          # vm-reset + run
+test-mount-profiles:
+	cd tests/remote && uv run pytest $(if $(NO_DEPLOY),--no-deploy,) \
+	  --no-header -v -s \
+	  --log-cli-level=INFO \
+	  --remote=$(REMOTE) \
+	  --beacon-host=$(BEACON_VM) \
+	  --beacon-port=$(BEACON_PORT) \
+	  --beacon-vm-snapshot=$(BEACON_SNAPSHOT) \
+	  --client-vm-snapshot=$(VM_SNAPSHOT) \
+	  test_mount_profiles.py
+
+test-mount-profiles-clean: vm-reset
+	$(MAKE) test-mount-profiles NO_DEPLOY=1
+
+# Run the pytest VM integration suite.
+# Usage:
+#   make test-vm                     # deploy + run all tests
+#   make test-vm NO_DEPLOY=1         # skip deploy (use existing build)
 test-vm:
-	cd tests/remote && pytest $(if $(NO_DEPLOY),--no-deploy,) \
-	  --remote=$(REMOTE) $(if $(CLIENT),--client=$(CLIENT),) \
+	cd tests/remote && uv run pytest $(if $(NO_DEPLOY),--no-deploy,) \
+	  --no-header -q \
+	  --remote=$(REMOTE) \
+	  --beacon-host=$(BEACON_VM) \
 	  --beacon-port=$(BEACON_PORT)

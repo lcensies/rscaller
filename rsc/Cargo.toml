@@ -16,5 +16,10 @@ container = ["dep:tokio", "dep:ociman"]
 anyhow = { workspace = true }
 libc = { workspace = true }
 clap = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+rscfuse = { path = "../rscfuse" }
+rustls = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { workspace = true, optional = true }
 ociman = { git = "https://github.com/mbj/mrs", optional = true }

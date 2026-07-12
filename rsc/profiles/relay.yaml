@@ -1,0 +1,16 @@
+name: relay
+description: "Network relay — socket/connect/bind forwarded through beacon, no filesystem overlay"
+mounts: []
+forward:
+  - name: network
+    syscalls:
+      - socket
+      - connect
+      - bind
+      - accept4
+      - sendto
+      - recvfrom
+      - sendmsg
+      - recvmsg
+      - getsockopt
+      - setsockopt

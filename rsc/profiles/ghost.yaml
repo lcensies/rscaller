@@ -1,0 +1,19 @@
+name: ghost
+description: "Beacon process control — beacon procfs at /proc, rootfs at /mnt/target; kill forwarded with local-cgroup exclusion"
+mounts:
+  # Beacon's process table replaces local /proc — ps/top/kill see beacon PIDs.
+  - remote: /proc
+    local: /proc
+    type: bind
+  # Full beacon rootfs exposed read/write at /mnt/target.
+  - remote: /
+    local: /mnt/target
+    type: bind
+    optional: true
+forward:
+  - name: signal
+    syscalls: [kill, tgkill, tkill]
+    filter:
+      # PIDs inside the session-local cgroup are locally-spawned processes.
+      # Continue their kill() locally; forward everything else to beacon.
+      cgroup: local

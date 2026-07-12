@@ -4,9 +4,11 @@
 //!   exec   — run a binary (with optional OCI container or microVM wrapping)
 //!   shell  — open an interactive shell forwarded to beacon
 //!   deploy — deploy the rscaller stack to a remote host
+//!   fuse   — FUSE daemon for remote FS access (spawned internally by exec)
 
 mod exec;
 mod deploy;
+mod mount_config;
 #[cfg(feature = "container")]
 mod microvm;
 
@@ -29,6 +31,9 @@ enum Cmd {
     Shell(ShellArgs),
     /// Deploy the rscaller stack to a remote host (tracefs snapshot → codegen → build → sync).
     Deploy(DeployArgs),
+    /// FUSE daemon for remote FS access via rsbeacon (spawned internally by exec).
+    #[command(hide = true)]
+    Fuse(rscfuse::FuseArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -64,10 +69,6 @@ pub struct TransportArgs {
     /// Path to rsclient binary (default: rsclient next to rsc).
     #[arg(long, hide = true)]
     pub rsclient: Option<String>,
-
-    /// Path to rscfuse binary (default: rscfuse next to rsc).
-    #[arg(long, hide = true)]
-    pub rscfuse: Option<String>,
 }
 
 impl TransportArgs {
@@ -80,12 +81,6 @@ impl TransportArgs {
     pub fn rsclient_bin(&self) -> String {
         self.rsclient.clone().unwrap_or_else(|| {
             sibling_bin("rsclient")
-        })
-    }
-
-    pub fn rscfuse_bin(&self) -> String {
-        self.rscfuse.clone().unwrap_or_else(|| {
-            sibling_bin("rscfuse")
         })
     }
 }
@@ -141,6 +136,11 @@ pub struct ExecArgs {
     #[arg(long, default_value = "/sys/module/rscaller/parameters/target_cgroup_ino", hide = true)]
     pub kmod_param: String,
 
+    /// Mount namespace overlay profile: none, recon, relay, shadow, ghost,
+    /// or path to a YAML file. Controls which remote paths are overlaid locally.
+    #[arg(long, default_value = "none")]
+    pub mount_profile: String,
+
     /// Command and arguments to run.
     #[arg(last = true, required = true)]
     pub cmd: Vec<String>,
@@ -178,6 +178,17 @@ pub struct ShellArgs {
 
     #[arg(long, default_value_t = 1)]
     pub microvm_cpus: u32,
+
+    /// Mount namespace overlay profile: none, recon, relay, shadow, ghost,
+    /// or path to a YAML file. Controls which remote paths are overlaid locally.
+    #[arg(long, default_value = "none")]
+    pub mount_profile: String,
+
+    /// Source shell rc files (~/.bashrc, /etc/profile, etc.).
+    /// Disabled by default when mount-profile is non-none to avoid running
+    /// beacon-side shell config that may have traps or unexpected behaviour.
+    #[arg(long, default_value_t = false)]
+    pub rc: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -243,5 +254,16 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             exec::run_shell_sync(args)
         }
         Cmd::Deploy(args) => deploy::run_deploy(args),
+        Cmd::Fuse(args) => {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::from_default_env()
+                        .add_directive("rscfuse=debug".parse()?),
+                )
+                .init();
+            rscfuse::run(args)
+        }
     }
 }

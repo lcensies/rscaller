@@ -37,12 +37,17 @@ rsync -az --delete \
   "$REPO_ROOT/" "$REMOTE:$REMOTE_DIR/"
 ok "rsync done"
 
+step "Installing build dependencies on $REMOTE"
+ssh "$REMOTE" "sudo apt-get install -y libfuse3-dev 2>&1 | tail -3" || true
+ok "apt done"
+
 step "Building Rust workspace on $REMOTE (release)"
 ssh "$REMOTE" "source \$HOME/.cargo/env 2>/dev/null; \
   cd $REMOTE_DIR && \
-  cargo build --workspace --release --exclude rscfuse 2>&1 | grep -E '^error|Finished'"
+  cargo build --workspace --release 2>&1 | grep -E '^error|Finished'"
 ok "remote build done"
 
 echo ""
-echo "==> Deploy done."
-echo "    To build and load kmod: ssh $REMOTE 'cd $REMOTE_DIR/kmod && make all && sudo insmod rscaller.ko'"
+echo "==> Deploy done. Binaries are in $REMOTE_DIR/target/release/ on $REMOTE."
+echo "    Next: 'make deploy-beacon' to push rsbeacon to the beacon VM."
+echo "    Or:   'make test-vm NO_DEPLOY=1' to run the E2E test suite."

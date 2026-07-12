@@ -123,6 +123,75 @@ fn parse_cidr(s: &str) -> Result<(u32, u32)> {
 }
 
 // ---------------------------------------------------------------------------
+// CgroupFilter — local-cgroup exclusion for signal syscalls
+// ---------------------------------------------------------------------------
+
+/// Excludes signal syscalls from forwarding when the target PID is a member
+/// of the per-session local cgroup (i.e. a locally-spawned child process).
+///
+/// This keeps `kill %job` / `kill <local_pid>` working correctly inside an
+/// interactive shell while still forwarding signals to beacon processes.
+#[derive(Clone, Debug, Default)]
+pub struct CgroupFilter {
+    /// Absolute path to the per-session cgroup, e.g.
+    /// `/sys/fs/cgroup/rscaller/session-<hex>`.
+    pub cgroup_path: String,
+    /// Syscall numbers gated by this filter (kill=62, tkill=200, tgkill=234).
+    pub gated_nrs: Vec<u32>,
+}
+
+impl CgroupFilter {
+    pub fn new(cgroup_path: String, gated_nrs: Vec<u32>) -> Self {
+        Self { cgroup_path, gated_nrs }
+    }
+
+    /// Returns true if the syscall should be continued locally (target is in
+    /// the local cgroup), false if it should be forwarded to beacon.
+    pub fn is_local(&self, nr: u64, args: &[u64; 6]) -> bool {
+        if !self.gated_nrs.contains(&(nr as u32)) {
+            return false;
+        }
+        let target_pid = match nr {
+            62 | 200 => args[0] as i64,  // kill(pid,sig) / tkill(tid,sig)
+            234 => args[1] as i64,        // tgkill(tgid,tid,sig) — tid is arg 1
+            _ => return false,
+        };
+        if target_pid <= 0 {
+            return false;
+        }
+        pid_in_cgroup(target_pid as u32, &self.cgroup_path)
+    }
+}
+
+/// Check whether `pid` is a member of the cgroup rooted at `cgroup_path`.
+///
+/// Reads `/proc/<pid>/cgroup` (cgroup v2 format: `0::/relative/path`)
+/// and checks if the relative path starts with the session cgroup's
+/// relative path (everything after `/sys/fs/cgroup`).
+fn pid_in_cgroup(pid: u32, cgroup_path: &str) -> bool {
+    // Strip the cgroup v2 mount prefix to get the relative path.
+    // e.g. /sys/fs/cgroup/rscaller/session-abc → /rscaller/session-abc
+    let rel = cgroup_path
+        .strip_prefix("/sys/fs/cgroup")
+        .unwrap_or(cgroup_path);
+
+    let proc_cgroup_path = format!("/proc/{pid}/cgroup");
+    let Ok(content) = std::fs::read_to_string(&proc_cgroup_path) else {
+        return false; // PID doesn't exist locally → not in local cgroup
+    };
+
+    // cgroup v2 line format: "0::<path>"
+    content.lines().any(|line| {
+        if let Some(path) = line.strip_prefix("0::") {
+            // Check exact match or sub-cgroup membership.
+            path == rel || path.starts_with(&format!("{rel}/"))
+        } else {
+            false
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Relay
 // ---------------------------------------------------------------------------
 
@@ -136,6 +205,7 @@ where
     pub beacon_reader: R,
     pub beacon_writer: W,
     pub filter: NetFilter,
+    pub cgroup_filter: Option<CgroupFilter>,
 }
 
 impl<C, R, W> Relay<C, R, W>
@@ -145,11 +215,16 @@ where
     W: AsyncWrite + Unpin,
 {
     pub fn new(controller: C, beacon_reader: R, beacon_writer: W) -> Self {
-        Self { controller, beacon_reader, beacon_writer, filter: NetFilter::default() }
+        Self { controller, beacon_reader, beacon_writer, filter: NetFilter::default(), cgroup_filter: None }
     }
 
     pub fn with_filter(mut self, filter: NetFilter) -> Self {
         self.filter = filter;
+        self
+    }
+
+    pub fn with_cgroup_filter(mut self, filter: Option<CgroupFilter>) -> Self {
+        self.cgroup_filter = filter;
         self
     }
 
@@ -166,9 +241,31 @@ where
         }
     }
 
-    async fn dispatch(&mut self, notif: Notification) -> Result<()> {
+    async fn dispatch(&mut self, mut notif: Notification) -> Result<()> {
         let id = notif.id;
         let nr = notif.nr;
+
+        // ── Beacon PID offset stripping for signal syscalls ───────────────
+        // When merged-proc mode is active, the ghost shell uses virtual PIDs
+        // (real_beacon_pid + BEACON_PID_OFFSET) to address beacon processes.
+        // Strip the offset before forwarding so the beacon sees the real PID.
+        const BEACON_PID_OFFSET: i64 = 10_000_000;
+        if matches!(nr, 62 | 200 | 234) {
+            let target = match nr {
+                62 | 200 => notif.args[0] as i64,  // kill(pid,sig) / tkill(tid,sig)
+                234      => notif.args[1] as i64,   // tgkill(tgid,tid,sig)
+                _        => 0,
+            };
+            if target > BEACON_PID_OFFSET {
+                let stripped = (target - BEACON_PID_OFFSET) as u64;
+                debug!(id, nr, orig_pid = target, real_pid = stripped, "stripped beacon PID offset");
+                match nr {
+                    62 | 200 => notif.args[0] = stripped,
+                    234      => notif.args[1] = stripped,
+                    _        => {}
+                }
+            }
+        }
 
         // ── Network filter ────────────────────────────────────────────────
         // For connect(42): sockaddr is arg 1.
@@ -183,6 +280,15 @@ where
             debug!(id, nr, "net filter: continuing locally");
             self.controller.continue_syscall(id).await?;
             return Ok(());
+        }
+
+        // ── Cgroup filter — local-process signal exclusion ────────────────
+        if let Some(ref cf) = self.cgroup_filter {
+            if cf.is_local(nr, &notif.args) {
+                debug!(id, nr, pid = notif.args[0], "cgroup filter: signal target is local, continuing");
+                self.controller.continue_syscall(id).await?;
+                return Ok(());
+            }
         }
 
         // ── Forward to beacon ─────────────────────────────────────────────

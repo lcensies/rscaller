@@ -21,11 +21,8 @@ pub fn run_exec_sync(args: ExecArgs) -> Result<()> {
 }
 
 pub fn run_shell_sync(args: ShellArgs) -> Result<()> {
-    let cmd = vec![
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
-        "-i".into(),
-    ];
-    run_exec_sync(ExecArgs { transport: args.transport, image: args.image, backend: args.backend, microvm: args.microvm, microvm_backend: args.microvm_backend, microvm_kernel: args.microvm_kernel, microvm_mem: args.microvm_mem, microvm_cpus: args.microvm_cpus, kmod_param: String::from("/sys/module/rscaller/parameters/target_cgroup_ino"), cmd })
+    let cmd = shell_cmd(&args);
+    run_exec_sync(ExecArgs { transport: args.transport, image: args.image, backend: args.backend, microvm: args.microvm, microvm_backend: args.microvm_backend, microvm_kernel: args.microvm_kernel, microvm_mem: args.microvm_mem, microvm_cpus: args.microvm_cpus, kmod_param: String::from("/sys/module/rscaller/parameters/target_cgroup_ino"), cmd, mount_profile: args.mount_profile })
 }
 
 // ---------------------------------------------------------------------------
@@ -45,11 +42,23 @@ pub async fn run_exec_async(args: ExecArgs) -> Result<()> {
 
 #[cfg(feature = "container")]
 pub async fn run_shell_async(args: ShellArgs) -> Result<()> {
-    let cmd = vec![
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
-        "-i".into(),
-    ];
-    run_exec_async(ExecArgs { transport: args.transport, image: args.image, backend: args.backend, microvm: args.microvm, microvm_backend: args.microvm_backend, microvm_kernel: args.microvm_kernel, microvm_mem: args.microvm_mem, microvm_cpus: args.microvm_cpus, kmod_param: String::from("/sys/module/rscaller/parameters/target_cgroup_ino"), cmd }).await
+    let cmd = shell_cmd(&args);
+    run_exec_async(ExecArgs { transport: args.transport, image: args.image, backend: args.backend, microvm: args.microvm, microvm_backend: args.microvm_backend, microvm_kernel: args.microvm_kernel, microvm_mem: args.microvm_mem, microvm_cpus: args.microvm_cpus, kmod_param: String::from("/sys/module/rscaller/parameters/target_cgroup_ino"), cmd, mount_profile: args.mount_profile }).await
+}
+
+/// Build the shell command vector for `rsc shell`.
+///
+/// When mount-profile is non-none, default to `--norc --noprofile` to avoid
+/// sourcing any rc files that might exist on the overlaid filesystem.
+/// Pass `--rc` to override and source normally.
+fn shell_cmd(args: &ShellArgs) -> Vec<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let no_rc = args.mount_profile != "none" && !args.rc;
+    if no_rc {
+        vec![shell, "--norc".into(), "--noprofile".into(), "-i".into()]
+    } else {
+        vec![shell, "-i".into()]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -132,73 +141,121 @@ fn run_seccomp(args: ExecArgs) -> Result<()> {
         bail!("no command specified");
     }
 
+    // Load profile first so we can inspect it before launching rscfuse.
+    let mount_profile = crate::mount_config::load(&args.mount_profile)
+        .context("loading mount profile")?;
+
     let name = args.transport.resolve_name();
     let mount_point = format!("{}/{}", args.transport.mount_base, name);
+    let merged_proc = mount_profile.has_proc_bind();
     let fuse_pid = launch_rscfuse(
-        &args.transport.rscfuse_bin(),
         &args.transport.beacon,
         &args.transport.encryption,
         args.transport.ca_cert.as_deref(),
         &mount_point,
         &name,
+        merged_proc,
     )?;
     eprintln!("rsc: rscfuse mounted at {} (pid {})", mount_point, fuse_pid);
-
-    let mut sv = [0i32; 2];
-    let ret = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-            0,
-            sv.as_mut_ptr(),
-        )
-    };
-    if ret != 0 {
-        bail!("socketpair: {}", std::io::Error::last_os_error());
+    if !mount_profile.mounts.is_empty() {
+        eprintln!("rsc: mount profile {:?} ({} entries)", mount_profile.name, mount_profile.mounts.len());
     }
-    let (parent_sock, child_sock) = (sv[0], sv[1]);
+
+    // Use a plain pipe to transfer the seccomp notify fd number.
+    // SCM_RIGHTS via sendmsg(2) would deadlock: sendmsg is syscall 46 which the
+    // ghost/shadow profiles intercept, so the child would block on its own filter
+    // before rsclient exists to process the notification.
+    // write(2)/read(2) (syscalls 1/0) are never in any profile's forward list.
+    let mut pipe_fds = [0i32; 2];
+    let ret = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if ret != 0 {
+        bail!("pipe2: {}", std::io::Error::last_os_error());
+    }
+    let (pipe_read, pipe_write) = (pipe_fds[0], pipe_fds[1]);
 
     let child_pid = unsafe { libc::fork() };
     match child_pid {
         -1 => bail!("fork failed: {}", std::io::Error::last_os_error()),
         0 => {
-            unsafe { libc::close(parent_sock) };
+            unsafe { libc::close(pipe_read) };
             let cmd = &args.cmd[0];
             let cmd_args = &args.cmd[1..];
-            child_seccomp_exec(child_sock, &vec![62u32], cmd, cmd_args);
+            let forward_nrs = mount_profile.forward_nrs();
+            child_seccomp_exec(pipe_write, &forward_nrs, cmd, cmd_args, &mount_profile, &mount_point);
         }
-        _pid => {
-            unsafe { libc::close(child_sock) };
-            let notify_fd = recv_fd(parent_sock)
+        child_pid => {
+            unsafe { libc::close(pipe_write) };
+
+            // Move child into session cgroup if the profile requests it.
+            // Done before handing off to rsclient so the cgroup is populated
+            // before any signal intercepts can arrive.
+            let session_cgroup: Option<String> = if mount_profile.needs_local_cgroup() {
+                match create_session_cgroup(child_pid) {
+                    Ok(path) => {
+                        eprintln!("rsc: session cgroup: {path}");
+                        Some(path)
+                    }
+                    Err(e) => {
+                        eprintln!("rsc: warning: could not create session cgroup: {e:#}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let notify_fd = recv_notify_fd(pipe_read, child_pid)
                 .context("receiving seccomp notify fd from child")?;
-            unsafe { libc::close(parent_sock) };
+            unsafe { libc::close(pipe_read) };
 
             eprintln!("rsc: received seccomp notify fd {}", notify_fd);
 
-            exec_rsclient(&args.transport.rsclient_bin(), &args.transport, notify_fd);
+            let cgroup_gated = mount_profile.cgroup_gated_nrs();
+            exec_rsclient(
+                &args.transport.rsclient_bin(),
+                &args.transport,
+                notify_fd,
+                session_cgroup.as_deref(),
+                &cgroup_gated,
+            );
         }
     }
     #[allow(unreachable_code)]
     Ok(())
 }
 
-/// Fork+exec rscfuse in the background and wait until the mount point is live.
+/// Fork+exec `rsc fuse` in the background and wait until the mount point is live.
 ///
-/// Returns the rscfuse child PID (left as a zombie until rsc exits;
+/// Returns the child PID (left as a zombie until rsc exits;
 /// AutoUnmount will clean up the FUSE mount on process death).
 fn launch_rscfuse(
-    bin: &str,
     beacon: &str,
     encryption: &str,
     ca_cert: Option<&str>,
     mount_point: &str,
     name: &str,
+    merged_proc: bool,
 ) -> Result<libc::pid_t> {
+    // Lazily detach any stale FUSE mount left by a previous session.  Without
+    // this, create_dir_all succeeds but stat(2) on the stale mountpoint hangs
+    // or returns EIO, causing is_dir() to return false and the subsequent
+    // fuser::mount2 to fail with EEXIST / EBUSY.
+    if is_mount_point(mount_point) {
+        let _ = std::process::Command::new("umount")
+            .args(["-l", mount_point])
+            .status();
+    }
     fs::create_dir_all(mount_point)
         .with_context(|| format!("create mount point {mount_point}"))?;
 
+    let rsc_exe = std::env::current_exe()
+        .context("resolving current executable path")?
+        .to_string_lossy()
+        .into_owned();
+
     let mut argv_strs = vec![
-        bin.to_string(),
+        rsc_exe.clone(),
+        "fuse".to_string(),
         "--beacon".to_string(),
         beacon.to_string(),
         "--mount".to_string(),
@@ -211,6 +268,9 @@ fn launch_rscfuse(
     if let Some(ca) = ca_cert {
         argv_strs.push("--ca-cert".to_string());
         argv_strs.push(ca.to_string());
+    }
+    if merged_proc {
+        argv_strs.push("--merged-proc".to_string());
     }
 
     let argv: Vec<CString> = argv_strs
@@ -277,11 +337,19 @@ fn is_mount_point(path: &str) -> bool {
 /// 3. Send notify fd to parent via SCM_RIGHTS
 /// 4. `execvpe` target binary
 fn child_seccomp_exec(
-    sock: libc::c_int,
+    pipe_write: libc::c_int,
     syscall_nrs: &[u32],
     cmd: &str,
     cmd_args: &[String],
+    mount_profile: &crate::mount_config::MountProfile,
+    fuse_root: &str,
 ) -> ! {
+    // Apply mount namespace BEFORE prctl — mounts require CAP_SYS_ADMIN.
+    if let Err(e) = crate::mount_config::apply(mount_profile, fuse_root) {
+        eprintln!("rsc: mount profile {:?} failed: {e}", mount_profile.name);
+        std::process::exit(1);
+    }
+
     let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if ret != 0 {
         eprintln!(
@@ -299,11 +367,20 @@ fn child_seccomp_exec(
         }
     };
 
-    if let Err(e) = send_fd(sock, notify_fd) {
-        eprintln!("rsc: send_fd failed: {e}");
+    // The kernel sets O_CLOEXEC on the seccomp notify fd by default.
+    // Clear it so the fd survives exec into bash; otherwise pidfd_getfd in
+    // the parent would race against exec and see EBADF.
+    unsafe { libc::fcntl(notify_fd, libc::F_SETFD, 0) };
+
+    // Send notify fd NUMBER via write() (syscall 1 — never intercepted).
+    // The parent steals the fd from our /proc entry via pidfd_getfd.
+    let fd_bytes = (notify_fd as u32).to_ne_bytes();
+    let ret = unsafe { libc::write(pipe_write, fd_bytes.as_ptr() as _, 4) };
+    if ret != 4 {
+        eprintln!("rsc: write notify fd number failed: {}", std::io::Error::last_os_error());
         std::process::exit(1);
     }
-    unsafe { libc::close(sock) };
+    unsafe { libc::close(pipe_write) };
 
     child_exec(cmd, cmd_args);
 }
@@ -368,86 +445,84 @@ fn install_seccomp_filter(syscall_nrs: &[u32]) -> Result<libc::c_int> {
     Ok(fd as libc::c_int)
 }
 
-/// Send `fd` over `sock` using SCM_RIGHTS ancillary data.
-fn send_fd(sock: libc::c_int, fd: libc::c_int) -> Result<()> {
-    let cmsg_space =
-        unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as usize;
-    let mut cmsg_buf = vec![0u8; cmsg_space];
+/// Read the notify fd number written by the child and steal the fd from the
+/// child's fd table using pidfd_getfd (Linux 5.6+).
+///
+/// The child writes a raw u32 (notify_fd number) via write(2) — syscall 1,
+/// which is never in any profile's seccomp forward list. We then use
+/// pidfd_getfd to atomically duplicate the fd from the child's fd table into
+/// the parent's, without any sendmsg/recvmsg round-trip.
+fn recv_notify_fd(pipe_read: libc::c_int, child_pid: libc::pid_t) -> Result<libc::c_int> {
+    const SYS_PIDFD_OPEN: libc::c_long = 434; // x86_64
+    const SYS_PIDFD_GETFD: libc::c_long = 438; // x86_64
 
-    let dummy: u8 = 0;
-    let mut iov = libc::iovec {
-        iov_base: &dummy as *const u8 as *mut libc::c_void,
-        iov_len: 1,
+    let mut buf = [0u8; 4];
+    let ret = unsafe { libc::read(pipe_read, buf.as_mut_ptr() as _, 4) };
+    if ret != 4 {
+        bail!(
+            "read notify fd number from child (got {} bytes): {}",
+            ret,
+            std::io::Error::last_os_error()
+        );
+    }
+    let fd_num = u32::from_ne_bytes(buf) as libc::c_int;
+
+    let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, child_pid as libc::c_long, 0i64) };
+    if pidfd < 0 {
+        bail!("pidfd_open({}): {}", child_pid, std::io::Error::last_os_error());
+    }
+    let pidfd = pidfd as libc::c_int;
+
+    let duped = unsafe {
+        libc::syscall(SYS_PIDFD_GETFD, pidfd as libc::c_long, fd_num as libc::c_long, 0i64)
     };
+    unsafe { libc::close(pidfd) };
 
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov as *mut libc::iovec;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_space;
-
-    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-    if cmsg.is_null() {
-        bail!("CMSG_FIRSTHDR returned null");
-    }
-    unsafe {
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len =
-            libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
-        let data_ptr = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
-        *data_ptr = fd;
+    if duped < 0 {
+        bail!(
+            "pidfd_getfd(child={}, fd={}): {}",
+            child_pid, fd_num,
+            std::io::Error::last_os_error()
+        );
     }
 
-    let ret = unsafe { libc::sendmsg(sock, &msg, 0) };
-    if ret < 0 {
-        bail!("sendmsg: {}", std::io::Error::last_os_error());
-    }
-    Ok(())
+    // pidfd_getfd always sets O_CLOEXEC on the result. Clear it so the fd
+    // survives exec_rsclient's execvpe() into rsclient.
+    unsafe { libc::fcntl(duped as libc::c_int, libc::F_SETFD, 0) };
+
+    Ok(duped as libc::c_int)
 }
 
-/// Receive a single fd via SCM_RIGHTS over `sock`.
-fn recv_fd(sock: libc::c_int) -> Result<libc::c_int> {
-    let cmsg_space =
-        unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as usize;
-    let mut cmsg_buf = vec![0u8; cmsg_space];
-
-    let mut dummy: u8 = 0;
-    let mut iov = libc::iovec {
-        iov_base: &mut dummy as *mut u8 as *mut libc::c_void,
-        iov_len: 1,
-    };
-
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov as *mut libc::iovec;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_space;
-
-    let ret = unsafe { libc::recvmsg(sock, &mut msg, 0) };
-    if ret < 0 {
-        bail!("recvmsg: {}", std::io::Error::last_os_error());
-    }
-
-    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-    if cmsg.is_null() {
-        bail!("no control message received");
-    }
-
-    let received_fd = unsafe {
-        if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-            bail!("unexpected cmsg level/type");
-        }
-        *(libc::CMSG_DATA(cmsg) as *const libc::c_int)
-    };
-
-    Ok(received_fd)
+/// Create a dedicated cgroup for locally-spawned processes and add `child_pid`.
+///
+/// Returns the cgroup path (e.g. `/sys/fs/cgroup/rscaller/session-<hex>`).
+/// The cgroup is a leaf under `CGROUP_BASE` so cgroup v2 delegation rules apply.
+fn create_session_cgroup(child_pid: libc::pid_t) -> Result<String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = format!("{CGROUP_BASE}/session-{ts:016x}");
+    fs::create_dir_all(&path)
+        .with_context(|| format!("create session cgroup {path}"))?;
+    fs::write(format!("{path}/cgroup.procs"), format!("{child_pid}\n"))
+        .with_context(|| format!("add PID {child_pid} to session cgroup"))?;
+    Ok(path)
 }
 
 /// Parent side: exec `rsclient --ctl seccomp --notif-fd <fd> [transport flags]`.
 ///
 /// This replaces the parent process image with rsclient.
-fn exec_rsclient(rsclient_bin: &str, transport: &TransportArgs, notify_fd: libc::c_int) -> ! {
+/// `session_cgroup` — path to the local session cgroup, if one was created.
+/// `cgroup_gated_nrs` — syscall numbers whose forwarding is gated by the cgroup filter.
+fn exec_rsclient(
+    rsclient_bin: &str,
+    transport: &TransportArgs,
+    notify_fd: libc::c_int,
+    session_cgroup: Option<&str>,
+    cgroup_gated_nrs: &[u32],
+) -> ! {
     let mut argv_strs = vec![
         rsclient_bin.to_string(),
         "--ctl".into(),
@@ -462,6 +537,18 @@ fn exec_rsclient(rsclient_bin: &str, transport: &TransportArgs, notify_fd: libc:
     if let Some(ca) = &transport.ca_cert {
         argv_strs.push("--ca-cert".into());
         argv_strs.push(ca.clone());
+    }
+    if let Some(cgroup) = session_cgroup {
+        argv_strs.push("--local-cgroup".into());
+        argv_strs.push(cgroup.to_string());
+        if !cgroup_gated_nrs.is_empty() {
+            let nrs = cgroup_gated_nrs.iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            argv_strs.push("--cgroup-gated-nrs".into());
+            argv_strs.push(nrs);
+        }
     }
 
     let argv: Vec<CString> = argv_strs
@@ -619,17 +706,15 @@ async fn spawn_rscfuse_async(
     encryption: &str,
     ca_cert: Option<&str>,
 ) -> Result<std::process::Child> {
-    let rscfuse_path = std::env::current_exe()?
-        .parent()
-        .unwrap()
-        .join("rscfuse");
+    let rsc_exe = std::env::current_exe().context("resolving current exe")?;
 
     let log_file =
         std::fs::File::create("/tmp/rscfuse.log").context("rscfuse log")?;
     let log_file2 = log_file.try_clone().context("rscfuse log clone")?;
 
-    let mut cmd = std::process::Command::new(&rscfuse_path);
-    cmd.arg("--beacon")
+    let mut cmd = std::process::Command::new(&rsc_exe);
+    cmd.arg("fuse")
+        .arg("--beacon")
         .arg(beacon)
         .arg("--mount")
         .arg(mount_path)
@@ -649,8 +734,8 @@ async fn spawn_rscfuse_async(
 
     let child = cmd
         .spawn()
-        .with_context(|| format!("spawning rscfuse from {:?}", rscfuse_path))?;
-    println!("rscfuse started (pid {})", child.id());
+        .with_context(|| format!("spawning rsc fuse from {:?}", rsc_exe))?;
+    println!("rsc fuse started (pid {})", child.id());
     Ok(child)
 }
 

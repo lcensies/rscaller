@@ -27,24 +27,47 @@ REMOTE_DIR = "/home/ubuntu/rscaller"
 
 
 # ---------------------------------------------------------------------------
-# Fabric helpers
+# Fabric helpers — persistent connections (one per host, reused across calls)
 # ---------------------------------------------------------------------------
 
-def _conn(host: str) -> Connection:
-    return Connection(host, connect_timeout=10,
-                      connect_kwargs={"allow_agent": True, "look_for_keys": True})
+_connections: dict[str, Connection] = {}
 
 
-def run(host: str, cmd: str, warn: bool = True, hide: bool = True):
+def _get_conn(host: str) -> Connection:
+    conn = _connections.get(host)
+    if conn is None:
+        conn = Connection(host, connect_timeout=10,
+                          connect_kwargs={"allow_agent": True, "look_for_keys": True})
+        _connections[host] = conn
+    return conn
+
+
+def _drop_conn(host: str) -> None:
+    """Close and evict the cached connection for host (e.g. after VM revert)."""
+    conn = _connections.pop(host, None)
+    if conn:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def run(host: str, cmd: str, warn: bool = True, hide: bool = True, timeout: int = 120):
     """Run cmd on host; returns a fabric Result. Never raises on non-zero exit."""
-    with _conn(host) as c:
-        return c.run(cmd, warn=warn, hide=hide, in_stream=False)
+    try:
+        return _get_conn(host).run(cmd, warn=warn, hide=hide, in_stream=False, timeout=timeout)
+    except Exception:
+        _drop_conn(host)
+        return _get_conn(host).run(cmd, warn=warn, hide=hide, in_stream=False, timeout=timeout)
 
 
 def run_bg(host: str, cmd: str):
     """Fire-and-forget: run cmd on host via disown, return immediately."""
-    with _conn(host) as c:
-        c.run(cmd, disown=True, in_stream=False)
+    try:
+        _get_conn(host).run(cmd, disown=True, in_stream=False)
+    except Exception:
+        _drop_conn(host)
+        _get_conn(host).run(cmd, disown=True, in_stream=False)
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +93,45 @@ def vm_restart(vm_name: str):
 
 
 # ---------------------------------------------------------------------------
+# VM snapshot helpers
+# ---------------------------------------------------------------------------
+
+def vm_snapshot(vm_name: str, snap_name: str) -> None:
+    """Create an internal (memory+disk) snapshot of a running VM.
+
+    Idempotent: deletes an existing snapshot with the same name first so that
+    a crash in a previous run (which skips teardown) never blocks a fresh run.
+    """
+    # Drop leftover from a crashed prior run — best effort, ignore errors.
+    subprocess.run(
+        ["virsh", "snapshot-delete", vm_name, snap_name],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["virsh", "snapshot-create-as", "--domain", vm_name,
+         "--name", snap_name, "--atomic"],
+        check=True, capture_output=True,
+    )
+
+
+def vm_restore(vm_name: str, snap_name: str) -> None:
+    """Revert VM to a previously created snapshot (pauses VM briefly)."""
+    _drop_conn(vm_name)
+    subprocess.run(
+        ["virsh", "snapshot-revert", vm_name, snap_name, "--running"],
+        check=True, capture_output=True,
+    )
+
+
+def vm_snapshot_delete(vm_name: str, snap_name: str) -> None:
+    """Delete a snapshot (best-effort; never raises)."""
+    subprocess.run(
+        ["virsh", "snapshot-delete", vm_name, snap_name],
+        capture_output=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # pytest options
 # ---------------------------------------------------------------------------
 
@@ -91,6 +153,12 @@ def pytest_addoption(parser):
                      help="Disable E2E tests that require beacon-host (on by default)")
     parser.addoption("--vm-name",      default=None,
                      help="libvirt domain for auto-restart (default: --remote)")
+    parser.addoption("--beacon-vm-name", default=None,
+                     help="libvirt domain for beacon VM snapshots (default: --beacon-host)")
+    parser.addoption("--beacon-vm-snapshot", default="baseline",
+                     help="Persistent baseline snapshot name for beacon VM (default: baseline)")
+    parser.addoption("--client-vm-snapshot", default="baseline",
+                     help="Persistent baseline snapshot name for client VM (default: baseline)")
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +188,50 @@ def beacon_port(pytestconfig):
 @pytest.fixture(scope="session")
 def vm_name(pytestconfig, remote):
     return pytestconfig.getoption("--vm-name") or remote
+
+
+@pytest.fixture(scope="session")
+def beacon_vm_name(pytestconfig, beacon_host):
+    return pytestconfig.getoption("--beacon-vm-name") or beacon_host
+
+
+@pytest.fixture(scope="session")
+def beacon_vm_snapshot(pytestconfig):
+    return pytestconfig.getoption("--beacon-vm-snapshot")
+
+
+@pytest.fixture(scope="session")
+def client_vm_snapshot(pytestconfig):
+    return pytestconfig.getoption("--client-vm-snapshot")
+
+
+# ---------------------------------------------------------------------------
+# Per-VM snapshot fixtures (function-scoped: snapshot before, revert after)
+# ---------------------------------------------------------------------------
+
+_SNAP = "pytest-clean"
+
+
+@pytest.fixture()
+def client_snapshotted(client, vm_name, client_vm_snapshot):
+    """Revert client VM to its persistent baseline snapshot before the test."""
+    print(f"\n[fixture] reverting {vm_name} → {client_vm_snapshot}", flush=True)
+    vm_restore(vm_name, client_vm_snapshot)
+    print(f"[fixture] waiting for SSH on {client}", flush=True)
+    wait_for_ssh(client)
+    print(f"[fixture] {client} is up", flush=True)
+    yield
+
+
+@pytest.fixture()
+def beacon_snapshotted(beacon_host, beacon_vm_name, beacon_vm_snapshot):
+    """Revert beacon VM to its persistent baseline snapshot before the test."""
+    print(f"\n[fixture] reverting {beacon_vm_name} → {beacon_vm_snapshot}", flush=True)
+    vm_restore(beacon_vm_name, beacon_vm_snapshot)
+    print(f"[fixture] waiting for SSH on {beacon_host}", flush=True)
+    wait_for_ssh(beacon_host)
+    print(f"[fixture] {beacon_host} is up", flush=True)
+    yield
 
 
 @pytest.fixture(scope="session")
@@ -267,7 +379,8 @@ def _forward_channel(chan, local_port: int):
 @pytest.fixture(scope="session")
 def beacon_tunnel(client, beacon_port, rsbeacon_local):
     """Reverse paramiko tunnel: client:beacon_port → localhost:beacon_port (kmod only)."""
-    conn = _conn(client)
+    conn = Connection(client, connect_timeout=10,
+                      connect_kwargs={"allow_agent": True, "look_for_keys": True})
     conn.open()
     transport = conn.client.get_transport()
     transport.request_port_forward("127.0.0.1", beacon_port)
@@ -340,14 +453,12 @@ def rsc_seccomp(pytestconfig, client, beacon_ip, beacon_port,
 
     rsc      = f"{REMOTE_DIR}/target/release/rsc"
     rsclient = f"{REMOTE_DIR}/target/release/rsclient"
-    rscfuse  = f"{REMOTE_DIR}/target/release/rscfuse"
 
     run_bg(client,
            f"nohup {rsc} exec "
            f"--beacon '{beacon_ip}:{beacon_port}' "
            f"--encryption none "
            f"--rsclient {rsclient} "
-           f"--rscfuse {rscfuse} "
            f"--mount-base {mount_dir} "
            f"--name default "
            f"-- sh -c 'kill -0 1; exec sleep 60' "

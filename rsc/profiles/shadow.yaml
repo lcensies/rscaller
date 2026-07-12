@@ -1,0 +1,43 @@
+name: shadow
+description: "Beacon impersonation — /proc, /sys, /etc identity overlaid; network forwarded through beacon"
+mounts:
+  - remote: /proc
+    local: /proc
+    type: bind
+  - remote: /sys
+    local: /sys
+    type: bind
+    optional: true
+  - remote: /etc/hostname
+    local: /etc/hostname
+    type: bind
+    optional: true
+  - remote: /etc/hosts
+    local: /etc/hosts
+    type: bind
+    optional: true
+  - remote: /etc/machine-id
+    local: /etc/machine-id
+    type: bind
+    optional: true
+  - remote: /etc/os-release
+    local: /etc/os-release
+    type: bind
+    optional: true
+  - remote: /etc/lsb-release
+    local: /etc/lsb-release
+    type: bind
+    optional: true
+forward:
+  - name: network
+    syscalls:
+      - socket
+      - connect
+      - bind
+      - accept4
+      - sendto
+      - recvfrom
+      - sendmsg
+      - recvmsg
+      - getsockopt
+      - setsockopt

@@ -2,11 +2,13 @@ use crate::client::Client;
 use crate::dirent::parse_dirent64;
 use crate::fh::FhTable;
 use crate::inode::InodeTable;
+use crate::procfs::{ProcFs, ProcPathKind, BEACON_PID_OFFSET};
 use crate::stat::stat_bytes_to_attr;
 use anyhow::Result;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    consts::FOPEN_DIRECT_IO,
 };
 use rscaller_proto::types::SyscallBuf;
 use std::ffi::OsStr;
@@ -42,6 +44,9 @@ pub struct RscFs {
     pub client: Arc<Client>,
     pub inodes: Arc<Mutex<InodeTable>>,
     pub fhs: Arc<Mutex<FhTable>>,
+    /// When Some, merged /proc mode is active: local PIDs served from real local
+    /// procfs; beacon PIDs (virtual = real_pid + BEACON_PID_OFFSET) from beacon.
+    pub proc_fs: Option<ProcFs>,
 }
 
 impl RscFs {
@@ -143,6 +148,46 @@ impl Filesystem for RscFs {
             None => { reply.error(libc::ENOENT); return; }
         };
 
+        // Merged /proc dispatch
+        if let Some(proc_fs) = self.proc_fs.as_ref() {
+            if path.starts_with("/proc") {
+                match ProcFs::classify(&path) {
+                    ProcPathKind::ProcSelf => {
+                        let ino = self.inodes.lock().unwrap().get_or_create(&path);
+                        reply.entry(&TTL, &ProcFs::proc_self_attr(ino), 0);
+                        return;
+                    }
+                    ProcPathKind::Local { pid, rest } => {
+                        let ino = self.inodes.lock().unwrap().get_or_create(&path);
+                        match proc_fs.attr_local(ino, pid, &rest, true) {
+                            Ok(attr) => reply.entry(&TTL, &attr, 0),
+                            Err(e) => {
+                                tracing::debug!("lookup local {:?}: {}", path, e);
+                                reply.error(libc::ENOENT);
+                            }
+                        }
+                        return;
+                    }
+                    ProcPathKind::Beacon { real_pid, rest } => {
+                        let bpath = ProcFs::beacon_path(real_pid, &rest);
+                        match proc_fs.stat_beacon(&bpath, true) {
+                            Ok(buf) if buf.len() >= std::mem::size_of::<libc::stat>() => {
+                                let ino = self.inodes.lock().unwrap().get_or_create(&path);
+                                reply.entry(&TTL, &stat_bytes_to_attr(ino, &buf), 0);
+                            }
+                            Ok(_) => reply.error(libc::EIO),
+                            Err(e) => {
+                                tracing::debug!("lookup beacon {:?}: {}", path, e);
+                                reply.error(libc::ENOENT);
+                            }
+                        }
+                        return;
+                    }
+                    ProcPathKind::Root | ProcPathKind::Other => {} // fall through to beacon
+                }
+            }
+        }
+
         match self.stat_path(&path, true) {
             Ok((buf, _)) => {
                 let ino = self.inodes.lock().unwrap().get_or_create(&path);
@@ -162,6 +207,39 @@ impl Filesystem for RscFs {
             None => { reply.error(libc::ENOENT); return; }
         };
 
+        // Merged /proc dispatch
+        if let Some(proc_fs) = self.proc_fs.as_ref() {
+            if path.starts_with("/proc") {
+                match ProcFs::classify(&path) {
+                    ProcPathKind::ProcSelf => {
+                        reply.attr(&TTL, &ProcFs::proc_self_attr(ino));
+                        return;
+                    }
+                    ProcPathKind::Local { pid, rest } => {
+                        match proc_fs.attr_local(ino, pid, &rest, false) {
+                            Ok(attr) => reply.attr(&TTL, &attr),
+                            Err(e) => {
+                                tracing::debug!("getattr local {:?}: {}", path, e);
+                                reply.error(libc::EIO);
+                            }
+                        }
+                        return;
+                    }
+                    ProcPathKind::Beacon { real_pid, rest } => {
+                        let bpath = ProcFs::beacon_path(real_pid, &rest);
+                        match proc_fs.stat_beacon(&bpath, false) {
+                            Ok(buf) if buf.len() >= std::mem::size_of::<libc::stat>() => {
+                                reply.attr(&TTL, &stat_bytes_to_attr(ino, &buf));
+                            }
+                            _ => reply.error(libc::EIO),
+                        }
+                        return;
+                    }
+                    ProcPathKind::Root | ProcPathKind::Other => {} // fall through
+                }
+            }
+        }
+
         match self.attr_for_path(ino, &path, false) {
             Ok(attr) => reply.attr(&TTL, &attr),
             Err(e) => {
@@ -177,13 +255,77 @@ impl Filesystem for RscFs {
             None => { reply.error(libc::ENOENT); return; }
         };
 
+        // Merged /proc dispatch
+        if let Some(proc_fs) = self.proc_fs.as_ref() {
+            if path.starts_with("/proc") {
+                match ProcFs::classify(&path) {
+                    ProcPathKind::Local { pid, rest } => {
+                        match proc_fs.open_local(pid, &rest, flags) {
+                            Ok(local_fd) => {
+                                let fh = self.fhs.lock().unwrap().alloc_local(local_fd);
+                                reply.opened(fh, FOPEN_DIRECT_IO);
+                            }
+                            Err(e) => {
+                                tracing::debug!("open local {:?}: {}", path, e);
+                                reply.error(libc::EIO);
+                            }
+                        }
+                        return;
+                    }
+                    ProcPathKind::Beacon { real_pid, rest } => {
+                        let bpath = ProcFs::beacon_path(real_pid, &rest);
+                        // Read all beacon proc files into a local memfd at open time.
+                        // This covers stat/status PID patching and avoids keeping remote
+                        // fds open for files that procfs regenerates on every read anyway.
+                        match proc_fs.read_beacon_file(&bpath) {
+                            Ok(raw) => {
+                                let stem = rest.rsplit('/').next().unwrap_or("");
+                                let content = match stem {
+                                    "stat"   => patch_beacon_stat(&raw, real_pid),
+                                    "status" => patch_beacon_status(&raw, real_pid),
+                                    "children" => patch_beacon_children(&raw),
+                                    _ => raw,
+                                };
+                                match make_memfd(&content) {
+                                    Ok(memfd) => {
+                                        let fh = self.fhs.lock().unwrap().alloc_local(memfd);
+                                        reply.opened(fh, FOPEN_DIRECT_IO);
+                                        return;
+                                    }
+                                    Err(e) => tracing::debug!("make_memfd {:?}: {}", bpath, e),
+                                }
+                            }
+                            Err(e) => tracing::debug!("read_beacon_file {:?}: {}", bpath, e),
+                        }
+                        // Fallback: proxy via remote fd (e.g. write-opened files).
+                        let open_flags = flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC);
+                        match proc_fs.open_beacon(&bpath, open_flags) {
+                            Ok(rfd) => {
+                                let fh = self.fhs.lock().unwrap().alloc(rfd);
+                                reply.opened(fh, FOPEN_DIRECT_IO);
+                            }
+                            Err(e) => {
+                                tracing::debug!("open beacon {:?}: {}", path, e);
+                                reply.error(libc::EIO);
+                            }
+                        }
+                        return;
+                    }
+                    _ => {} // Root, ProcSelf, Other: fall through
+                }
+            }
+        }
+
         // Strip O_CREAT etc. that don't make sense for an existing file open.
         let open_flags = flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC);
 
         match self.remote_open(&path, open_flags, 0) {
             Ok(rfd) => {
                 let fh = self.fhs.lock().unwrap().alloc(rfd);
-                reply.opened(fh, 0);
+                // FOPEN_DIRECT_IO bypasses the kernel page cache so every read
+                // reaches our handler.  Required for /proc files which report
+                // st_size=0 and would otherwise be served as empty from cache.
+                reply.opened(fh, FOPEN_DIRECT_IO);
             }
             Err(e) => {
                 tracing::debug!("open ino={}: {}", ino, e);
@@ -203,6 +345,26 @@ impl Filesystem for RscFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        // Local fh: read from real /proc via local pread.
+        if let Some(local_fd) = self.fhs.lock().unwrap().get_local(fh) {
+            let mut buf = vec![0u8; size as usize];
+            let ret = unsafe {
+                libc::pread(
+                    local_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    size as libc::size_t,
+                    offset as libc::off_t,
+                )
+            };
+            if ret < 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+                reply.error(errno);
+            } else {
+                reply.data(&buf[..ret as usize]);
+            }
+            return;
+        }
+
         let rfd = match self.fhs.lock().unwrap().get(fh) {
             Some(fd) => fd,
             None => { reply.error(libc::EBADF); return; }
@@ -283,8 +445,15 @@ impl Filesystem for RscFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        if let Some(rfd) = self.fhs.lock().unwrap().release(fh) {
-            self.remote_close(rfd);
+        // Extract under lock then drop the guard before any further locking.
+        let local_fd = self.fhs.lock().unwrap().release_local(fh);
+        if let Some(lfd) = local_fd {
+            unsafe { libc::close(lfd); }
+        } else {
+            let rfd = self.fhs.lock().unwrap().release(fh);
+            if let Some(rfd) = rfd {
+                self.remote_close(rfd);
+            }
         }
         reply.ok();
     }
@@ -294,6 +463,42 @@ impl Filesystem for RscFs {
             Some(p) => p,
             None => { reply.error(libc::ENOENT); return; }
         };
+
+        // Merged /proc dispatch
+        if let Some(proc_fs) = self.proc_fs.as_ref() {
+            if path.starts_with("/proc") {
+                match ProcFs::classify(&path) {
+                    ProcPathKind::Local { pid, rest } => {
+                        match proc_fs.open_local(pid, &rest, libc::O_RDONLY | libc::O_DIRECTORY) {
+                            Ok(local_fd) => {
+                                let fh = self.fhs.lock().unwrap().alloc_local(local_fd);
+                                reply.opened(fh, 0);
+                            }
+                            Err(e) => {
+                                tracing::debug!("opendir local {:?}: {}", path, e);
+                                reply.error(libc::EIO);
+                            }
+                        }
+                        return;
+                    }
+                    ProcPathKind::Beacon { real_pid, rest } => {
+                        let bpath = ProcFs::beacon_path(real_pid, &rest);
+                        match proc_fs.open_beacon(&bpath, libc::O_RDONLY | libc::O_DIRECTORY) {
+                            Ok(rfd) => {
+                                let fh = self.fhs.lock().unwrap().alloc(rfd);
+                                reply.opened(fh, 0);
+                            }
+                            Err(e) => {
+                                tracing::debug!("opendir beacon {:?}: {}", path, e);
+                                reply.error(libc::EIO);
+                            }
+                        }
+                        return;
+                    }
+                    _ => {} // Root, ProcSelf, Other: fall through to beacon open
+                }
+            }
+        }
 
         // O_RDONLY | O_DIRECTORY
         match self.remote_open(&path, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
@@ -311,11 +516,103 @@ impl Filesystem for RscFs {
     fn readdir(
         &mut self,
         _req: &Request,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        // Local fh: enumerate a real local /proc/<pid>/ directory.
+        if let Some(local_fd) = self.fhs.lock().unwrap().get_local(fh) {
+            let mut all_entries = Vec::new();
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let ret = unsafe {
+                    libc::syscall(
+                        libc::SYS_getdents64,
+                        local_fd as libc::c_long,
+                        buf.as_mut_ptr() as libc::c_long,
+                        buf.len() as libc::c_long,
+                    )
+                };
+                if ret <= 0 { break; }
+                let mut parsed = parse_dirent64(&buf[..ret as usize]);
+                all_entries.append(&mut parsed);
+            }
+            for (i, entry) in all_entries.iter().enumerate() {
+                if (i as i64) < offset { continue; }
+                let kind = dirent_type_to_filetype(entry.file_type);
+                if reply.add(entry.ino, (i + 1) as i64, kind, OsStr::new(&entry.name)) {
+                    break;
+                }
+            }
+            reply.ok();
+            return;
+        }
+
+        // Merged /proc root: emit beacon PIDs (with offset) + local PIDs.
+        if self.proc_fs.is_some() {
+            let is_proc_root = {
+                let inodes = self.inodes.lock().unwrap();
+                inodes.get_path(ino).map(|p| p == "/proc").unwrap_or(false)
+            };
+            if is_proc_root {
+                let rfd = match self.fhs.lock().unwrap().get(fh) {
+                    Some(fd) => fd,
+                    None => { reply.error(libc::EBADF); return; }
+                };
+
+                let mut all_entries: Vec<(u64, FileType, String)> = Vec::new();
+                loop {
+                    let res = self.client.syscall(
+                        SYS_GETDENTS64,
+                        [rfd as u64, 0, 65536, 0, 0, 0],
+                        vec![],
+                        vec![(1, 65536)],
+                    );
+                    match res {
+                        Ok((ret, out_bufs)) => {
+                            if ret <= 0 { break; }
+                            let buf = out_bufs.into_iter().find(|b| b.arg_idx == 1)
+                                .map(|b| b.data).unwrap_or_default();
+                            for e in parse_dirent64(&buf[..(ret as usize).min(buf.len())]) {
+                                if e.name == "." || e.name == ".." { continue; }
+                                let kind = dirent_type_to_filetype(e.file_type);
+                                if let Ok(pid) = e.name.parse::<u64>() {
+                                    if pid > 0 {
+                                        let virt = pid + BEACON_PID_OFFSET;
+                                        all_entries.push((virt, kind, virt.to_string()));
+                                    }
+                                } else {
+                                    // Non-PID entry (net, sys, version, etc.)
+                                    all_entries.push((e.ino, kind, e.name));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("merged-proc getdents64: {}", e);
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                    }
+                }
+
+                // Append local PIDs
+                for pid in self.proc_fs.as_ref().unwrap().local_pids() {
+                    all_entries.push((pid as u64, FileType::Directory, pid.to_string()));
+                }
+
+                for (i, (entry_ino, kind, name)) in all_entries.iter().enumerate() {
+                    if (i as i64) < offset { continue; }
+                    if reply.add(*entry_ino, (i + 1) as i64, *kind, OsStr::new(name)) {
+                        break;
+                    }
+                }
+                reply.ok();
+                return;
+            }
+        }
+
+        // Normal remote readdir.
         let rfd = match self.fhs.lock().unwrap().get(fh) {
             Some(fd) => fd,
             None => { reply.error(libc::EBADF); return; }
@@ -361,18 +658,6 @@ impl Filesystem for RscFs {
 
             let kind = dirent_type_to_filetype(entry.file_type);
 
-            // Get or create inode for this entry name.
-            // We don't have the parent path here easily, but we can use the
-            // entry name with an inode from the kernel's d_ino.
-            let full_path = {
-                // We need parent path — retrieve from the fh's inode.
-                // Since we don't track fh→ino, use the kernel ino directly
-                // and register it in our table keyed by the d_ino number.
-                // This is a best-effort mapping.
-                entry.ino
-            };
-            let _ = full_path; // used below via entry.ino
-
             let next_offset = (i + 1) as i64;
             if reply.add(entry.ino, next_offset, kind, OsStr::new(&entry.name)) {
                 break; // buffer full
@@ -390,17 +675,60 @@ impl Filesystem for RscFs {
         _flags: i32,
         reply: ReplyEmpty,
     ) {
-        if let Some(rfd) = self.fhs.lock().unwrap().release(fh) {
-            self.remote_close(rfd);
+        let local_fd = self.fhs.lock().unwrap().release_local(fh);
+        if let Some(lfd) = local_fd {
+            unsafe { libc::close(lfd); }
+        } else {
+            let rfd = self.fhs.lock().unwrap().release(fh);
+            if let Some(rfd) = rfd {
+                self.remote_close(rfd);
+            }
         }
         reply.ok();
     }
 
-    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
+    fn readlink(&mut self, req: &Request, ino: u64, reply: ReplyData) {
         let path = match self.path_for(ino) {
             Some(p) => p,
             None => { reply.error(libc::ENOENT); return; }
         };
+
+        // Merged /proc dispatch
+        if let Some(proc_fs) = self.proc_fs.as_ref() {
+            if path.starts_with("/proc") {
+                match ProcFs::classify(&path) {
+                    ProcPathKind::ProcSelf => {
+                        // Return the PID of the process that issued this FUSE request,
+                        // not rscfuse's own PID — callers like `tail` use /proc/self/fd/N
+                        // to access their own file descriptors.
+                        reply.data(req.pid().to_string().as_bytes());
+                        return;
+                    }
+                    ProcPathKind::Local { pid, rest } => {
+                        match proc_fs.readlink_local(pid, &rest) {
+                            Ok(data) => reply.data(&data),
+                            Err(e) => {
+                                tracing::debug!("readlink local {:?}: {}", path, e);
+                                reply.error(libc::EINVAL);
+                            }
+                        }
+                        return;
+                    }
+                    ProcPathKind::Beacon { real_pid, rest } => {
+                        let bpath = ProcFs::beacon_path(real_pid, &rest);
+                        match proc_fs.readlink_beacon(&bpath) {
+                            Ok(data) => reply.data(&data),
+                            Err(e) => {
+                                tracing::debug!("readlink beacon {:?}: {}", path, e);
+                                reply.error(libc::EINVAL);
+                            }
+                        }
+                        return;
+                    }
+                    ProcPathKind::Root | ProcPathKind::Other => {} // fall through
+                }
+            }
+        }
 
         let mut path_bytes = path.as_bytes().to_vec();
         path_bytes.push(0);
@@ -869,6 +1197,93 @@ impl RscFs {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Beacon /proc/<pid>/stat and /proc/<pid>/status PID patching
+//
+// procps-ng validates that stat[0] (pid field in the file) matches the
+// directory name.  Beacon processes appear at virtual PIDs (real + offset),
+// so we rewrite those two files at open time and serve them from a memfd.
+// ---------------------------------------------------------------------------
+
+/// Add BEACON_PID_OFFSET to a non-zero PID string; leave "0" unchanged.
+fn virt_pid(s: &str) -> String {
+    match s.trim().parse::<u64>() {
+        Ok(0) | Err(_) => s.to_string(),
+        Ok(n) => (n + BEACON_PID_OFFSET).to_string(),
+    }
+}
+
+/// Rewrite /proc/<real_pid>/stat so field 0 and the ppid/pgrp/session fields
+/// carry virtual PIDs.  The comm field "(name)" may contain spaces, so we
+/// locate it by the first '(' and last ')' rather than splitting on spaces.
+fn patch_beacon_stat(content: &[u8], real_pid: u32) -> Vec<u8> {
+    let s = match std::str::from_utf8(content) { Ok(s) => s, Err(_) => return content.to_vec() };
+    let open  = match s.find('(')  { Some(i) => i, None => return content.to_vec() };
+    let close = match s.rfind(')') { Some(i) => i, None => return content.to_vec() };
+    if close <= open { return content.to_vec(); }
+    let comm = &s[open..=close]; // "(name)" — verbatim, may contain spaces
+    // Fields after ')': <state> <ppid> <pgrp> <session> <tty_nr> ...
+    let after: Vec<&str> = s[close + 1..].split_whitespace().collect();
+    if after.len() < 4 { return content.to_vec(); }
+    let state   = after[0];
+    let ppid    = virt_pid(after[1]);
+    let pgrp    = virt_pid(after[2]);
+    let session = virt_pid(after[3]);
+    let rest: Vec<&str> = after[4..].to_vec();
+    let virtual_pid = real_pid as u64 + BEACON_PID_OFFSET;
+    let mut out = format!("{} {} {} {} {} {}", virtual_pid, comm, state, ppid, pgrp, session);
+    for f in &rest { out.push(' '); out.push_str(f); }
+    out.push('\n');
+    out.into_bytes()
+}
+
+/// Rewrite /proc/<real_pid>/status so Pid/Tgid/PPid/TracerPid carry virtual PIDs.
+fn patch_beacon_status(content: &[u8], real_pid: u32) -> Vec<u8> {
+    let s = match std::str::from_utf8(content) { Ok(s) => s, Err(_) => return content.to_vec() };
+    let mut out = String::with_capacity(s.len() + 64);
+    for line in s.lines() {
+        let colon = match line.find(':') { Some(i) => i, None => { out.push_str(line); out.push('\n'); continue; } };
+        let key = &line[..colon];
+        let raw_val = &line[colon + 1..];
+        match key {
+            "Pid" => out.push_str(&format!("Pid:\t{}\n", real_pid as u64 + BEACON_PID_OFFSET)),
+            "Tgid" | "PPid" | "TracerPid" => {
+                out.push_str(&format!("{}:\t{}\n", key, virt_pid(raw_val)));
+            }
+            _ => { out.push_str(line); out.push('\n'); }
+        }
+    }
+    out.into_bytes()
+}
+
+/// Rewrite /proc/<pid>/task/<tid>/children — space-separated child PIDs — adding the offset.
+fn patch_beacon_children(content: &[u8]) -> Vec<u8> {
+    let s = match std::str::from_utf8(content) { Ok(s) => s, Err(_) => return content.to_vec() };
+    let out: Vec<String> = s.split_whitespace().map(virt_pid).collect();
+    if out.is_empty() {
+        return content.to_vec();
+    }
+    let mut result = out.join(" ");
+    result.push('\n');
+    result.into_bytes()
+}
+
+/// Create an anonymous memfd containing `content`; returns the fd.
+fn make_memfd(content: &[u8]) -> anyhow::Result<std::os::unix::io::RawFd> {
+    let name = std::ffi::CString::new("proc-patch").unwrap();
+    let fd = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), 0u64) } as i32;
+    if fd < 0 { anyhow::bail!("memfd_create: {}", std::io::Error::last_os_error()); }
+    let mut written = 0;
+    while written < content.len() {
+        let ret = unsafe {
+            libc::write(fd, content[written..].as_ptr() as *const libc::c_void, content.len() - written)
+        };
+        if ret <= 0 { unsafe { libc::close(fd); } anyhow::bail!("memfd write"); }
+        written += ret as usize;
+    }
+    Ok(fd)
 }
 
 fn dirent_type_to_filetype(d_type: u8) -> FileType {
