@@ -26,6 +26,7 @@ pub use notification::{Notification, SyscallArgs};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::os::unix::io::RawFd;
 
 /// The controller interface every backend must implement.
 ///
@@ -69,5 +70,34 @@ pub trait SyscallController: Send {
     async fn continue_syscall(&mut self, id: u64) -> Result<()> {
         let _ = id;
         anyhow::bail!("continue_syscall not supported by this controller backend")
+    }
+
+    /// Complete a notification by injecting `local_fd` — an fd valid in
+    /// THIS process (the controller/relay), e.g. one half of a
+    /// `socketpair()` — into the tracee's own fd table, using the newly
+    /// installed fd number as the syscall's return value.
+    ///
+    /// Only meaningful for syscalls that return a *new* fd (`socket`,
+    /// `accept4`): it lets a real, locally-backed fd stand in for what
+    /// used to be a bare virtual fd number, so every later `read`/`write`/
+    /// `close`/`poll`/`fcntl`/`ioctl` on it is an ordinary local syscall —
+    /// never seen by this controller again — while a background task on
+    /// the *other* half of the pair relays actual bytes to/from rsbeacon
+    /// using the existing per-syscall request/response API, unchanged.
+    ///
+    /// For the seccomp backend this is `SECCOMP_IOCTL_NOTIF_ADDFD` with
+    /// `SECCOMP_ADDFD_FLAG_SEND` (Linux 5.9+), which atomically injects the
+    /// fd *and* completes/resumes the notification with it as the return
+    /// value. The kmod backend has no equivalent (and doesn't need one —
+    /// see `AGENTS.md`'s "shadow fd" note); the default impl returns an
+    /// error so callers know to fall back to a plain `complete(id, retval,
+    /// ...)` with the original (virtual fd) value instead.
+    ///
+    /// Returns the fd number as installed in the *tracee's* fd table
+    /// (usually different from `local_fd`, which is a number in the
+    /// caller's own table).
+    async fn complete_with_fd(&mut self, id: u64, local_fd: RawFd) -> Result<RawFd> {
+        let _ = (id, local_fd);
+        anyhow::bail!("complete_with_fd not supported by this controller backend")
     }
 }

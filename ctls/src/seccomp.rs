@@ -76,11 +76,24 @@ struct SeccompNotifResp {
     flags: u32,
 }
 
+/// `struct seccomp_notif_addfd` from linux/seccomp.h — see
+/// `SyscallController::complete_with_fd`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SeccompNotifAddfd {
+    id: u64,
+    flags: u32,
+    srcfd: u32,
+    newfd: u32,
+    newfd_flags: u32,
+}
+
 // Compile-time layout assertions.
 const _: () = {
     assert!(mem::size_of::<SeccompData>() == 64);
     assert!(mem::size_of::<SeccompNotif>() == 80);
     assert!(mem::size_of::<SeccompNotifResp>() == 24);
+    assert!(mem::size_of::<SeccompNotifAddfd>() == 24);
 };
 
 // ---------------------------------------------------------------------------
@@ -110,6 +123,14 @@ const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong =
 #[allow(dead_code)]
 const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong =
     iow(2, mem::size_of::<u64>());
+/// `SECCOMP_IOCTL_NOTIF_ADDFD` — see `SyscallController::complete_with_fd`.
+/// Linux 5.9+.
+const SECCOMP_IOCTL_NOTIF_ADDFD: libc::c_ulong =
+    iowr(3, mem::size_of::<SeccompNotifAddfd>());
+/// `flags` bit: complete/resume the notification atomically with this
+/// ioctl call, returning the newly-installed fd number as the ioctl's own
+/// return value — no separate `SECCOMP_IOCTL_NOTIF_SEND` needed.
+const SECCOMP_ADDFD_FLAG_SEND: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // seccomp(2) syscall wrappers
@@ -519,6 +540,30 @@ impl SyscallController for SeccompController {
             bail!("continue_syscall SECCOMP_IOCTL_NOTIF_SEND id={}: {}", id, err);
         }
         Ok(())
+    }
+
+    async fn complete_with_fd(&mut self, id: u64, local_fd: RawFd) -> Result<RawFd> {
+        let fd = self.fd;
+        let mut addfd = SeccompNotifAddfd {
+            id,
+            flags: SECCOMP_ADDFD_FLAG_SEND,
+            srcfd: local_fd as u32,
+            newfd: 0,
+            newfd_flags: 0,
+        };
+        // SECCOMP_IOCTL_NOTIF_ADDFD with FLAG_SEND both installs `local_fd`
+        // (duplicated from THIS process's fd table) into the tracee's fd
+        // table AND completes/resumes the notification in one call — the
+        // ioctl's return value IS the new fd number in the tracee, per
+        // `man 2 seccomp_unotify`.
+        let ret = unsafe {
+            libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD, &mut addfd as *mut SeccompNotifAddfd)
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            bail!("SECCOMP_IOCTL_NOTIF_ADDFD id={}: {}", id, err);
+        }
+        Ok(ret)
     }
 }
 

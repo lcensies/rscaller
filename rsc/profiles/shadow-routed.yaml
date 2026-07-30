@@ -1,0 +1,86 @@
+name: shadow-routed
+description: "Shadow profile with network routing policy — targets remote, C2+internet local"
+mounts:
+  - remote: /proc
+    local: /proc
+    type: bind
+  - remote: /sys
+    local: /sys
+    type: bind
+    optional: true
+  - remote: /etc/hostname
+    local: /etc/hostname
+    type: bind
+    optional: true
+  - remote: /etc/hosts
+    local: /etc/hosts
+    type: bind
+    optional: true
+  - remote: /etc/machine-id
+    local: /etc/machine-id
+    type: bind
+    optional: true
+  - remote: /etc/os-release
+    local: /etc/os-release
+    type: bind
+    optional: true
+  - remote: /etc/lsb-release
+    local: /etc/lsb-release
+    type: bind
+    optional: true
+  - remote: /etc/resolv.conf
+    local: /etc/resolv.conf
+    type: bind
+    optional: true
+
+forward:
+  - name: network-routed
+    syscalls:
+      - socket
+      - connect
+      - bind
+      - listen
+      - accept4
+      - sendto
+      - recvfrom
+      - sendmsg
+      - recvmsg
+      - getsockopt
+      - setsockopt
+    filter:
+      # Network routing policy: ordered rules, first match wins.
+      # Customize by passing --route "subnet=direction" CLI args.
+      # Default routes provided as example (all LOCAL — safe default).
+      net_routes:
+        # Example: C2 controller (local network, real kernel)
+        # - subnet: "10.0.0.1/32"
+        #   port: 443
+        #   direction: LOCAL
+
+        # Example: target network (relay through beacon)
+        # - subnet: "192.168.1.0/24"
+        #   direction: REMOTE
+
+        # Default: everything else uses real kernel
+        - subnet: "0.0.0.0/0"
+          direction: LOCAL
+
+  # read/write/close/poll/ppoll are generic — they operate on ordinary
+  # file/pipe/terminal fds far more often than on our beacon-owned socket
+  # fds. fd_range:virtual restricts interception to fds in the virtual
+  # range a NetBackend hands out (see rscaller_proto::types::VIRTUAL_FD_BASE);
+  # everything else runs against the real kernel untouched, at zero added
+  # cost (the check happens in the seccomp BPF filter itself, before any
+  # notification/relay round-trip). See
+  # ctls::seccomp::build_filter_fd_gated / rsc::mount_config::ForwardFilter.
+  - name: socket-fd-ops
+    syscalls:
+      - read
+      - write
+      - close
+      - poll
+      - ppoll
+      - fcntl
+      - ioctl
+    filter:
+      fd_range: virtual

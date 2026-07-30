@@ -146,6 +146,10 @@ pub struct ForwardFilter {
     /// reaches rsclient/rsbeacon.
     #[serde(default)]
     pub fd_range: Option<FdRangeScope>,
+    /// Network routing policy: ordered list of destination subnet → direction rules.
+    /// First match wins. Applies to `connect()` and `sendto()` syscalls.
+    #[serde(default)]
+    pub net_routes: Option<Vec<NetRoute>>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -161,6 +165,25 @@ pub enum FdRangeScope {
     /// Only forward if the fd argument is in the beacon-owned virtual fd
     /// range.
     Virtual,
+}
+
+/// Network routing rule: match destination subnet/port, apply direction (LOCAL or REMOTE).
+#[derive(Deserialize, Clone, Debug)]
+pub struct NetRoute {
+    /// Destination subnet in CIDR notation, e.g. "192.168.1.0/24" or "10.0.0.1/32".
+    pub subnet: String,
+    /// Optional: specific destination port (host byte order). Omit or 0 for any port.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Direction: LOCAL (use tracee's kernel) or REMOTE (forward to beacon).
+    pub direction: NetRouteDirection,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum NetRouteDirection {
+    Local,
+    Remote,
 }
 
 // Generated from files/syscall_nrs by build.rs.

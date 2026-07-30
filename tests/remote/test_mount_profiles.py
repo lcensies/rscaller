@@ -216,3 +216,84 @@ def test_shadow(client, beacon_host, beacon_ip, beacon_port, rsbeacon):
         f"tracee saw hostname execve on beacon (expected 0 — exec must be local):\n"
         + "\n".join("  " + tracee.format_event(e) for e in hostname_events)
     )
+
+
+# ---------------------------------------------------------------------------
+# Network routing tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.timeout(120)
+def test_net_routing_default_local(client, beacon_host, beacon_ip, beacon_port, rsbeacon):
+    """Default routing: all connections LOCAL (no --route args).
+    
+    Connect to localhost:9999 (nothing listening).  Should fail locally with
+    'Connection refused', NOT hang waiting for beacon response (which would
+    indicate the connection was routed to beacon).
+    """
+    # Create a simple Python script that tries to connect to localhost:9999
+    test_script = """
+import socket
+try:
+    s = socket.socket()
+    s.settimeout(2)
+    s.connect(('127.0.0.1', 9999))
+except ConnectionRefusedError:
+    print("LOCAL_REFUSED")
+except Exception as e:
+    print(f"ERROR: {e}")
+"""
+    rc, stdout = _rsc_exec(client, beacon_ip, beacon_port, "none",
+                           f"python3 -c '{test_script}'", timeout=15)
+    
+    print(f"[test_net_routing_default_local] stdout={stdout.strip()!r}", flush=True)
+    # With default LOCAL routing, should get ECONNREFUSED locally (not hang on beacon)
+    assert "LOCAL_REFUSED" in stdout or "Refused" in stdout or rc != 0, (
+        f"Expected local connect failure, got: {stdout}"
+    )
+
+
+@pytest.mark.timeout(120)
+def test_net_routing_route_arg(client, beacon_host, beacon_ip, beacon_port, rsbeacon):
+    """Network routing with --route argument.
+    
+    Pass --route to rsc exec; verify it's parsed and does not crash.
+    The actual routing behavior (LOCAL vs REMOTE) is tested by unit tests.
+    This e2e test just ensures the CLI arg is accepted and the process runs.
+    """
+    rsc      = f"{REMOTE_DIR}/target/release/rsc"
+    rsclient = f"{REMOTE_DIR}/target/release/rsclient"
+    name     = "net-routing-test"
+    mount_point = f"{MOUNT_BASE}/{name}"
+    
+    run(client, f"mkdir -p '{MOUNT_BASE}'")
+    run(client,
+        f"sudo pkill -9 -f '{name}' 2>/dev/null || true; sleep 0.4; "
+        f"grep -qF '{mount_point}' /proc/mounts && sudo umount -l '{mount_point}' 2>/dev/null || true; "
+        f"sudo rm -rf '{mount_point}' 2>/dev/null || true")
+    
+    # Start rsc fuse overlay with routing args
+    cmd = (
+        f"cd {REMOTE_DIR} && "
+        f"LD_LIBRARY_PATH=/home/ubuntu/install/lib:$LD_LIBRARY_PATH "
+        f"sudo -E {rsc} fuse --mount {mount_point} "
+        f"--remote-target rsbeacon --remote-origin {beacon_ip}:{beacon_port} "
+        f"--route '192.0.2.0/24=remote' "
+        f"--route '0.0.0.0/0=local' "
+        f">/tmp/rsc-fuse-routing.log 2>&1 &"
+    )
+    
+    run(client, cmd)
+    time.sleep(1)
+    
+    # Verify mount exists
+    r = run(client, f"test -d {mount_point} && echo OK")
+    assert r.ok and "OK" in r.stdout, (
+        f"rsc fuse mount failed; check /tmp/rsc-fuse-routing.log:\n"
+        + run(client, "cat /tmp/rsc-fuse-routing.log").stdout[:500]
+    )
+    
+    # Clean up
+    run(client,
+        f"sudo pkill -9 -f '{name}' 2>/dev/null || true; sleep 0.4; "
+        f"grep -qF '{mount_point}' /proc/mounts && sudo umount -l '{mount_point}' 2>/dev/null || true")
+

@@ -2,8 +2,10 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use tracing::{info, warn};
 
+mod beacon_conn;
 mod kmod;
 mod relay;
+mod socket_proxy;
 mod veth;
 
 #[derive(Parser)]
@@ -39,13 +41,21 @@ struct Args {
     #[arg(long, default_value = "rsc1")]
     veth_peer: String,
 
-    // ── Filter config ────────────────────────────────────────────────────────
-    /// Subnet to intercept and forward (e.g. 192.0.2.160/29)
-    #[arg(long)]
+    // ── Network routing ──────────────────────────────────────────────────────
+    /// Network routing rules: `--route "<subnet>[:port]=<direction>"`.
+    /// Multiple routes allowed; first match wins.
+    /// Direction: "local" (use real kernel) or "remote" (relay through beacon).
+    /// Example: `--route "192.168.1.0/24=remote" --route "0.0.0.0/0=local"`
+    #[arg(long, value_name = "RULE")]
+    route: Vec<String>,
+
+    // ── Deprecated: legacy filter config ──────────────────────────────────────
+    /// (Deprecated: use --route instead) Subnet to intercept and forward (e.g. 192.0.2.160/29)
+    #[arg(long, hide = true)]
     filter_net: Option<String>,
 
-    /// Comma-separated ports to intercept (e.g. 80,443)
-    #[arg(long)]
+    /// (Deprecated: use --route instead) Comma-separated ports to intercept (e.g. 80,443)
+    #[arg(long, hide = true)]
     filter_ports: Option<String>,
 
     // ── Seccomp backend options ──────────────────────────────────────────────
@@ -154,10 +164,13 @@ async fn main() -> Result<()> {
 async fn run_kmod(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()> {
     use ctls::kmod::KmodController;
 
-    let filter = relay::NetFilter::parse(
-        args.filter_net.as_deref(),
-        args.filter_ports.as_deref(),
-    )?;
+    // Build network filter from CLI routes
+    let filter = if !args.route.is_empty() {
+        relay::NetFilter::from_cli(args.route.clone())?
+    } else {
+        // No routes: default to LOCAL (safe default)
+        relay::NetFilter::from_cli(vec![])?
+    };
 
     // Keep the original fd open so kmod sees rsclient_active=1.
     info!("Opening kmod proc at {}", args.proc_path);
@@ -227,10 +240,13 @@ async fn run_seccomp(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()
     let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     let ctl = SeccompController::from_fd(owned);
 
-    let filter = relay::NetFilter::parse(
-        args.filter_net.as_deref(),
-        args.filter_ports.as_deref(),
-    )?;
+    // Build network filter from CLI routes
+    let filter = if !args.route.is_empty() {
+        relay::NetFilter::from_cli(args.route.clone())?
+    } else {
+        // No routes: default to LOCAL (safe default)
+        relay::NetFilter::from_cli(vec![])?
+    };
 
     let cgroup_filter = args.local_cgroup.as_deref().map(|cgroup| {
         relay::CgroupFilter::new(cgroup.to_string(), args.cgroup_gated_nrs.clone())
@@ -250,6 +266,7 @@ async fn run_seccomp(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()
         relay::Relay::new(ctl, r, w)
             .with_filter(filter)
             .with_cgroup_filter(cgroup_filter)
+            .with_socket_proxy(beacon_addr, use_tls, Some(ca_pem))
             .run()
             .await
     } else {
@@ -260,6 +277,7 @@ async fn run_seccomp(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()
         relay::Relay::new(ctl, r, w)
             .with_filter(filter)
             .with_cgroup_filter(cgroup_filter)
+            .with_socket_proxy(beacon_addr, use_tls, None)
             .run()
             .await
     };

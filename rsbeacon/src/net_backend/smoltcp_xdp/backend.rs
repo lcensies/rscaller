@@ -629,8 +629,23 @@ impl SmoltcpXdpBackend {
             .map(|&(_, sz)| sz as usize)
             .unwrap_or(0);
 
+        // `flags` (args[3]) is only a real argument for recvfrom/recvmsg —
+        // read(2)/write(2) (the `want_addr == false` case, `sys_read`) have
+        // no such parameter, so args[3] there is an arbitrary leftover
+        // register value, not a real flags word; checking it in that case
+        // would risk misreading MSG_DONTWAIT out of noise. `MSG_DONTWAIT`
+        // requests non-blocking behavior for *this call only*, regardless
+        // of the fd's own persisted blocking mode (`SocketEntry::nonblock`)
+        // — this is what lets rsclient's `socket_proxy` background task
+        // poll a socket without ever blocking a server-side worker thread
+        // for the full `IO_TIMEOUT`, independent of whatever blocking mode
+        // the tracee itself asked for at `socket()`/later via `fcntl`/
+        // `ioctl` (which, for a proxied real fd, never reaches rsbeacon at
+        // all anymore — see `rsclient::socket_proxy`'s module doc).
+        let want_dontwait = want_addr && (req.args[3] as i32 & libc::MSG_DONTWAIT != 0);
+
         let nonblock = match self.table.with(fd, |e| e.nonblock()) {
-            Some(nb) => nb,
+            Some(nb) => nb || want_dontwait,
             None => return err(req, libc::EBADF),
         };
 
@@ -641,6 +656,20 @@ impl SmoltcpXdpBackend {
                 match entry {
                     SocketEntry::Tcp { handle, .. } => {
                         let sock = state.sockets.get_mut::<tcp::Socket>(*handle);
+                        // Still establishing the connection: `may_recv()`
+                        // returns `false` for these states too, which
+                        // would otherwise be indistinguishable from "peer
+                        // closed" below — not ready yet, not closed. Only
+                        // ever actually reachable when a caller issues a
+                        // read on a socket before its own connect() has
+                        // finished (rsclient's socket-proxy background
+                        // task does exactly this deliberately, racing
+                        // ahead of the tracee's connect() call — see its
+                        // module doc).
+                        if matches!(sock.state(), tcp::State::SynSent | tcp::State::SynReceived | tcp::State::Listen)
+                        {
+                            return None;
+                        }
                         if !sock.may_recv() {
                             return Some((0, Vec::new(), None)); // peer closed: EOF
                         }
@@ -726,8 +755,13 @@ impl SmoltcpXdpBackend {
             req.in_bufs.iter().find(|b| b.arg_idx == idx).and_then(|b| parse_sockaddr_in(&b.data))
         });
 
+        // See the matching comment in `recv_common`: args[3] (`flags`) is
+        // only meaningful for the sendto variant (`dest_arg_idx.is_some()`)
+        // — plain write(2) has no such argument.
+        let want_dontwait = dest_arg_idx.is_some() && (req.args[3] as i32 & libc::MSG_DONTWAIT != 0);
+
         let nonblock = match self.table.with(fd, |e| e.nonblock()) {
-            Some(nb) => nb,
+            Some(nb) => nb || want_dontwait,
             None => return err(req, libc::EBADF),
         };
 
@@ -738,6 +772,12 @@ impl SmoltcpXdpBackend {
                     SocketEntry::Tcp { handle, .. } => {
                         let mut state = self.state.lock().expect("PollState mutex poisoned");
                         let sock = state.sockets.get_mut::<tcp::Socket>(*handle);
+                        // See the matching comment in `recv_common`: still
+                        // connecting is not the same as closed.
+                        if matches!(sock.state(), tcp::State::SynSent | tcp::State::SynReceived | tcp::State::Listen)
+                        {
+                            return Ok(None);
+                        }
                         if !sock.may_send() {
                             return Err(-(libc::EPIPE as i64));
                         }
