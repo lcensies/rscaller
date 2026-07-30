@@ -20,6 +20,10 @@ libc = { workspace = true }
 rustls = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
+log = "0.4"
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "iface-max-addr-count-4", "iface-max-route-count-4", "auto-icmp-echo-reply", "log"] }
+aya = "0.14.0"
 
 [build-dependencies]
 rcgen = "0.13"

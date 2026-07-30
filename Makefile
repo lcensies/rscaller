@@ -89,6 +89,14 @@ VM_SNAPSHOT      ?= baseline
 BEACON_SNAPSHOT  ?= baseline
 # Path where rsbeacon lives on BEACON_VM
 BEACON_BIN_REMOTE ?= /home/ubuntu/rsbeacon
+# rsbeacon --netstack backend (direct|smoltcp-xdp) and its --xdp-* flags,
+# threaded through to `make poc`/`make test-evasion` etc. — see
+# `net_backend/smoltcp_xdp/init.rs` for what each flag does. XDP_IFACE has
+# no sane default (must match the beacon VM's real NIC), so it's left
+# empty unless the caller passes it.
+NETSTACK   ?= direct
+XDP_IFACE  ?=
+XDP_QUEUE  ?= 0
 
 .PHONY: build test integration-tests setup-remote provision \
         deploy deploy-beacon deploy-all \
@@ -195,6 +203,9 @@ demo-teardown:
 #   make poc                                       # proc profile, default cmd
 #   make poc PROFILE=full CMD=hostname             # full profile
 #   make poc PROFILE=none CMD="ip -4 addr"
+#   make poc NETSTACK=smoltcp-xdp XDP_IFACE=enp1s0 # exercise the smoltcp-xdp backend
+#     (NETSTACK/XDP_IFACE/XDP_QUEUE reach poc.sh as env vars — see that
+#     script's own `--netstack`/`--xdp-iface`/`--xdp-queue` flags)
 poc:
 	bash scripts/poc.sh --profile $(or $(PROFILE),proc) $(if $(CMD),--cmd "$(CMD)",)
 
@@ -235,6 +246,7 @@ vm-reset: vm-clean
 #   make test-evasion                # deploy + run
 #   make test-evasion NO_DEPLOY=1    # skip deploy (use existing build)
 #   make test-evasion-clean          # vm-reset + run (fresh state, no stale snapshots)
+#   make test-evasion NETSTACK=smoltcp-xdp XDP_IFACE=enp1s0   # exercise the smoltcp-xdp backend
 test-evasion:
 	cd tests/remote && uv run pytest $(if $(NO_DEPLOY),--no-deploy,) \
 	  --no-header -v -s \
@@ -244,6 +256,9 @@ test-evasion:
 	  --beacon-port=$(BEACON_PORT) \
 	  --beacon-vm-snapshot=$(BEACON_SNAPSHOT) \
 	  --client-vm-snapshot=$(VM_SNAPSHOT) \
+	  --netstack=$(NETSTACK) \
+	  $(if $(XDP_IFACE),--xdp-iface=$(XDP_IFACE),) \
+	  --xdp-queue=$(XDP_QUEUE) \
 	  test_evasion.py
 
 # Full clean run: reset VMs, then run evasion tests without a second deploy.

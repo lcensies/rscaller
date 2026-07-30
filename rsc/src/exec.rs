@@ -3,6 +3,7 @@ use anyhow::{bail, Context, Result};
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
+use std::os::fd::IntoRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -165,7 +166,11 @@ fn run_seccomp(args: ExecArgs) -> Result<()> {
     // SCM_RIGHTS via sendmsg(2) would deadlock: sendmsg is syscall 46 which the
     // ghost/shadow profiles intercept, so the child would block on its own filter
     // before rsclient exists to process the notification.
-    // write(2)/read(2) (syscalls 1/0) are never in any profile's forward list.
+    // write(2)/read(2) (syscalls 1/0) on this pipe are always real, low-numbered
+    // fds (from pipe2() below) — even for a profile that fd-range-gates
+    // read/write (see `ForwardFilter::fd_range`), the BPF filter only
+    // notifies for fds in the beacon-owned virtual range, so this pipe I/O
+    // is guaranteed to fall through to SECCOMP_RET_ALLOW and never block.
     let mut pipe_fds = [0i32; 2];
     let ret = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
     if ret != 0 {
@@ -180,8 +185,9 @@ fn run_seccomp(args: ExecArgs) -> Result<()> {
             unsafe { libc::close(pipe_read) };
             let cmd = &args.cmd[0];
             let cmd_args = &args.cmd[1..];
-            let forward_nrs = mount_profile.forward_nrs();
-            child_seccomp_exec(pipe_write, &forward_nrs, cmd, cmd_args, &mount_profile, &mount_point);
+            let always_nrs = mount_profile.forward_nrs_always();
+            let fd_gated_nrs = mount_profile.forward_nrs_fd_gated();
+            child_seccomp_exec(pipe_write, &always_nrs, &fd_gated_nrs, cmd, cmd_args, &mount_profile, &mount_point);
         }
         child_pid => {
             unsafe { libc::close(pipe_write) };
@@ -338,7 +344,8 @@ fn is_mount_point(path: &str) -> bool {
 /// 4. `execvpe` target binary
 fn child_seccomp_exec(
     pipe_write: libc::c_int,
-    syscall_nrs: &[u32],
+    always_nrs: &[u32],
+    fd_gated_nrs: &[u32],
     cmd: &str,
     cmd_args: &[String],
     mount_profile: &crate::mount_config::MountProfile,
@@ -359,7 +366,7 @@ fn child_seccomp_exec(
         std::process::exit(1);
     }
 
-    let notify_fd = match install_seccomp_filter(syscall_nrs) {
+    let notify_fd = match install_seccomp_filter(always_nrs, fd_gated_nrs) {
         Ok(fd) => fd,
         Err(e) => {
             eprintln!("rsc: seccomp filter install failed: {e}");
@@ -372,7 +379,8 @@ fn child_seccomp_exec(
     // the parent would race against exec and see EBADF.
     unsafe { libc::fcntl(notify_fd, libc::F_SETFD, 0) };
 
-    // Send notify fd NUMBER via write() (syscall 1 — never intercepted).
+    // Send notify fd NUMBER via write() (syscall 1) on `pipe_write`, a real
+    // low-numbered fd — never intercepted, per the fd-range gating note above.
     // The parent steals the fd from our /proc entry via pidfd_getfd.
     let fd_bytes = (notify_fd as u32).to_ne_bytes();
     let ret = unsafe { libc::write(pipe_write, fd_bytes.as_ptr() as _, 4) };
@@ -387,69 +395,29 @@ fn child_seccomp_exec(
 
 /// Install a seccomp BPF filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
 /// Returns the notify fd.
-fn install_seccomp_filter(syscall_nrs: &[u32]) -> Result<libc::c_int> {
-    const BPF_LD: u16 = 0x00;
-    const BPF_W: u16 = 0x00;
-    const BPF_ABS: u16 = 0x20;
-    const BPF_JMP: u16 = 0x05;
-    const BPF_JEQ: u16 = 0x10;
-    const BPF_K: u16 = 0x00;
-    const BPF_RET: u16 = 0x06;
-    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-    const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
-    const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
-    const SYS_SECCOMP: libc::c_long = 317; // x86_64
-
-    let mut insns: Vec<libc::sock_filter> = Vec::new();
-
-    // Load syscall number from seccomp_data.nr (offset 0).
-    insns.push(libc::sock_filter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 0 });
-
-    let n = syscall_nrs.len();
-    for (i, &nr) in syscall_nrs.iter().enumerate() {
-        let jt = (n - i) as u8; // jump to NOTIF past remaining JEQs + ALLOW
-        insns.push(libc::sock_filter { code: BPF_JMP | BPF_JEQ | BPF_K, jt, jf: 0, k: nr });
-    }
-
-    // Default: allow.
-    insns.push(libc::sock_filter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW });
-    // Matched: notify.
-    insns.push(libc::sock_filter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: SECCOMP_RET_USER_NOTIF,
-    });
-
-    let prog = libc::sock_fprog {
-        len: insns.len() as u16,
-        filter: insns.as_mut_ptr(),
-    };
-
-    let fd = unsafe {
-        libc::syscall(
-            SYS_SECCOMP,
-            libc::SECCOMP_SET_MODE_FILTER as libc::c_long,
-            SECCOMP_FILTER_FLAG_NEW_LISTENER as libc::c_long,
-            &prog as *const libc::sock_fprog as libc::c_long,
-        )
-    };
-
-    if fd < 0 {
-        bail!(
-            "seccomp(SECCOMP_SET_MODE_FILTER, NEW_LISTENER): {}",
-            std::io::Error::last_os_error()
-        );
-    }
-
-    Ok(fd as libc::c_int)
+///
+/// `always_nrs` are notified unconditionally; `fd_gated_nrs` are notified
+/// only when the syscall's fd argument (`args[0]`) is in the beacon-owned
+/// virtual fd range — see `ctls::seccomp::build_filter_fd_gated` (this is a
+/// thin wrapper; the actual BPF program construction lives there so
+/// `ctls` — which also implements the userspace side of the same
+/// mechanism, `SeccompController` — stays the single source of truth for
+/// it, instead of two independently-maintained copies).
+fn install_seccomp_filter(always_nrs: &[u32], fd_gated_nrs: &[u32]) -> Result<libc::c_int> {
+    let (_insns, prog) = ctls::seccomp::build_filter_fd_gated(always_nrs, fd_gated_nrs);
+    // SAFETY: `prog` points at `_insns`, which outlives this call.
+    let fd = unsafe { ctls::seccomp::seccomp_install_filter(&prog as *const libc::sock_fprog) }
+        .context("installing seccomp filter")?;
+    Ok(fd.into_raw_fd() as libc::c_int)
 }
 
 /// Read the notify fd number written by the child and steal the fd from the
 /// child's fd table using pidfd_getfd (Linux 5.6+).
 ///
-/// The child writes a raw u32 (notify_fd number) via write(2) — syscall 1,
-/// which is never in any profile's seccomp forward list. We then use
+/// The child writes a raw u32 (notify_fd number) via write(2) — syscall 1 on
+/// `pipe_write`, a real fd well below the virtual fd range, so even a
+/// profile that fd-range-gates write() never intercepts it (see the
+/// fd-range gating note where the pipe is created). We then use
 /// pidfd_getfd to atomically duplicate the fd from the child's fd table into
 /// the parent's, without any sendmsg/recvmsg round-trip.
 fn recv_notify_fd(pipe_read: libc::c_int, child_pid: libc::pid_t) -> Result<libc::c_int> {

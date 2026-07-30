@@ -68,6 +68,20 @@ khook stub), `use_count` leaks and rmmod hangs. The test script enforces:
 `deploy.sh` installs `libfuse3-dev` on dev-vm-1 automatically. rscfuse is now a library
 embedded in `rsc` (invoked as `rsc fuse`); no separate rscfuse binary is deployed.
 
+### Dependency: XDP/eBPF toolchain (`clang`, `libbpf-dev`, `libelf-dev`, `bpftool`)
+Required by the `smoltcp-xdp` rsbeacon network backend (compiling `bpf/*.c` to BPF
+bytecode and loading/inspecting XDP programs). Installed by `scripts/bootstrap.sh`'s
+`PKGS` array — **never `apt-get install` these by hand on a dev VM**; add the package to
+`bootstrap.sh` instead so provisioning stays idempotent and reproducible from a clean VM.
+
+### Never hand-install packages on dev VMs — fix the harness instead
+If a dev VM is missing a system package (build tool, library, etc.), **do not**
+`ssh dev-vm-N "sudo apt-get install ..."` ad hoc. Add the package to
+`scripts/bootstrap.sh`'s `PKGS` array (it already diffs against `dpkg -s` and only
+installs what's missing, so it's safe/idempotent to re-run) and re-run bootstrap. This
+keeps VM state reproducible from a fresh snapshot/clone instead of accumulating
+undocumented manual changes that `vm-reset` would silently wipe out.
+
 ### Normal iteration (code changed, want to test)
 ```
 make test-evasion-clean        # vm-reset → deploy-all → run tests (canonical)

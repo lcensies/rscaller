@@ -34,6 +34,7 @@ forward:
       - socket
       - connect
       - bind
+      - listen
       - accept4
       - sendto
       - recvfrom
@@ -41,3 +42,22 @@ forward:
       - recvmsg
       - getsockopt
       - setsockopt
+  # read/write/close/poll/ppoll are generic — they operate on ordinary
+  # file/pipe/terminal fds far more often than on our beacon-owned socket
+  # fds. fd_range:virtual restricts interception to fds in the virtual
+  # range a NetBackend hands out (see rscaller_proto::types::VIRTUAL_FD_BASE);
+  # everything else runs against the real kernel untouched, at zero added
+  # cost (the check happens in the seccomp BPF filter itself, before any
+  # notification/relay round-trip). See
+  # ctls::seccomp::build_filter_fd_gated / rsc::mount_config::ForwardFilter.
+  - name: socket-fd-ops
+    syscalls:
+      - read
+      - write
+      - close
+      - poll
+      - ppoll
+      - fcntl
+      - ioctl
+    filter:
+      fd_range: virtual

@@ -159,6 +159,12 @@ def pytest_addoption(parser):
                      help="Persistent baseline snapshot name for beacon VM (default: baseline)")
     parser.addoption("--client-vm-snapshot", default="baseline",
                      help="Persistent baseline snapshot name for client VM (default: baseline)")
+    parser.addoption("--netstack",     default="direct",
+                     help="rsbeacon --netstack backend: direct|smoltcp-xdp (default: direct)")
+    parser.addoption("--xdp-iface",    default=None,
+                     help="rsbeacon --xdp-iface (required when --netstack=smoltcp-xdp)")
+    parser.addoption("--xdp-queue",    type=int, default=0,
+                     help="rsbeacon --xdp-queue (default: 0)")
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +320,27 @@ def kmod(pytestconfig, remote, deploy):
 # Beacon — rsbeacon on beacon_host (dev-vm-2)
 # ---------------------------------------------------------------------------
 
+def _netstack_args(pytestconfig) -> str:
+    """Builds the `--netstack`/`--xdp-*` args to append to an rsbeacon
+    command line, from the `--netstack`/`--xdp-iface`/`--xdp-queue`
+    pytest options (see `pytest_addoption`). `smoltcp-xdp` requires
+    `--xdp-iface`; failing fast here with a clear pytest message is
+    cheaper than letting rsbeacon itself reject it after already having
+    been started in the background.
+    """
+    netstack = pytestconfig.getoption("--netstack")
+    if netstack == "direct":
+        return ""
+    xdp_iface = pytestconfig.getoption("--xdp-iface")
+    if not xdp_iface:
+        pytest.fail(
+            f"--netstack={netstack} requires --xdp-iface <interface> "
+            "(e.g. --xdp-iface=enp1s0, matching the beacon VM's real NIC)"
+        )
+    xdp_queue = pytestconfig.getoption("--xdp-queue")
+    return f"--netstack {netstack} --xdp-iface {xdp_iface} --xdp-queue {xdp_queue} "
+
+
 @pytest.fixture(scope="session")
 def rsbeacon_on_beacon(pytestconfig, beacon_host, beacon_port, deploy_beacon):
     """Start rsbeacon on beacon_host, listening on all interfaces."""
@@ -323,6 +350,7 @@ def rsbeacon_on_beacon(pytestconfig, beacon_host, beacon_port, deploy_beacon):
     run_bg(beacon_host,
            f"nohup sudo {BEACON_BIN} "
            f"--listen 0.0.0.0:{beacon_port} "
+           f"{_netstack_args(pytestconfig)}"
            f">/tmp/rsbeacon.log 2>&1")
     time.sleep(1)
     r = run(beacon_host, f"ss -tlnp | grep ':{beacon_port}'")

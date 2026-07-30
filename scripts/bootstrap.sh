@@ -26,15 +26,21 @@ REMOTE_DIR="${2:-/home/ubuntu/rscaller}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KHOOK_URL="https://github.com/lcensies/khook"
 
-step() { echo ""; echo "==> $*"; }
-ok()   { echo "    [ok] $*"; }
-fail() { echo "    [FAIL] $*" >&2; exit 1; }
+step() {
+	echo ""
+	echo "==> $*"
+}
+ok() { echo "    [ok] $*"; }
+fail() {
+	echo "    [FAIL] $*" >&2
+	exit 1
+}
 
 # ---------------------------------------------------------------------------
 # 1. System dependencies
 # ---------------------------------------------------------------------------
 step "Installing system deps on $REMOTE"
-ssh "$REMOTE" 'bash -s' << 'ENDSSH'
+ssh "$REMOTE" 'bash -s' <<'ENDSSH'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
@@ -43,6 +49,12 @@ PKGS=(
   build-essential gcc make git curl
   pkg-config libssl-dev
   "linux-headers-${KERNEL}"
+  # XDP/eBPF toolchain (beacon-smoltcp-xdp-netstack net backend):
+  #   clang/llvm  — compile bpf/*.c to BPF bytecode (clang -target bpf)
+  #   libbpf-dev  — vmlinux.h / bpf_helpers.h and friends for the XDP program
+  #   libelf-dev  — BPF object (ELF) loading support
+  #   bpftool     — inspect/debug loaded XDP programs and maps
+  clang llvm libbpf-dev libelf-dev bpftool
 )
 
 # Check which are missing
@@ -68,7 +80,7 @@ ok "system deps"
 # 2. Rust toolchain
 # ---------------------------------------------------------------------------
 step "Checking Rust on $REMOTE"
-ssh "$REMOTE" 'bash -s' << 'ENDSSH'
+ssh "$REMOTE" 'bash -s' <<'ENDSSH'
 set -euo pipefail
 source "$HOME/.cargo/env" 2>/dev/null || true
 if command -v cargo &>/dev/null; then
@@ -88,26 +100,26 @@ ok "Rust toolchain"
 # ---------------------------------------------------------------------------
 step "Syncing repo to $REMOTE:$REMOTE_DIR"
 rsync -az --delete \
-  --exclude='.git/' \
-  --exclude='target/' \
-  --exclude='kmod/*.ko' \
-  --exclude='kmod/*.o' \
-  --exclude='kmod/*.mod.c' \
-  --exclude='kmod/*.symvers' \
-  --exclude='kmod/modules.order' \
-  --exclude='kmod/.tmp_versions/' \
-  --exclude='vms/' \
-  --exclude='.workmux-prompts/' \
-  --exclude='certs/' \
-  --exclude='lib/khook/' \
-  "$REPO_ROOT/" "$REMOTE:$REMOTE_DIR/"
+	--exclude='.git/' \
+	--exclude='target/' \
+	--exclude='kmod/*.ko' \
+	--exclude='kmod/*.o' \
+	--exclude='kmod/*.mod.c' \
+	--exclude='kmod/*.symvers' \
+	--exclude='kmod/modules.order' \
+	--exclude='kmod/.tmp_versions/' \
+	--exclude='vms/' \
+	--exclude='.workmux-prompts/' \
+	--exclude='certs/' \
+	--exclude='lib/khook/' \
+	"$REPO_ROOT/" "$REMOTE:$REMOTE_DIR/"
 ok "rsync done"
 
 # ---------------------------------------------------------------------------
 # 4. khook submodule
 # ---------------------------------------------------------------------------
 step "Initializing khook submodule on $REMOTE"
-ssh "$REMOTE" "bash -s" << ENDSSH
+ssh "$REMOTE" "bash -s" <<ENDSSH
 set -euo pipefail
 KHOOK_DIR="$REMOTE_DIR/lib/khook"
 if [ ! -f "\$KHOOK_DIR/Makefile.khook" ]; then
@@ -126,7 +138,7 @@ ok "khook"
 # 5. Generate kmod C headers
 # ---------------------------------------------------------------------------
 step "Generating kmod C headers (tools/codegen)"
-ssh "$REMOTE" "bash -s" << ENDSSH
+ssh "$REMOTE" "bash -s" <<ENDSSH
 set -euo pipefail
 source "\$HOME/.cargo/env" 2>/dev/null || true
 cd "$REMOTE_DIR"
@@ -142,7 +154,7 @@ ok "kmod headers"
 # 6. Build kernel module
 # ---------------------------------------------------------------------------
 step "Building kernel module on $REMOTE"
-ssh "$REMOTE" "bash -s" << ENDSSH
+ssh "$REMOTE" "bash -s" <<ENDSSH
 set -euo pipefail
 cd "$REMOTE_DIR/kmod"
 make clean 2>/dev/null || true
@@ -155,7 +167,7 @@ ok "kmod/rscaller.ko built"
 # 7. Build Rust workspace
 # ---------------------------------------------------------------------------
 step "Building Rust workspace on $REMOTE"
-ssh "$REMOTE" "bash -s" << ENDSSH
+ssh "$REMOTE" "bash -s" <<ENDSSH
 set -euo pipefail
 source "\$HOME/.cargo/env" 2>/dev/null || true
 cd "$REMOTE_DIR"

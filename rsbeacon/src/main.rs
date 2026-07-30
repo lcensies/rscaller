@@ -1,10 +1,17 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::str::FromStr;
+use std::sync::Arc;
 use rustls;
 
 mod executor;
+mod net_backend;
 mod server;
+
+use net_backend::direct::DirectBackend;
+use net_backend::smoltcp_xdp::init::{self as xdp_init, XdpConfig};
+use net_backend::NetBackend;
 
 // Certs embedded at compile time by build.rs
 const EMBEDDED_CERT_PEM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cert.pem"));
@@ -37,6 +44,102 @@ struct Args {
 
     #[arg(long, default_value = "10")]
     max_connections: usize,
+
+    /// Network syscall execution backend: `direct` (today's kernel-stack
+    /// passthrough) or `smoltcp-xdp` (userspace TCP/IP stack over AF_XDP).
+    #[arg(long, default_value = "direct")]
+    netstack: String,
+
+    /// Interface to attach the XDP program / bind the AF_XDP socket to.
+    /// Required when `--netstack smoltcp-xdp` is selected; ignored otherwise.
+    #[arg(long)]
+    xdp_iface: Option<String>,
+
+    /// AF_XDP queue index to bind (`--netstack smoltcp-xdp` only).
+    #[arg(long, default_value_t = 0)]
+    xdp_queue: u32,
+
+    /// AF_XDP ring mode: only `copy` is implemented in v1 (see design
+    /// Non-Goals); `zerocopy` is accepted as a value so the error message
+    /// is actionable, but always rejected.
+    #[arg(long, default_value = "copy")]
+    xdp_mode: String,
+
+    /// Override auto-detected local IPv4 address for `--xdp-iface`
+    /// (`--netstack smoltcp-xdp` only). Auto-detected via `SIOCGIFADDR`
+    /// when omitted.
+    #[arg(long)]
+    xdp_ip: Option<String>,
+
+    /// Override auto-detected IPv4 CIDR prefix length for `--xdp-ip`/
+    /// `--xdp-iface` (`--netstack smoltcp-xdp` only). Auto-detected via
+    /// `SIOCGIFNETMASK` when omitted.
+    #[arg(long)]
+    xdp_prefix: Option<u8>,
+
+    /// Override auto-detected default-gateway IPv4 address
+    /// (`--netstack smoltcp-xdp` only). Auto-detected from
+    /// `/proc/net/route` when omitted; if auto-detection also fails, the
+    /// backend starts without a default route (only on-link traffic for
+    /// `--xdp-ip`'s subnet will be reachable).
+    #[arg(long)]
+    xdp_gateway: Option<String>,
+}
+
+/// Builds and initializes the selected [`NetBackend`]. Fails fast with an
+/// actionable error if the selected backend can't be constructed — callers
+/// must treat this as fatal (non-zero exit) before accepting any client
+/// connections, so a broken `--netstack` selection never silently falls
+/// back to a different backend than the operator asked for.
+fn init_backend(args: &Args) -> Result<Arc<dyn NetBackend>> {
+    match args.netstack.as_str() {
+        "direct" => Ok(Arc::new(DirectBackend::new())),
+        "smoltcp-xdp" => init_smoltcp_xdp_backend(args),
+        other => anyhow::bail!(
+            "Unknown --netstack '{}': expected 'direct' or 'smoltcp-xdp'",
+            other
+        ),
+    }
+}
+
+/// Validates the `--xdp-*` CLI flags and hands off to
+/// `net_backend::smoltcp_xdp::init` (task 6.4) for the actual backend
+/// construction (XDP program load/attach, AF_XDP bind, `smoltcp`
+/// `Interface`/poll-loop wiring) — kept out of `main.rs`, which only
+/// needs to turn flags into an [`XdpConfig`].
+fn init_smoltcp_xdp_backend(args: &Args) -> Result<Arc<dyn NetBackend>> {
+    let iface = args.xdp_iface.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("--netstack smoltcp-xdp requires --xdp-iface <interface>")
+    })?;
+
+    if args.xdp_mode != "copy" {
+        anyhow::bail!(
+            "--xdp-mode '{}' is not supported: v1 only implements AF_XDP copy mode \
+             (see design.md Non-Goals re: zero-copy); use --xdp-mode copy or omit the flag",
+            args.xdp_mode
+        );
+    }
+
+    let ip = args
+        .xdp_ip
+        .as_deref()
+        .map(Ipv4Addr::from_str)
+        .transpose()
+        .with_context(|| format!("--xdp-ip '{}' is not a valid IPv4 address", args.xdp_ip.as_deref().unwrap_or("")))?;
+    let gateway = args
+        .xdp_gateway
+        .as_deref()
+        .map(Ipv4Addr::from_str)
+        .transpose()
+        .with_context(|| format!("--xdp-gateway '{}' is not a valid IPv4 address", args.xdp_gateway.as_deref().unwrap_or("")))?;
+
+    xdp_init::init(XdpConfig {
+        iface: iface.to_string(),
+        queue: args.xdp_queue,
+        ip,
+        prefix: args.xdp_prefix,
+        gateway,
+    })
 }
 
 #[tokio::main]
@@ -82,13 +185,18 @@ async fn main() -> Result<()> {
 
     let use_tls = args.encryption == "tls";
 
+    // Fail fast, before binding any listener or accepting connections, if
+    // the selected backend can't be initialized.
+    let backend = init_backend(&args)?;
+    tracing::info!("Network backend: {}", backend.name());
+
     match args.transport.as_str() {
         "tcp" => {
             let addr: SocketAddr = args.listen.parse()?;
             if use_tls {
-                server::run_tls(addr, cert_pem, key_pem).await
+                server::run_tls(addr, cert_pem, key_pem, backend).await
             } else {
-                server::run_plain(addr).await
+                server::run_plain(addr, backend).await
             }
         }
         "uds" => {
@@ -96,7 +204,7 @@ async fn main() -> Result<()> {
                 .uds_path
                 .as_deref()
                 .unwrap_or("/tmp/rsbeacon.sock");
-            server::run_uds(path, use_tls, cert_pem, key_pem).await
+            server::run_uds(path, use_tls, cert_pem, key_pem, backend).await
         }
         other => anyhow::bail!("Unknown transport: {}", other),
     }

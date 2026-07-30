@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use libc::{c_long, syscall, SYS_seccomp};
 use tracing::debug;
 
-use crate::meta::{build_table, resolve_size, Dir};
+use crate::meta::{build_table, read_tracee_mem, resolve_size, write_tracee_mem, Dir};
 use crate::notification::InBuf;
 use crate::{Notification, SyscallController};
 
@@ -142,71 +142,144 @@ pub unsafe fn seccomp_install_filter(prog: *const libc::sock_fprog) -> Result<Ow
     Ok(OwnedFd::from_raw_fd(fd as RawFd))
 }
 
-/// Build a minimal BPF filter that traps the given syscall numbers with
-/// `SECCOMP_RET_USER_NOTIF` and allows all others.
+// BPF constants shared by both filter builders below.
+const BPF_LD: u16 = 0x00;
+const BPF_W: u16 = 0x00;
+const BPF_ABS: u16 = 0x20;
+const BPF_JMP: u16 = 0x05;
+const BPF_JEQ: u16 = 0x10;
+const BPF_JGT: u16 = 0x20;
+const BPF_JGE: u16 = 0x30;
+const BPF_K: u16 = 0x00;
+const BPF_RET: u16 = 0x06;
+
+const SECCOMP_RET_ALLOW: u32 = 0x7fff0000;
+const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc00000;
+
+// offsetof(struct seccomp_data, nr) == 0
+const OFFSET_NR: u32 = 0;
+
+/// offsetof(struct seccomp_data, args[i]) == 16 + 8*i. Each `args[i]` is a
+/// 64-bit value but classic BPF can only load 32-bit words, so a full
+/// comparison needs both halves. x86-64 is little-endian: the low 32 bits
+/// live at the base offset, the high 32 bits 4 bytes further in.
+fn offset_arg_lo(i: u8) -> u32 {
+    16 + 8 * i as u32
+}
+fn offset_arg_hi(i: u8) -> u32 {
+    offset_arg_lo(i) + 4
+}
+
+fn ld_abs(offset: u32) -> libc::sock_filter {
+    libc::sock_filter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: offset }
+}
+fn jeq(k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter { code: BPF_JMP | BPF_JEQ | BPF_K, jt, jf, k }
+}
+fn jgt(k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter { code: BPF_JMP | BPF_JGT | BPF_K, jt, jf, k }
+}
+fn jge(k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter { code: BPF_JMP | BPF_JGE | BPF_K, jt, jf, k }
+}
+fn ret(k: u32) -> libc::sock_filter {
+    libc::sock_filter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k }
+}
+
+/// Build a BPF filter with `SECCOMP_RET_USER_NOTIF` for the given syscall
+/// numbers, allowing all others (equivalent to the pre-fd-gating filter —
+/// kept for callers/tests that don't need the fd-range distinction).
+pub fn build_filter(syscall_nrs: &[u32]) -> (Vec<libc::sock_filter>, libc::sock_fprog) {
+    build_filter_fd_gated(syscall_nrs, &[])
+}
+
+/// Build a BPF filter with two categories of intercepted syscalls:
+///
+/// - `always_nrs`: `SECCOMP_RET_USER_NOTIF` unconditionally (e.g. `socket`,
+///   `connect`, `bind` — there's no meaningful "real fd" for these to fall
+///   back to).
+/// - `fd_gated_nrs`: `SECCOMP_RET_USER_NOTIF` only if `args[0]` (the fd
+///   argument — true for `read`/`write`/`close`/`poll`/`ppoll`, the only
+///   syscalls this is meant for) is `>= VIRTUAL_FD_BASE`
+///   (`rscaller_proto::types::VIRTUAL_FD_BASE`); otherwise `SECCOMP_RET_ALLOW`
+///   (runs against the tracee's real kernel, untouched). This is what lets
+///   a profile intercept `read`/`write`/`close` on rsbeacon-backend-owned
+///   virtual fds *without* round-tripping every ordinary file/pipe/real-
+///   socket read or write through rsbeacon too.
+///
+/// Any syscall number present in both lists is treated as fd-gated (the
+/// `always_nrs` JEQ for it would be unreachable dead code, so callers
+/// should not do this, but it's not unsound — just wasteful).
 ///
 /// Returns `(instructions, sock_fprog)` — keep `instructions` alive as long
 /// as the `sock_fprog` is used.
-pub fn build_filter(syscall_nrs: &[u32]) -> (Vec<libc::sock_filter>, libc::sock_fprog) {
-    // BPF constants
-    const BPF_LD: u16 = 0x00;
-    const BPF_W: u16 = 0x00;
-    const BPF_ABS: u16 = 0x20;
-    const BPF_JMP: u16 = 0x05;
-    const BPF_JEQ: u16 = 0x10;
-    const BPF_K: u16 = 0x00;
-    const BPF_RET: u16 = 0x06;
+pub fn build_filter_fd_gated(
+    always_nrs: &[u32],
+    fd_gated_nrs: &[u32],
+) -> (Vec<libc::sock_filter>, libc::sock_fprog) {
+    let threshold = rscaller_proto::types::VIRTUAL_FD_BASE as u64;
+    let threshold_lo = (threshold & 0xffff_ffff) as u32;
+    debug_assert_eq!(
+        threshold >> 32,
+        0,
+        "VIRTUAL_FD_BASE must fit in 32 bits for this filter's high-word fast path"
+    );
 
-    const SECCOMP_RET_ALLOW: u32 = 0x7fff0000;
-    const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc00000;
-
-    // offsetof(seccomp_data, nr) == 0
-    const OFFSET_NR: u32 = 0;
-
-    let mut insns: Vec<libc::sock_filter> = Vec::new();
-
-    // Load syscall nr into accumulator.
-    insns.push(libc::sock_filter {
-        code: BPF_LD | BPF_W | BPF_ABS,
-        jt: 0,
-        jf: 0,
-        k: OFFSET_NR,
-    });
-
-    // For each intercepted syscall: JEQ nr → USER_NOTIF (jump to ret_notif)
-    // The jump offset calculation: after we push all JEQ instructions and the
-    // RET_ALLOW, we'll jump to RET_USER_NOTIF.  We arrange it as:
-    //   [load] [jeq_0] [jeq_1] ... [jeq_N] [ret_allow] [ret_notif]
+    // Program layout (all jumps forward-only, as required by classic BPF):
     //
-    // jeq_i: if equal, jump forward (N - i) instructions to ret_notif
-    //        else fall through to next jeq.
-    let n = syscall_nrs.len();
-    for (i, &nr) in syscall_nrs.iter().enumerate() {
-        // jt = jump if equal; jf = 0 (fall through)
-        let jt = (n - i) as u8; // skip remaining jeqs + ret_allow
-        insns.push(libc::sock_filter {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt,
-            jf: 0,
-            k: nr,
-        });
+    //   0:                LD nr
+    //   1..=A:            JEQ always_nrs[i] -> NOTIF                  (fall through)
+    //   A+1..=A+F:        JEQ fd_gated_nrs[i] -> FDCHECK               (fall through)
+    //   A+F+1:            RET ALLOW                        [ALLOW1]
+    //   A+F+2:            LD args[0] hi                    [FDCHECK]
+    //   A+F+3:            JGT 0 -> NOTIF                              (fall through)
+    //   A+F+4:            LD args[0] lo
+    //   A+F+5:            JGE threshold_lo -> NOTIF                   (fall through)
+    //   A+F+6:            RET ALLOW                        [ALLOW2]
+    //   A+F+7:            RET NOTIF                        [NOTIF]
+    let a = always_nrs.len();
+    let f = fd_gated_nrs.len();
+    // Instruction index (0-based) of the shared FDCHECK block's first
+    // instruction and of the final RET NOTIF — computed once, up front, so
+    // every JEQ/JGT/JGE below can compute its own forward-relative jt.
+    let idx_fdcheck = 1 + a + f + 1; // skip LD, all JEQs, and ALLOW1
+    let idx_notif = idx_fdcheck + 5; // FDCHECK block is 5 instructions long
+
+    let mut insns: Vec<libc::sock_filter> = Vec::with_capacity(idx_notif + 1);
+
+    insns.push(ld_abs(OFFSET_NR)); // 0
+
+    for &nr in always_nrs {
+        let here = insns.len();
+        let jt = (idx_notif - (here + 1)) as u8;
+        insns.push(jeq(nr, jt, 0));
+    }
+    for &nr in fd_gated_nrs {
+        let here = insns.len();
+        let jt = (idx_fdcheck - (here + 1)) as u8;
+        insns.push(jeq(nr, jt, 0));
     }
 
-    // Default: allow.
-    insns.push(libc::sock_filter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: SECCOMP_RET_ALLOW,
-    });
+    debug_assert_eq!(insns.len(), 1 + a + f);
+    insns.push(ret(SECCOMP_RET_ALLOW)); // ALLOW1, idx = 1+a+f
 
-    // Target for matched syscalls.
-    insns.push(libc::sock_filter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: SECCOMP_RET_USER_NOTIF,
-    });
+    debug_assert_eq!(insns.len(), idx_fdcheck);
+    insns.push(ld_abs(offset_arg_hi(0)));
+    {
+        let here = insns.len();
+        let jt = (idx_notif - (here + 1)) as u8;
+        insns.push(jgt(0, jt, 0));
+    }
+    insns.push(ld_abs(offset_arg_lo(0)));
+    {
+        let here = insns.len();
+        let jt = (idx_notif - (here + 1)) as u8;
+        insns.push(jge(threshold_lo, jt, 0));
+    }
+    insns.push(ret(SECCOMP_RET_ALLOW)); // ALLOW2
+
+    debug_assert_eq!(insns.len(), idx_notif);
+    insns.push(ret(SECCOMP_RET_USER_NOTIF)); // NOTIF
 
     let prog = libc::sock_fprog {
         len: insns.len() as u16,
@@ -245,7 +318,7 @@ fn fill_from_meta(nr: u64, args: &[u64; 6], pid: u32) -> (Vec<InBuf>, Vec<(u8, u
         if ptr == 0 {
             continue;
         }
-        let size = resolve_size(param, args);
+        let size = resolve_size(param, args, pid);
         if size == 0 {
             continue;
         }
@@ -270,58 +343,10 @@ fn fill_from_meta(nr: u64, args: &[u64; 6], pid: u32) -> (Vec<InBuf>, Vec<(u8, u
     (in_data, out_sizes)
 }
 
-/// Write `data` into `pid`'s virtual address `addr` using `process_vm_writev`.
-/// Silently ignores failures (process may have exited).
-fn write_tracee_mem(pid: u32, addr: u64, data: &[u8]) {
-    let local = libc::iovec {
-        iov_base: data.as_ptr() as *mut libc::c_void,
-        iov_len: data.len(),
-    };
-    let remote = libc::iovec {
-        iov_base: addr as *mut libc::c_void,
-        iov_len: data.len(),
-    };
-    unsafe {
-        libc::process_vm_writev(
-            pid as libc::pid_t,
-            &local as *const libc::iovec,
-            1,
-            &remote as *const libc::iovec,
-            1,
-            0,
-        );
-    }
-}
-
-/// Read `len` bytes from `pid`'s virtual address `addr` using `process_vm_readv`.
-/// Returns `None` on failure (e.g. process exited, bad pointer).
-fn read_tracee_mem(pid: u32, addr: u64, len: usize) -> Option<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    let local = libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-        iov_len: len,
-    };
-    let remote = libc::iovec {
-        iov_base: addr as *mut libc::c_void,
-        iov_len: len,
-    };
-    let ret = unsafe {
-        libc::process_vm_readv(
-            pid as libc::pid_t,
-            &local as *const libc::iovec,
-            1,
-            &remote as *const libc::iovec,
-            1,
-            0,
-        )
-    };
-    if ret < 0 {
-        None
-    } else {
-        buf.truncate(ret as usize);
-        Some(buf)
-    }
-}
+// `read_tracee_mem`/`write_tracee_mem` now live in `meta.rs` (imported
+// above) — `resolve_size`'s `Size::FromPtrU32` variant needs the same
+// `process_vm_readv` capability, so both live next to the metadata table
+// that drives them.
 
 // ---------------------------------------------------------------------------
 // Controller
@@ -494,5 +519,153 @@ impl SyscallController for SeccompController {
             bail!("continue_syscall SECCOMP_IOCTL_NOTIF_SEND id={}: {}", id, err);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    /// Minimal classic BPF interpreter for exactly the instruction subset
+    /// `build_filter_fd_gated` emits (`LD_ABS W`, `JEQ`/`JGT`/`JGE K`,
+    /// `RET K`), run against a `SeccompData`-shaped byte buffer. Lets us
+    /// validate the generated jump math without an actual `seccomp(2)`
+    /// syscall (which needs a real kernel + no_new_privs/CAP_SYS_ADMIN).
+    fn run_filter(insns: &[libc::sock_filter], data: &SeccompData) -> u32 {
+        let bytes = data_to_bytes(data);
+        let mut pc = 0usize;
+        let mut acc: u32 = 0;
+        loop {
+            let ins = insns[pc];
+            let class = ins.code & 0x07;
+            match class {
+                0x00 => {
+                    // LD | W | ABS — the only load form we ever generate.
+                    let off = ins.k as usize;
+                    acc = u32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap());
+                    pc += 1;
+                }
+                0x05 => {
+                    let op = ins.code & 0xf0;
+                    let taken = match op {
+                        0x10 => acc == ins.k,
+                        0x20 => acc > ins.k,
+                        0x30 => acc >= ins.k,
+                        _ => panic!("unsupported jmp op in test interpreter: {op:#x}"),
+                    };
+                    pc = if taken {
+                        pc + 1 + ins.jt as usize
+                    } else {
+                        pc + 1 + ins.jf as usize
+                    };
+                }
+                0x06 => return ins.k,
+                _ => panic!("unsupported bpf class in test interpreter: {class:#x}"),
+            }
+        }
+    }
+
+    fn data_to_bytes(d: &SeccompData) -> [u8; 64] {
+        let mut buf = [0u8; 64];
+        buf[0..4].copy_from_slice(&d.nr.to_ne_bytes());
+        buf[4..8].copy_from_slice(&d.arch.to_ne_bytes());
+        buf[8..16].copy_from_slice(&d.instruction_pointer.to_ne_bytes());
+        for i in 0..6 {
+            buf[16 + 8 * i..16 + 8 * i + 8].copy_from_slice(&d.args[i].to_ne_bytes());
+        }
+        buf
+    }
+
+    fn data_for(nr: i32, args: [u64; 6]) -> SeccompData {
+        SeccompData { nr, arch: 0, instruction_pointer: 0, args }
+    }
+
+    #[test]
+    fn always_list_notifies_regardless_of_fd() {
+        let (insns, _prog) = build_filter_fd_gated(&[41, 42], &[0, 1, 3]);
+        let d = data_for(41, [0; 6]);
+        assert_eq!(run_filter(&insns, &d), SECCOMP_RET_USER_NOTIF);
+    }
+
+    #[test]
+    fn fd_gated_low_fd_is_allowed() {
+        let (insns, _prog) = build_filter_fd_gated(&[41], &[0, 1, 3]);
+        let mut args = [0u64; 6];
+        args[0] = 3; // an ordinary low fd
+        let d = data_for(1 /* write */, args);
+        assert_eq!(run_filter(&insns, &d), SECCOMP_RET_ALLOW);
+    }
+
+    #[test]
+    fn fd_gated_high_fd_notifies() {
+        let (insns, _prog) = build_filter_fd_gated(&[41], &[0, 1, 3]);
+        let mut args = [0u64; 6];
+        args[0] = rscaller_proto::types::VIRTUAL_FD_BASE as u64 + 5;
+        let d = data_for(1, args);
+        assert_eq!(run_filter(&insns, &d), SECCOMP_RET_USER_NOTIF);
+    }
+
+    #[test]
+    fn fd_gated_exact_threshold_notifies() {
+        let (insns, _prog) = build_filter_fd_gated(&[], &[0]);
+        let mut args = [0u64; 6];
+        args[0] = rscaller_proto::types::VIRTUAL_FD_BASE as u64;
+        let d = data_for(0, args);
+        assert_eq!(run_filter(&insns, &d), SECCOMP_RET_USER_NOTIF);
+    }
+
+    #[test]
+    fn fd_gated_just_below_threshold_is_allowed() {
+        let (insns, _prog) = build_filter_fd_gated(&[], &[0]);
+        let mut args = [0u64; 6];
+        args[0] = rscaller_proto::types::VIRTUAL_FD_BASE as u64 - 1;
+        let d = data_for(0, args);
+        assert_eq!(run_filter(&insns, &d), SECCOMP_RET_ALLOW);
+    }
+
+    #[test]
+    fn fd_gated_high_word_nonzero_notifies() {
+        // Value far beyond 32 bits must still trigger the high-word check.
+        let (insns, _prog) = build_filter_fd_gated(&[], &[0]);
+        let mut args = [0u64; 6];
+        args[0] = 1u64 << 40;
+        let d = data_for(0, args);
+        assert_eq!(run_filter(&insns, &d), SECCOMP_RET_USER_NOTIF);
+    }
+
+    #[test]
+    fn unrelated_syscall_is_allowed() {
+        let (insns, _prog) = build_filter_fd_gated(&[41, 42], &[0, 1, 3]);
+        let d = data_for(2 /* open, in neither list */, [0; 6]);
+        assert_eq!(run_filter(&insns, &d), SECCOMP_RET_ALLOW);
+    }
+
+    #[test]
+    fn every_always_and_fd_gated_syscall_individually() {
+        let always = [41u32, 42, 44, 45, 49, 50, 54, 55, 288];
+        let fd_gated = [0u32, 1, 3, 7, 271];
+        let (insns, _prog) = build_filter_fd_gated(&always, &fd_gated);
+        for &nr in &always {
+            let d = data_for(nr as i32, [0; 6]);
+            assert_eq!(run_filter(&insns, &d), SECCOMP_RET_USER_NOTIF, "nr={nr}");
+        }
+        for &nr in &fd_gated {
+            let mut args = [0u64; 6];
+            args[0] = rscaller_proto::types::VIRTUAL_FD_BASE as u64 + 1;
+            let d = data_for(nr as i32, args);
+            assert_eq!(run_filter(&insns, &d), SECCOMP_RET_USER_NOTIF, "nr={nr} (high fd)");
+            args[0] = 5;
+            let d = data_for(nr as i32, args);
+            assert_eq!(run_filter(&insns, &d), SECCOMP_RET_ALLOW, "nr={nr} (low fd)");
+        }
+    }
+
+    #[test]
+    fn plain_build_filter_still_notifies_unconditionally() {
+        let (insns, _prog) = build_filter(&[59]);
+        let d = data_for(59, [0; 6]);
+        assert_eq!(run_filter(&insns, &d), SECCOMP_RET_USER_NOTIF);
+        let d2 = data_for(60, [0; 6]);
+        assert_eq!(run_filter(&insns, &d2), SECCOMP_RET_ALLOW);
     }
 }

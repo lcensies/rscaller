@@ -36,9 +36,25 @@ impl MountProfile {
         })
     }
 
-    /// All syscall numbers that need a seccomp BPF entry (across all rules).
-    pub fn forward_nrs(&self) -> Vec<u32> {
+    /// Syscall numbers to intercept unconditionally — every rule without a
+    /// `filter: {fd_range: ...}` (across all rules).
+    pub fn forward_nrs_always(&self) -> Vec<u32> {
         let mut nrs: Vec<u32> = self.forward.iter()
+            .filter(|r| !r.has_fd_range_filter())
+            .flat_map(|r| r.syscall_nrs())
+            .collect();
+        nrs.sort_unstable();
+        nrs.dedup();
+        nrs
+    }
+
+    /// Syscall numbers to intercept only when their fd argument is in the
+    /// beacon-owned virtual fd range — every rule with
+    /// `filter: {fd_range: virtual}` (across all rules). See
+    /// [`ForwardFilter::fd_range`] and `ctls::seccomp::build_filter_fd_gated`.
+    pub fn forward_nrs_fd_gated(&self) -> Vec<u32> {
+        let mut nrs: Vec<u32> = self.forward.iter()
+            .filter(|r| r.has_fd_range_filter())
             .flat_map(|r| r.syscall_nrs())
             .collect();
         nrs.sort_unstable();
@@ -96,6 +112,13 @@ impl ForwardRule {
             Some(CgroupScope::Local)
         )
     }
+
+    pub fn has_fd_range_filter(&self) -> bool {
+        matches!(
+            self.filter.as_ref().and_then(|f| f.fd_range.as_ref()),
+            Some(FdRangeScope::Virtual)
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +132,20 @@ pub struct ForwardFilter {
     /// inside the session's local cgroup, continue the syscall locally instead
     /// of forwarding it to beacon. Keeps shell job control intact for
     /// locally-spawned processes while still forwarding signals to beacon PIDs.
+    #[serde(default)]
     pub cgroup: Option<CgroupScope>,
+    /// Fd-range gating, for syscalls that operate on *any* fd (`read`,
+    /// `write`, `close`, `poll`, `ppoll`) rather than being inherently
+    /// network-specific. `virtual` means: only forward when the syscall's
+    /// fd argument is one previously handed back by a beacon `NetBackend`
+    /// (see `rscaller_proto::types::VIRTUAL_FD_BASE`) — an ordinary local
+    /// fd (file, pipe, real socket) is left completely untouched, running
+    /// against the tracee's own kernel exactly as if this profile didn't
+    /// exist. This check happens in the seccomp BPF filter itself (see
+    /// `ctls::seccomp::build_filter_fd_gated`), before any syscall ever
+    /// reaches rsclient/rsbeacon.
+    #[serde(default)]
+    pub fd_range: Option<FdRangeScope>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -117,6 +153,14 @@ pub struct ForwardFilter {
 pub enum CgroupScope {
     /// Exclude PIDs that are members of the per-session local cgroup.
     Local,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum FdRangeScope {
+    /// Only forward if the fd argument is in the beacon-owned virtual fd
+    /// range.
+    Virtual,
 }
 
 // Generated from files/syscall_nrs by build.rs.
@@ -332,4 +376,66 @@ fn apply_bind(entry: &MountEntry, fuse_root: &str) -> Result<()> {
 
     eprintln!("rsc: bind-mounted {:?} → {:?}", source_path, entry.local);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shadow_profile_parses_and_lists_listen() {
+        let profile = builtin_preset("shadow").expect("shadow profile should exist");
+        let always = profile.forward_nrs_always();
+        // listen (50) must be present now — previously missing entirely.
+        assert!(always.contains(&50), "listen missing from shadow's always list: {always:?}");
+        // The rest of the always-network syscalls are still there too.
+        for nr in [41u32, 42, 44, 45, 49, 54, 55, 288, 46, 47] {
+            assert!(always.contains(&nr), "nr={nr} missing from shadow always list: {always:?}");
+        }
+    }
+
+    #[test]
+    fn shadow_profile_fd_gates_generic_fd_syscalls() {
+        let profile = builtin_preset("shadow").expect("shadow profile should exist");
+        let fd_gated = profile.forward_nrs_fd_gated();
+        let always = profile.forward_nrs_always();
+        for nr in [0u32, 1, 3, 7, 271, 72] {
+            assert!(fd_gated.contains(&nr), "nr={nr} missing from shadow fd-gated list: {fd_gated:?}");
+            assert!(!always.contains(&nr), "nr={nr} should not also be in the always list");
+        }
+    }
+
+    #[test]
+    fn ghost_profile_cgroup_filter_still_parses() {
+        // Regression check: adding `fd_range` (with #[serde(default)]) to
+        // ForwardFilter must not break profiles that only ever set `cgroup`.
+        let profile = builtin_preset("ghost").expect("ghost profile should exist");
+        assert!(profile.needs_local_cgroup());
+        let gated = profile.cgroup_gated_nrs();
+        assert!(!gated.is_empty());
+        // ghost has no fd_range-filtered rules.
+        assert!(profile.forward_nrs_fd_gated().is_empty());
+    }
+
+    #[test]
+    fn forward_filter_with_only_fd_range_parses_without_cgroup_key() {
+        let yaml = r#"
+name: test
+forward:
+  - name: x
+    syscalls: [read, write]
+    filter:
+      fd_range: virtual
+"#;
+        let profile: MountProfile = serde_yaml::from_str(yaml).expect("should parse");
+        assert!(profile.forward[0].has_fd_range_filter());
+        assert!(!profile.forward[0].has_cgroup_filter());
+    }
+
+    #[test]
+    fn builtin_names_include_both_profiles() {
+        let names = builtin_names();
+        assert!(names.contains(&"ghost"));
+        assert!(names.contains(&"shadow"));
+    }
 }

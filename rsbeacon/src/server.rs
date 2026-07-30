@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -8,8 +9,9 @@ use rscaller_proto::codec::{read_message, write_message};
 use rscaller_proto::types::SyscallRequest;
 
 use crate::executor::execute_syscall;
+use crate::net_backend::NetBackend;
 
-pub async fn run_plain(addr: SocketAddr) -> Result<()> {
+pub async fn run_plain(addr: SocketAddr, backend: Arc<dyn NetBackend>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("rsbeacon listening (plain TCP) on {}", addr);
 
@@ -17,16 +19,22 @@ pub async fn run_plain(addr: SocketAddr) -> Result<()> {
         let (stream, peer) = listener.accept().await?;
         info!("Connection from {}", peer);
         let _ = stream.set_nodelay(true);
+        let backend = backend.clone();
         tokio::spawn(async move {
             let (mut reader, mut writer) = tokio::io::split(stream);
-            if let Err(e) = handle_connection(&mut reader, &mut writer).await {
+            if let Err(e) = handle_connection(&mut reader, &mut writer, &*backend).await {
                 warn!("Connection error from {}: {}", peer, e);
             }
         });
     }
 }
 
-pub async fn run_tls(addr: SocketAddr, cert_pem: Vec<u8>, key_pem: Vec<u8>) -> Result<()> {
+pub async fn run_tls(
+    addr: SocketAddr,
+    cert_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+    backend: Arc<dyn NetBackend>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("rsbeacon listening (TLS) on {}", addr);
 
@@ -35,12 +43,13 @@ pub async fn run_tls(addr: SocketAddr, cert_pem: Vec<u8>, key_pem: Vec<u8>) -> R
         info!("TLS connection from {}", peer);
         let cert_pem = cert_pem.clone();
         let key_pem = key_pem.clone();
+        let backend = backend.clone();
         tokio::spawn(async move {
             match rscaller_proto::transport::tls::accept_tls(tcp_stream, &cert_pem, &key_pem).await
             {
                 Ok(tls_stream) => {
                     let (mut reader, mut writer) = tokio::io::split(tls_stream);
-                    if let Err(e) = handle_connection(&mut reader, &mut writer).await {
+                    if let Err(e) = handle_connection(&mut reader, &mut writer, &*backend).await {
                         warn!("TLS connection error from {}: {}", peer, e);
                     }
                 }
@@ -55,6 +64,7 @@ pub async fn run_uds(
     _use_tls: bool, // UDS+TLS is unusual; always run plain for UDS
     _cert_pem: Vec<u8>,
     _key_pem: Vec<u8>,
+    backend: Arc<dyn NetBackend>,
 ) -> Result<()> {
     use tokio::net::UnixListener;
 
@@ -64,16 +74,17 @@ pub async fn run_uds(
 
     loop {
         let (stream, _) = listener.accept().await?;
+        let backend = backend.clone();
         tokio::spawn(async move {
             let (mut r, mut w) = tokio::io::split(stream);
-            if let Err(e) = handle_connection(&mut r, &mut w).await {
+            if let Err(e) = handle_connection(&mut r, &mut w, &*backend).await {
                 warn!("UDS connection error: {}", e);
             }
         });
     }
 }
 
-async fn handle_connection<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+async fn handle_connection<R, W>(reader: &mut R, writer: &mut W, backend: &dyn NetBackend) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -91,7 +102,9 @@ where
             }
         };
 
-        let resp = execute_syscall(&req);
+        tracing::info!("XDP_DIAG: req nr={} args={:?}", req.number, req.args);
+        let resp = execute_syscall(&req, backend);
+        tracing::info!("XDP_DIAG: resp ret={}", resp.ret);
         write_message(writer, &resp).await?;
     }
 }

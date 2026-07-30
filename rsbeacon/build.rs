@@ -13,8 +13,43 @@ fn main() {
         generate_certs(&ca_path, &cert_path, &key_path);
     }
 
+    maybe_rebuild_xdp_prog();
+
     // Tell cargo to rerun only if build.rs itself changes — not on every build.
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+/// `bpf/xdp_prog.o` is produced ahead-of-time from `bpf/xdp_prog.c` and
+/// checked into the repo (see that file's header comment for the exact
+/// rebuild command) — the same approach `xdplganger` takes with its own
+/// prebuilt `.o`. rsbeacon's own build NEVER invokes clang/a BPF toolchain
+/// automatically: doing so opportunistically on whatever machine happens
+/// to run `cargo build` is unsafe (different clang versions/libbpf-dev
+/// header layouts across machines can silently produce a different object,
+/// or — as observed during development — clang truncating the output file
+/// before failing to compile, destroying a good checked-in artifact).
+///
+/// Per this repo's convention (see AGENTS.md "Never hand-install packages
+/// on dev VMs — fix the harness instead" and the two-VM topology), the BPF
+/// toolchain only ever needs to be present on the build host (dev-vm-1),
+/// and rebuilding `xdp_prog.o` is an explicit, manual, developer-invoked
+/// step — never part of the ordinary `cargo build` / deploy flow.
+///
+/// This function only verifies the checked-in object exists and is
+/// well-formed enough to embed; it never writes to `bpf/xdp_prog.o`.
+fn maybe_rebuild_xdp_prog() {
+    let src = PathBuf::from("bpf/xdp_prog.c");
+    let obj = PathBuf::from("bpf/xdp_prog.o");
+    println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-changed={}", obj.display());
+
+    if !obj.exists() {
+        println!(
+            "cargo:warning=bpf/xdp_prog.o is missing; rebuild it manually on a host with clang \
+             + libbpf-dev (e.g. dev-vm-1) with: clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+             -I/usr/include/$(uname -m)-linux-gnu -c bpf/xdp_prog.c -o bpf/xdp_prog.o"
+        );
+    }
 }
 
 fn generate_certs(

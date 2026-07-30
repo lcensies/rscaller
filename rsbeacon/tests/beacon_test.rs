@@ -1,6 +1,7 @@
 use rscaller_proto::codec::{read_message, write_message};
 use rscaller_proto::types::{SyscallRequest, SyscallResponse};
 use rsbeacon::executor::execute_syscall;
+use rsbeacon::net_backend::direct::DirectBackend;
 use tokio::net::{TcpListener, TcpStream};
 
 #[test]
@@ -12,7 +13,7 @@ fn test_execute_getpid() {
         in_bufs: Vec::new(),
         out_sizes: Vec::new(),
     };
-    let resp = execute_syscall(&req);
+    let resp = execute_syscall(&req, &DirectBackend::new());
     assert!(
         resp.ret > 0,
         "getpid should return positive PID, got {}",
@@ -32,7 +33,7 @@ fn test_execute_kill_sig0() {
         in_bufs: Vec::new(),
         out_sizes: Vec::new(),
     };
-    let resp = execute_syscall(&req);
+    let resp = execute_syscall(&req, &DirectBackend::new());
     assert_eq!(resp.ret, 0, "kill(self, 0) should succeed");
 }
 
@@ -45,7 +46,7 @@ fn test_blocked_syscall_returns_eperm() {
         in_bufs: Vec::new(),
         out_sizes: Vec::new(),
     };
-    let resp = execute_syscall(&req);
+    let resp = execute_syscall(&req, &DirectBackend::new());
     assert_eq!(resp.ret, -(libc::EPERM as i64));
     assert_eq!(resp.slot_idx, 99);
 }
@@ -61,7 +62,7 @@ async fn test_beacon_roundtrip_plain() {
         let (mut reader, mut writer) = tokio::io::split(stream);
         // Serve one request then exit
         let req: SyscallRequest = read_message(&mut reader).await.unwrap();
-        let resp = execute_syscall(&req);
+        let resp = execute_syscall(&req, &DirectBackend::new());
         write_message(&mut writer, &resp).await.unwrap();
     });
 

@@ -8,6 +8,7 @@ description = "Syscall interception controller abstraction for rscaller"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 libc = { workspace = true }
+rscaller-proto = { path = "../rscaller-proto" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

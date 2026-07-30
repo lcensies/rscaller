@@ -1,6 +1,8 @@
 use rscaller_proto::types::{SyscallBuf, SyscallRequest, SyscallResponse};
 use tracing::{debug, warn};
 
+use crate::net_backend::NetBackend;
+
 /// Syscalls blocked from remote execution.
 /// Extend as needed — beacon is meant for a throwaway VM, so list is minimal.
 const BLOCKED_SYSCALLS: &[u64] = &[
@@ -21,7 +23,26 @@ const BLOCKED_SYSCALLS: &[u64] = &[
     435, // clone3
 ];
 
-pub fn execute_syscall(req: &SyscallRequest) -> SyscallResponse {
+/// Executes `req`, first giving the active `NetBackend` a chance to claim
+/// it (see `crate::net_backend`). Syscall numbers not claimed by the
+/// backend — which, with the default `direct` backend, is *every* syscall
+/// number — fall through to the generic `libc::syscall` passthrough below,
+/// unchanged from rsbeacon's behavior before the `NetBackend` abstraction
+/// was introduced.
+pub fn execute_syscall(req: &SyscallRequest, backend: &dyn NetBackend) -> SyscallResponse {
+    if backend.owns_syscall(req) {
+        return backend.handle(req);
+    }
+
+    execute_syscall_direct(req)
+}
+
+/// The generic syscall passthrough: executes `req` via `libc::syscall`
+/// against the beacon host's real kernel. This is rsbeacon's entire
+/// behavior prior to the `NetBackend` abstraction, and remains the sole
+/// execution path for any syscall number the active backend does not
+/// claim.
+fn execute_syscall_direct(req: &SyscallRequest) -> SyscallResponse {
     let num = req.number;
     let mut args = req.args;
 
@@ -112,5 +133,80 @@ pub fn execute_syscall(req: &SyscallRequest) -> SyscallResponse {
         slot_idx: req.slot_idx,
         ret: ret as i64,
         out_bufs,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net_backend::direct::DirectBackend;
+
+    /// `execute_syscall` with the `direct` backend must behave identically
+    /// to calling the generic passthrough directly — this is the
+    /// behavioral-parity guarantee from design decision D1: `direct` is not
+    /// a reimplementation, it's the same code path with zero interception.
+    #[test]
+    fn direct_backend_matches_generic_passthrough_for_getpid() {
+        let backend = DirectBackend::new();
+        let req = SyscallRequest {
+            slot_idx: 7,
+            number: libc::SYS_getpid as u64,
+            args: [0; 6],
+            in_bufs: vec![],
+            out_sizes: vec![],
+        };
+
+        let via_backend = execute_syscall(&req, &backend);
+        let via_direct = execute_syscall_direct(&req);
+
+        assert_eq!(via_backend.ret, via_direct.ret);
+        assert_eq!(via_backend.slot_idx, req.slot_idx);
+        // Both should return the real pid of this test process.
+        assert_eq!(via_backend.ret, std::process::id() as i64);
+    }
+
+    /// A socket-related syscall number, when serviced through the `direct`
+    /// backend, must still go through the exact same generic passthrough —
+    /// there is no shadow/alternate code path for socket syscalls when
+    /// `--netstack direct` is selected.
+    #[test]
+    fn direct_backend_does_not_intercept_socket_syscalls() {
+        let backend = DirectBackend::new();
+        // socket(AF_INET, SOCK_DGRAM, 0) — harmless, closes itself via drop
+        // of the fd being lost is fine for this test (short-lived process).
+        let req = SyscallRequest {
+            slot_idx: 1,
+            number: libc::SYS_socket as u64,
+            args: [libc::AF_INET as u64, libc::SOCK_DGRAM as u64, 0, 0, 0, 0],
+            in_bufs: vec![],
+            out_sizes: vec![],
+        };
+
+        let via_backend = execute_syscall(&req, &backend);
+        // A real fd (>= 0) proves this actually executed via libc::syscall
+        // against the real kernel, not some backend-internal virtual fd.
+        assert!(
+            via_backend.ret >= 0,
+            "expected a real kernel fd, got {}",
+            via_backend.ret
+        );
+        // Clean up the fd we just created.
+        unsafe {
+            libc::close(via_backend.ret as i32);
+        }
+    }
+
+    #[test]
+    fn blocked_syscalls_still_return_eperm_through_backend() {
+        let backend = DirectBackend::new();
+        let req = SyscallRequest {
+            slot_idx: 0,
+            number: 169, // reboot
+            args: [0; 6],
+            in_bufs: vec![],
+            out_sizes: vec![],
+        };
+        let resp = execute_syscall(&req, &backend);
+        assert_eq!(resp.ret, -(libc::EPERM as i64));
     }
 }
