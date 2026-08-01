@@ -1,0 +1,39 @@
+name: recon-routed
+description: |
+  Reconnaissance scenario: beacon's /proc/sys overlaid + selective network routing.
+  
+  Extends: base (common mounts + network syscalls)
+  Network: Specific subnets routed through beacon; discovery tools use local kernel.
+  
+  Example use: Network reconnaissance — 'ip addr' shows beacon's interfaces,
+  'curl' against target subnet is relayed through beacon, 'curl' to internet
+  uses local kernel.
+  
+  Configure routed subnets by editing net_routes below or pass --route CLI args.
+
+extends: base
+
+forward:
+  - name: network-routed
+    syscalls:
+      - socket
+      - connect
+      - bind
+      - listen
+      - accept4
+      - sendto
+      - recvfrom
+      - sendmsg
+      - recvmsg
+      - getsockopt
+      - setsockopt
+    filter:
+      # Network routing: ordered rules, first match wins.
+      # Default: all LOCAL (discovery tools like 'ip addr' use real kernel).
+      # Uncomment/add to route specific target subnets through beacon.
+      # Examples:
+      #   - subnet: "192.168.1.0/24"
+      #     direction: REMOTE     # Target subnet via beacon
+      #   - subnet: "0.0.0.0/0"
+      #     direction: LOCAL      # Everything else (discovery) local
+      net_routes: []

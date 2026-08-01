@@ -105,7 +105,7 @@ XDP_QUEUE  ?= 0
         test-vm test-evasion test-evasion-clean \
         test-mount-profiles test-mount-profiles-clean \
         handlers demo demo-auto demo-teardown \
-        poc poc-notracee
+        poc poc-notracee poc-scenario poc-scenario-tmux poc-compare
 
 build:
 	$(call CARGO,build --workspace)
@@ -212,6 +212,32 @@ poc:
 # Same as poc but skip tracee (faster startup, ~3s less wait).
 poc-notracee:
 	bash scripts/poc.sh --no-tracee --profile $(or $(PROFILE),proc) $(if $(CMD),--cmd "$(CMD)",)
+
+# Run one of the built-in evasion scenarios (exec|file|network) as a
+# baseline-vs-evasion comparison; prints matching-event counts + verdict.
+# Usage:
+#   make poc-scenario SCENARIO=exec
+#   make poc-scenario SCENARIO=file
+#   make poc-scenario SCENARIO=network
+poc-scenario:
+	bash scripts/poc.sh --scenario $(or $(SCENARIO),exec)
+
+# Same as poc-scenario, but opens a 2-pane tmux window (rsclient | rsbeacon)
+# for screenshotting the run. See scripts/poc_tmux.sh.
+poc-scenario-tmux:
+	bash scripts/poc_tmux.sh --scenario $(or $(SCENARIO),exec)
+
+# Arbitrary baseline-vs-evasion comparison — see `bash scripts/poc.sh --help`
+# for --cmd/--baseline-cmd/--events/--query.
+# Usage:
+#   make poc-compare PROFILE=ghost CMD="cat /mnt/target/etc/shadow" \
+#       BASELINE_CMD="cat /etc/shadow" QUERY=cat
+poc-compare:
+	bash scripts/poc.sh --compare --profile $(or $(PROFILE),ghost) \
+	  $(if $(CMD),--cmd "$(CMD)",) \
+	  $(if $(BASELINE_CMD),--baseline-cmd "$(BASELINE_CMD)",) \
+	  $(if $(EVENTS),--events "$(EVENTS)",) \
+	  $(if $(QUERY),--query "$(QUERY)",)
 
 # ---------------------------------------------------------------------------
 # VM harness — clean state management

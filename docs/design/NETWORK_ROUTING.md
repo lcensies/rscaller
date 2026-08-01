@@ -177,29 +177,31 @@ net_routes:
 
 ## Syntax
 
-### YAML Profile
+### Profile System: Base + Inheritance
+
+Starting with `v0.1.0+`, profiles support `extends:` directive to reduce duplication.
+
+#### Base Profile (`base.yaml`)
+
+All scenario profiles extend `base`, which provides:
+- Common mounts: `/proc`, `/sys`, `/etc/*` (hostname, hosts, machine-id, os-release, lsb-release)
+- Common forward rules: all network syscalls + socket-fd-ops (read/write/close/poll/etc)
 
 ```yaml
-name: shadow-routed
-description: "Shadow profile with network routing policy"
+name: base
 mounts:
   - remote: /proc
     local: /proc
     type: bind
+  - remote: /sys
+    local: /sys
+    type: bind
+    optional: true
+  # ... (other /etc/* mounts)
+
 forward:
-  - name: network-routed
-    syscalls: [socket, connect, bind, sendto]
-    filter:
-      net_routes:
-        - subnet: "10.0.0.1/32"
-          port: 443
-          direction: LOCAL
-        
-        - subnet: "192.168.1.0/24"
-          direction: REMOTE
-        
-        - subnet: "0.0.0.0/0"
-          direction: LOCAL
+  - name: network-syscalls
+    syscalls: [socket, connect, bind, listen, accept4, sendto, recvfrom, sendmsg, recvmsg, getsockopt, setsockopt]
   
   - name: socket-fd-ops
     syscalls: [read, write, close, poll, ppoll, fcntl, ioctl]
@@ -207,25 +209,90 @@ forward:
       fd_range: virtual
 ```
 
-### CLI Arguments
+#### Scenario Profiles
+
+**`beacon-local.yaml`** (red team: beacon + C2 + targets):
+
+```yaml
+name: beacon-local
+extends: base
+
+forward:
+  - name: network-routed
+    syscalls: [socket, connect, bind, listen, accept4, sendto, recvfrom, sendmsg, recvmsg, getsockopt, setsockopt]
+    filter:
+      # Customize via --route CLI args
+      net_routes: []  # Empty = all LOCAL (safe default)
+```
+
+**`recon-routed.yaml`** (reconnaissance: beacon's network visible + selective routing):
+
+```yaml
+name: recon-routed
+extends: base
+
+forward:
+  - name: network-routed
+    syscalls: [socket, connect, bind, listen, accept4, sendto, recvfrom, sendmsg, recvmsg, getsockopt, setsockopt]
+    filter:
+      net_routes: []  # Empty = all LOCAL (discovery tools use real kernel)
+```
+
+#### Inheritance Merging
+
+When a profile has `extends: base`:
+- **Mounts:** parent first, then child appends
+- **Forward rules:** parent first, then child appends
+- **Child rules have lower priority** (matched later)
+
+#### Custom Profiles
+
+Create a profile extending `base`:
+
+```yaml
+name: my-pivot
+extends: base
+description: "Internal pivoting: access multiple segments via beacon"
+
+forward:
+  - name: custom-routing
+    syscalls: [socket, connect, bind, listen, accept4, sendto, recvfrom, sendmsg, recvmsg, getsockopt, setsockopt]
+    filter:
+      net_routes:
+        - subnet: "192.168.1.0/24"
+          direction: REMOTE
+        - subnet: "10.0.0.0/8"
+          direction: REMOTE
+        - subnet: "0.0.0.0/0"
+          direction: LOCAL
+```
+
+Save to `~/.config/rsc/profiles/my-pivot.yaml` or `/etc/rsc/profiles/my-pivot.yaml`, then use:
+
+```bash
+rsc exec --mount-profile my-pivot --beacon host:9999 -- cmd
+```
+
+### CLI Arguments: Network Routing
+
+Override or extend profile routing rules:
 
 ```bash
 rsc exec \
-  --mount-profile shadow \
+  --mount-profile beacon-local \
   --beacon 192.168.1.100:9999 \
-  --route "10.0.0.1:443=local" \
   --route "192.168.1.0/24=remote" \
   --route "0.0.0.0/0=local" \
   -- ./beacon
 ```
 
-**Format:** `--route "<subnet>[:port]=<direction>"`
+**Format:** `--route "<subnet>[:<port>]=<direction>"`
 
-- Subnet: CIDR (e.g., "192.168.1.0/24", "10.0.0.1/32")
-- Port: optional, specific port (e.g., "10.0.0.1:443"), omit for any port
-- Direction: "local" or "remote"
+- **Subnet:** CIDR notation (e.g., "192.168.1.0/24", "10.0.0.1/32")
+- **Port:** optional, specific port (e.g., ":443"). Omit for any port.
+- **Direction:** "local" (use real kernel) or "remote" (relay through beacon)
 
-Routes are applied in order of specification. First match wins.
+Routes are applied **in order**. **First match wins.**
 
 ---
 
@@ -568,18 +635,66 @@ forward:
 
 ## Testing
 
-Test cases:
-1. No routes → all LOCAL (default safe).
-2. Single route matching → correct direction.
-3. Overlapping routes → first-match wins.
-4. Port-specific + wildcard → port-specific checked first.
-5. 0.0.0.0/0 catches unmatched.
-6. Malformed routes rejected at parse time.
+### Unit Tests
+
+`rsclient/src/relay.rs` contains 9 unit tests covering:
+
+1. **Empty routes** → all LOCAL (default safe)
+2. **Single route matching** → correct direction applied
+3. **Port-specific rules** → same subnet, different ports, first match wins
+4. **Overlapping subnets** → /24 before /32, first match priority
+5. **Default route** → 0.0.0.0/0 catch-all works
+6. **Non-routing syscalls** → only connect(42) & sendto(44) routed
+7. **Missing sockaddr** → malformed syscalls default to LOCAL
+8. **Parse errors** → invalid `--route` rejected with clear messages
+
+**Run:** `cargo test -p rsclient --lib relay::tests`
+
+### E2E Tests
+
+`tests/remote/test_mount_profiles.py` includes:
+
+- **`test_recon_routed_beacon_ip_visible`**: Proves `recon-routed` profile works end-to-end.
+  - Runs `ip -4 addr` inside `rsc exec --mount-profile recon-routed`
+  - Fetches beacon's IPs from dev-vm-2
+  - Asserts beacon's IPs appear in output (mount overlay working)
+  - Asserts execution is local (tracee sees no execve on beacon)
+  - Verifies: mount overlay + network routing both functional
+
+**Run:** `make test-evasion` (full VM integration test)
+
+### Discovery: Finding Beacon's Network
+
+To discover beacon's network interfaces before configuring `--route` rules:
+
+```bash
+# Inside rsc exec with recon-routed profile (sees beacon's /proc)
+$ rsc exec --mount-profile recon-routed --beacon host:9999 -- bash
+ubuntu@beacon$ ip addr
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536
+    inet 127.0.0.1/8 scope host lo
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
+    inet 192.168.1.50/24 brd 192.168.1.255 scope global eth0
+3: tun0: <POINTOPOINT,UP,LOWER_UP> mtu 1500
+    inet 10.0.0.0/8 scope global tun0
+
+# Now you know: relay 192.168.1.0/24 and 10.0.0.0/8
+ubuntu@beacon$ exit
+
+# Re-run with explicit routing
+$ rsc exec --mount-profile beacon-local --beacon host:9999 \
+    --route "192.168.1.0/24=remote" \
+    --route "10.0.0.0/8=remote" \
+    --route "0.0.0.0/0=local" \
+    -- ./beacon
+```
 
 ---
 
 ## References
 
-- `rsc/src/mount_config.rs`: ForwardFilter parsing.
-- `rsclient/src/relay.rs`: Routing policy lookup in dispatch loop.
-- `rsc/src/exec.rs`: CLI argument parsing for `--route`.
+- `rsc/src/mount_config.rs`: Profile loading, `extends:` inheritance, ForwardFilter parsing.
+- `rsclient/src/relay.rs`: NetFilter struct, routing policy lookup in dispatch loop, unit tests.
+- `rsclient/src/main.rs`: CLI argument parsing for `--route`, `--mount-profile`.
+- `rsc/profiles/`: Predefined profiles (base, beacon-local, recon-routed).
+- `tests/remote/test_mount_profiles.py`: E2E tests for profiles and network routing.

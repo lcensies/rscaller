@@ -1,0 +1,39 @@
+name: beacon-local
+description: |
+  Red team scenario: beacon impersonation + selective network routing.
+  
+  Extends: base (common mounts + network syscalls)
+  Network: Target subnets routed through beacon; C2 & internet use local kernel.
+  
+  Example use: Sliver beacon on attack machine — C2 callback reaches local
+  internet, target network accessed via beacon relay.
+  
+  Configure target subnets by editing net_routes below or pass --route CLI args.
+
+extends: base
+
+forward:
+  - name: network-routed
+    syscalls:
+      - socket
+      - connect
+      - bind
+      - listen
+      - accept4
+      - sendto
+      - recvfrom
+      - sendmsg
+      - recvmsg
+      - getsockopt
+      - setsockopt
+    filter:
+      # Network routing: ordered rules, first match wins.
+      # Default: all LOCAL (safe). Uncomment/add routes for target subnets.
+      # Examples:
+      #   - subnet: "192.168.1.0/24"
+      #     direction: REMOTE     # Target network via beacon
+      #   - subnet: "10.0.0.0/8"
+      #     direction: REMOTE
+      #   - subnet: "0.0.0.0/0"
+      #     direction: LOCAL      # Everything else (internet, C2) local
+      net_routes: []

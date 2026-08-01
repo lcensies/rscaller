@@ -1,0 +1,58 @@
+name: base
+description: "Base profile: common mounts (/proc, /sys, /etc) and network syscalls forwarding"
+
+mounts:
+  - remote: /proc
+    local: /proc
+    type: bind
+  - remote: /sys
+    local: /sys
+    type: bind
+    optional: true
+  - remote: /etc/hostname
+    local: /etc/hostname
+    type: bind
+    optional: true
+  - remote: /etc/hosts
+    local: /etc/hosts
+    type: bind
+    optional: true
+  - remote: /etc/machine-id
+    local: /etc/machine-id
+    type: bind
+    optional: true
+  - remote: /etc/os-release
+    local: /etc/os-release
+    type: bind
+    optional: true
+  - remote: /etc/lsb-release
+    local: /etc/lsb-release
+    type: bind
+    optional: true
+
+forward:
+  - name: network-syscalls
+    syscalls:
+      - socket
+      - connect
+      - bind
+      - listen
+      - accept4
+      - sendto
+      - recvfrom
+      - sendmsg
+      - recvmsg
+      - getsockopt
+      - setsockopt
+
+  - name: socket-fd-ops
+    syscalls:
+      - read
+      - write
+      - close
+      - poll
+      - ppoll
+      - fcntl
+      - ioctl
+    filter:
+      fd_range: virtual

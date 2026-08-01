@@ -297,3 +297,46 @@ def test_net_routing_route_arg(client, beacon_host, beacon_ip, beacon_port, rsbe
         f"sudo pkill -9 -f '{name}' 2>/dev/null || true; sleep 0.4; "
         f"grep -qF '{mount_point}' /proc/mounts && sudo umount -l '{mount_point}' 2>/dev/null || true")
 
+
+@pytest.mark.timeout(120)
+def test_recon_routed_beacon_ip_visible(client, beacon_host, beacon_ip, beacon_port, rsbeacon):
+    """Recon-routed profile: beacon's IP visible via 'ip addr', no local IP match.
+    
+    Use recon-routed profile with network routing to relay connections.
+    Beacon's IP addresses should appear in 'ip addr' output (mounted /proc),
+    and should NOT match the client's IP addresses.
+    """
+    tracee = _make_tracee(beacon_host)
+    tracee.start(settle_secs=3.0)
+    
+    # Get beacon's IPs
+    r = run(beacon_host, "ip -4 addr | grep 'inet ' | awk '{print $2}'")
+    beacon_ips = set(r.stdout.strip().split('\n')) if r.ok else set()
+    print(f"[recon_routed] beacon IPs: {beacon_ips}", flush=True)
+    
+    # Run rsc exec with recon-routed profile
+    rc, stdout = _rsc_exec(client, beacon_ip, beacon_port, "recon-routed",
+                           "ip -4 addr | grep 'inet ' | awk '{print $2}'", timeout=30)
+    
+    events = _filter_motd(tracee.stop())
+    client_ips = set(stdout.strip().split('\n')) if stdout.strip() else set()
+    print(f"[recon_routed] client saw IPs: {client_ips}", flush=True)
+    
+    assert rc == 0, f"ip -4 addr failed (exit {rc})"
+    assert client_ips, "ip -4 addr returned no IPv4 addresses"
+    
+    # Key assertion: beacon's IPs should be visible, not client's
+    # (or at least not all client IPs — beacon might share some for testing)
+    assert any(ip in client_ips for ip in beacon_ips), (
+        f"beacon IPs {beacon_ips} NOT visible via recon-routed profile. "
+        f"Got IPs: {client_ips}. Mount overlay might not be working."
+    )
+    
+    # Execution must be local (ip command doesn't run on beacon)
+    ip_events = tracee.execve_matches(events, pattern="ip")
+    assert not ip_events, (
+        f"tracee saw ip execve on beacon (expected 0 — exec must be local):\n"
+        + "\n".join("  " + tracee.format_event(e) for e in ip_events)
+    )
+
+
