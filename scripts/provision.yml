@@ -21,6 +21,7 @@
           - make
           - linux-headers-{{ ansible_kernel }}
           - linux-tools-common
+          - libvirt-dev
         state: present
         update_cache: true
 

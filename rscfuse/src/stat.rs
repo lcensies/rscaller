@@ -18,12 +18,16 @@ pub fn stat_bytes_to_attr(ino: u64, buf: &[u8]) -> FileAttr {
     // fields out immediately rather than holding the reference.
     let st: libc::stat = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const libc::stat) };
 
+    // Block devices must be reported as regular files in the FUSE view.
+    // If the kernel sees a real block-device rdev it will bypass FUSE and
+    // attempt I/O against the local device with that major:minor, which
+    // returns zero bytes for a remote beacon device.
     let kind = match st.st_mode & libc::S_IFMT {
         libc::S_IFREG => FileType::RegularFile,
         libc::S_IFDIR => FileType::Directory,
         libc::S_IFLNK => FileType::Symlink,
         libc::S_IFCHR => FileType::CharDevice,
-        libc::S_IFBLK => FileType::BlockDevice,
+        libc::S_IFBLK => FileType::RegularFile,
         libc::S_IFIFO => FileType::NamedPipe,
         libc::S_IFSOCK => FileType::Socket,
         _ => FileType::RegularFile, // fallback
@@ -59,7 +63,13 @@ pub fn stat_bytes_to_attr(ino: u64, buf: &[u8]) -> FileAttr {
         nlink: st.st_nlink as u32,
         uid: st.st_uid,
         gid: st.st_gid,
-        rdev: st.st_rdev as u32,
+        // Block devices are exposed as regular files; zero rdev so the kernel
+        // does not attempt to use a local device with the same major:minor.
+        rdev: if (st.st_mode & libc::S_IFMT) == libc::S_IFBLK {
+            0
+        } else {
+            st.st_rdev as u32
+        },
         blksize: st.st_blksize as u32,
         flags: 0,
     }

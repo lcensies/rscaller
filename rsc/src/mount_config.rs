@@ -28,6 +28,87 @@ pub struct MountProfile {
     /// vs. continued locally.
     #[serde(default)]
     pub forward: Vec<ForwardRule>,
+    /// QEMU relay mode: when present, `rsc exec` runs the command inside a
+    /// local QEMU VM with the beacon's block device attached (see relay.rs).
+    /// Toggle relay mode by pointing --mount-profile at any profile carrying
+    /// this section — the built-in `qemu-relay` profile is just the defaults.
+    #[serde(default)]
+    pub relay: Option<RelayConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// RelayConfig — QEMU relay VM settings
+// ---------------------------------------------------------------------------
+
+pub const DEFAULT_RELAY_ARTIFACTS: &str = "/var/lib/libvirt/images/rscaller-relay";
+pub const DEFAULT_RELAY_KERNEL_CMDLINE: &str =
+    "root=/dev/vda rw console=ttyS0 quiet init=/vm-init-relay.sh";
+pub const DEFAULT_RELAY_MOUNT_POINT: &str = "/mnt/relay";
+pub const DEFAULT_RELAY_MEMORY_MIB: u64 = 512;
+pub const DEFAULT_RELAY_VCPUS: u32 = 1;
+
+fn default_relay_artifacts() -> std::path::PathBuf {
+    std::path::PathBuf::from(DEFAULT_RELAY_ARTIFACTS)
+}
+fn default_relay_cmdline() -> String {
+    DEFAULT_RELAY_KERNEL_CMDLINE.to_string()
+}
+fn default_relay_mount_point() -> String {
+    DEFAULT_RELAY_MOUNT_POINT.to_string()
+}
+fn default_relay_memory() -> u64 {
+    DEFAULT_RELAY_MEMORY_MIB
+}
+fn default_relay_vcpus() -> u32 {
+    DEFAULT_RELAY_VCPUS
+}
+
+/// QEMU relay VM configuration. Every field has a default, so a profile can
+/// enable relay mode with a bare `relay: {}`; override only what differs.
+///
+/// Precedence: CLI flag (`--relay-artifacts`, `--relay-device`) > profile
+/// `relay:` section > built-in defaults.
+#[derive(Deserialize, Clone, Debug)]
+pub struct RelayConfig {
+    /// Directory containing the relay VM boot artifacts:
+    /// `vmlinuz`, `initrd.img`, `rootfs.img`. See docs/qemu-relay.md for how
+    /// to prepare a custom image.
+    #[serde(default = "default_relay_artifacts")]
+    pub artifacts: std::path::PathBuf,
+    /// Device on the beacon to attach: absolute path (`/dev/vdb`) or bare
+    /// name under the beacon's /dev (`vdb`). When omitted, the beacon's root
+    /// device is auto-discovered (LVM-aware) via /proc/mounts + sysfs.
+    #[serde(default)]
+    pub device: Option<std::path::PathBuf>,
+    /// Guest kernel command line. Must match the image's init contract: the
+    /// referenced init must start qemu-guest-agent on the virtio-serial
+    /// channel and keep PID 1 alive.
+    #[serde(default = "default_relay_cmdline")]
+    pub kernel_cmdline: String,
+    /// Guest-side mount point where the attached device is mounted.
+    #[serde(default = "default_relay_mount_point")]
+    pub mount_point: String,
+    #[serde(default = "default_relay_memory")]
+    pub memory_mib: u64,
+    #[serde(default = "default_relay_vcpus")]
+    pub vcpus: u32,
+    /// libvirt connection URI. None = qemu:///session.
+    #[serde(default)]
+    pub libvirt_uri: Option<String>,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            artifacts: default_relay_artifacts(),
+            device: None,
+            kernel_cmdline: default_relay_cmdline(),
+            mount_point: default_relay_mount_point(),
+            memory_mib: default_relay_memory(),
+            vcpus: default_relay_vcpus(),
+            libvirt_uri: None,
+        }
+    }
 }
 
 impl MountProfile {
@@ -213,6 +294,9 @@ pub enum MountType {
     Bind,
     // Overlay support (overlayfs full-root) is reserved for a future layer.
     Overlay,
+    /// Bind-mount from an absolute host path, bypassing the FUSE mount root.
+    /// Used by the qemu-relay profile to expose the relay view.
+    Host,
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +390,12 @@ fn resolve_extends(profile: &mut MountProfile) -> Result<()> {
     if profile.description.is_empty() {
         profile.description = parent.description;
     }
-    
+
+    // Inherit relay config when the child doesn't define its own.
+    if profile.relay.is_none() {
+        profile.relay = parent.relay;
+    }
+
     Ok(())
 }
 
@@ -360,6 +449,7 @@ pub fn apply(profile: &MountProfile, fuse_root: &str) -> Result<()> {
 fn apply_entry(entry: &MountEntry, fuse_root: &str) -> Result<()> {
     match entry.mount_type {
         MountType::Bind => apply_bind(entry, fuse_root),
+        MountType::Host => apply_host_bind(entry),
         MountType::Overlay => {
             if entry.optional {
                 eprintln!(
@@ -380,18 +470,25 @@ fn apply_entry(entry: &MountEntry, fuse_root: &str) -> Result<()> {
 fn apply_bind(entry: &MountEntry, fuse_root: &str) -> Result<()> {
     let remote_rel = entry.remote.trim_start_matches('/');
     let source_path = format!("{}/{}", fuse_root.trim_end_matches('/'), remote_rel);
+    apply_bind_absolute(entry, &source_path)
+}
 
-    if !std::path::Path::new(&source_path).exists() {
+fn apply_host_bind(entry: &MountEntry) -> Result<()> {
+    apply_bind_absolute(entry, &entry.remote)
+}
+
+fn apply_bind_absolute(entry: &MountEntry, source_path: &str) -> Result<()> {
+    if !std::path::Path::new(source_path).exists() {
         if entry.optional {
             return Ok(());
         }
-        bail!("remote path {source_path:?} not found in FUSE mount");
+        bail!("source path {source_path:?} not found");
     }
 
     // Auto-create target if absent — bind(2) requires the target to already exist.
     let target_path = std::path::Path::new(&entry.local);
     if !target_path.exists() {
-        if std::path::Path::new(&source_path).is_dir() {
+        if std::path::Path::new(source_path).is_dir() {
             fs::create_dir_all(target_path)
                 .with_context(|| format!("auto-create target dir {:?}", target_path))?;
         } else {
@@ -406,7 +503,7 @@ fn apply_bind(entry: &MountEntry, fuse_root: &str) -> Result<()> {
         }
     }
 
-    let source = CString::new(source_path.as_str()).expect("NUL in source path");
+    let source = CString::new(source_path).expect("NUL in source path");
     let target = CString::new(entry.local.as_str()).expect("NUL in target path");
 
     let ret = unsafe {
@@ -494,5 +591,39 @@ forward:
         let names = builtin_names();
         assert!(names.contains(&"ghost"));
         assert!(names.contains(&"shadow"));
+    }
+
+    #[test]
+    fn relay_section_defaults_and_overrides() {
+        // Bare section: every field falls back to the built-in default.
+        let bare: MountProfile = serde_yaml::from_str("name: t\nrelay: {}\n").unwrap();
+        let cfg = bare.relay.expect("relay section present");
+        assert_eq!(cfg.artifacts, std::path::PathBuf::from(DEFAULT_RELAY_ARTIFACTS));
+        assert_eq!(cfg.kernel_cmdline, DEFAULT_RELAY_KERNEL_CMDLINE);
+        assert_eq!(cfg.mount_point, DEFAULT_RELAY_MOUNT_POINT);
+        assert_eq!(cfg.memory_mib, DEFAULT_RELAY_MEMORY_MIB);
+        assert_eq!(cfg.vcpus, DEFAULT_RELAY_VCPUS);
+        assert!(cfg.device.is_none());
+        assert!(cfg.libvirt_uri.is_none());
+
+        // Overrides land; profiles without a relay section stay in normal mode.
+        let custom: MountProfile = serde_yaml::from_str(
+            "name: t\nrelay:\n  artifacts: /opt/img\n  device: /dev/vdc\n  memory_mib: 512\n",
+        )
+        .unwrap();
+        let cfg = custom.relay.unwrap();
+        assert_eq!(cfg.artifacts, std::path::PathBuf::from("/opt/img"));
+        assert_eq!(cfg.device, Some(std::path::PathBuf::from("/dev/vdc")));
+        assert_eq!(cfg.memory_mib, 512);
+        assert_eq!(cfg.vcpus, DEFAULT_RELAY_VCPUS); // untouched field keeps default
+        let plain: MountProfile = serde_yaml::from_str("name: t\n").unwrap();
+        assert!(plain.relay.is_none());
+    }
+
+    #[test]
+    fn builtin_qemu_relay_profile_enables_relay_mode() {
+        let profile = builtin_preset("qemu-relay").expect("qemu-relay preset exists");
+        let cfg = profile.relay.expect("qemu-relay must carry a relay section");
+        assert!(cfg.kernel_cmdline.contains("init="));
     }
 }

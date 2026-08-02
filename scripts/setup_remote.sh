@@ -11,7 +11,8 @@ export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
 sudo apt-get install -y build-essential linux-headers-$(uname -r) \
   linux-tools-$(uname -r) linux-tools-common \
-  bpftool pkg-config libssl-dev curl git fuse3 libfuse3-dev 2>&1 | tail -5
+  bpftool pkg-config libssl-dev curl git fuse3 libfuse3-dev \
+  libvirt-dev 2>&1 | tail -5
 
 if ! command -v docker &>/dev/null; then
   curl -fsSL https://get.docker.com | sudo sh

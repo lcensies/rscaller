@@ -111,6 +111,12 @@ pub fn run(args: FuseArgs) -> Result<()> {
     let options = vec![
         MountOption::RW,
         MountOption::FSName(args.name.clone()),
+        // Required so that block-device nodes under /rsc/<target>/dev can be
+        // opened by consumers like QEMU's raw disk driver.
+        MountOption::Dev,
+        // Libvirt/QEMU may run as a dedicated user (libvirt-qemu) rather than
+        // the mounter; allow_other is required for any non-mounter access.
+        MountOption::AllowOther,
     ];
 
     tracing::info!("Mounting FUSE fs at {} ...", args.mount);

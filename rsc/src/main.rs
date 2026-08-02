@@ -9,6 +9,8 @@
 mod exec;
 mod deploy;
 mod mount_config;
+#[cfg(feature = "relay")]
+mod relay;
 #[cfg(feature = "container")]
 mod microvm;
 
@@ -137,9 +139,19 @@ pub struct ExecArgs {
     pub kmod_param: String,
 
     /// Mount namespace overlay profile: none, recon, relay, shadow, ghost,
-    /// or path to a YAML file. Controls which remote paths are overlaid locally.
+    /// qemu-relay, or path to a YAML file. Controls which remote paths are overlaid locally.
     #[arg(long, default_value = "none")]
     pub mount_profile: String,
+
+    /// Directory containing relay VM boot artifacts (vmlinuz, initrd.img, rootfs.img).
+    /// Used by the qemu-relay profile.
+    #[arg(long)]
+    pub relay_artifacts: Option<PathBuf>,
+
+    /// Explicit remote device path for qemu-relay (e.g. /dev/sda1).
+    /// If omitted, the first usable block device is discovered automatically.
+    #[arg(long)]
+    pub relay_device: Option<PathBuf>,
 
     /// Command and arguments to run.
     #[arg(last = true, required = true)]
@@ -180,9 +192,19 @@ pub struct ShellArgs {
     pub microvm_cpus: u32,
 
     /// Mount namespace overlay profile: none, recon, relay, shadow, ghost,
-    /// or path to a YAML file. Controls which remote paths are overlaid locally.
+    /// qemu-relay, or path to a YAML file. Controls which remote paths are overlaid locally.
     #[arg(long, default_value = "none")]
     pub mount_profile: String,
+
+    /// Directory containing relay VM boot artifacts (vmlinuz, initrd.img, rootfs.img).
+    /// Used by the qemu-relay profile.
+    #[arg(long)]
+    pub relay_artifacts: Option<PathBuf>,
+
+    /// Explicit remote device path for qemu-relay (e.g. /dev/sda1).
+    /// If omitted, the first usable block device is discovered automatically.
+    #[arg(long)]
+    pub relay_device: Option<PathBuf>,
 
     /// Source shell rc files (~/.bashrc, /etc/profile, etc.).
     /// Disabled by default when mount-profile is non-none to avoid running

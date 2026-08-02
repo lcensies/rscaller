@@ -11,6 +11,9 @@ path = "src/main.rs"
 [features]
 default = ["container"]
 container = ["dep:tokio", "dep:ociman"]
+# relay enables `rsc exec --profile qemu-relay`. It requires libvirt-dev
+# on the build host, so it is opt-in.
+relay = ["dep:qemu-vdw-core"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -20,6 +23,7 @@ serde = { workspace = true }
 serde_yaml = { workspace = true }
 ctls = { path = "../ctls", default-features = false, features = ["seccomp"] }
 rscfuse = { path = "../rscfuse" }
+qemu-vdw-core = { path = "../qemu-vdw-core", optional = true }
 rustls = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { workspace = true, optional = true }

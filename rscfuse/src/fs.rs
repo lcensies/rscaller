@@ -22,6 +22,7 @@ const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 
 // Syscall numbers (x86-64)
 const SYS_CLOSE: u64 = 3;
+const SYS_LSEEK: u64 = 8;
 const SYS_PREAD64: u64 = 17;
 const SYS_PWRITE64: u64 = 18;
 const SYS_GETDENTS64: u64 = 217;
@@ -95,8 +96,20 @@ impl RscFs {
     }
 
     fn attr_for_path(&self, ino: u64, path: &str, follow: bool) -> Result<FileAttr> {
-        let (buf, _st) = self.stat_path(path, follow)?;
-        Ok(stat_bytes_to_attr(ino, &buf))
+        let (buf, st) = self.stat_path(path, follow)?;
+        let is_block = (st.st_mode & libc::S_IFMT) == libc::S_IFBLK;
+        let mut attr = stat_bytes_to_attr(ino, &buf);
+        if is_block {
+            if let Some(size) = self.block_device_size(path) {
+                attr.size = size;
+                attr.blocks = size / u64::from(std::cmp::max(attr.blksize, 1));
+            }
+            // Libvirt/QEMU may run as a non-root user (libvirt-qemu).  Report
+            // the device as world-accessible so the kernel allows the open to
+            // reach rscfuse; the real permission check happens on the beacon.
+            attr.perm = 0o666;
+        }
+        Ok(attr)
     }
 
     /// Open a remote path, returning a remote fd.
@@ -128,6 +141,30 @@ impl RscFs {
         {
             tracing::warn!("remote close fd={} failed: {}", rfd, e);
         }
+    }
+
+    /// Best-effort block-device size by opening the path on the beacon and
+    /// lseeking to the end.  Block devices report st_size=0 in a plain stat,
+    /// but consumers like QEMU's raw driver need a non-zero size.
+    fn block_device_size(&self, path: &str) -> Option<u64> {
+        let fd = self.remote_open(path, libc::O_RDWR, 0).ok()?;
+        let ret = self
+            .client
+            .syscall(SYS_LSEEK, [fd as u64, 0, libc::SEEK_END as u64, 0, 0, 0], vec![], vec![])
+            .ok()?
+            .0;
+        self.remote_close(fd);
+        if ret < 0 {
+            return None;
+        }
+        Some(ret as u64)
+    }
+
+    /// True if `path` resolves to a block device on the beacon.
+    fn is_block_device(&self, path: &str) -> bool {
+        self.stat_path(path, true)
+            .map(|(_, st)| (st.st_mode & libc::S_IFMT) == libc::S_IFBLK)
+            .unwrap_or(false)
     }
 }
 
@@ -188,10 +225,11 @@ impl Filesystem for RscFs {
             }
         }
 
-        match self.stat_path(&path, true) {
-            Ok((buf, _)) => {
+        match self.attr_for_path(0, &path, true) {
+            Ok(attr) => {
                 let ino = self.inodes.lock().unwrap().get_or_create(&path);
-                let attr = stat_bytes_to_attr(ino, &buf);
+                let mut attr = attr;
+                attr.ino = ino;
                 reply.entry(&TTL, &attr, 0);
             }
             Err(e) => {
@@ -317,7 +355,14 @@ impl Filesystem for RscFs {
         }
 
         // Strip O_CREAT etc. that don't make sense for an existing file open.
-        let open_flags = flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC);
+        let mut open_flags = flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC);
+
+        // Block devices forwarded through FUSE cannot honor O_DIRECT: the host
+        // FUSE layer and the remote beacon fd both expect ordinary buffered
+        // read/write paths.  Strip it before forwarding the open.
+        if self.is_block_device(&path) {
+            open_flags &= !libc::O_DIRECT;
+        }
 
         match self.remote_open(&path, open_flags, 0) {
             Ok(rfd) => {

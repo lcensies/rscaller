@@ -1,0 +1,14 @@
+name: qemu-relay
+description: "QEMU relay — run the command inside a local QEMU VM with the beacon's block device attached (raw I/O invisible to host EDR)"
+
+# Relay mode is toggled by the presence of this section. All values shown are
+# the built-in defaults; a custom profile can override any subset. See
+# docs/qemu-relay.md for preparing a custom boot image.
+relay:
+  artifacts: /var/lib/libvirt/images/rscaller-relay
+  # device: /dev/vdb        # omit = auto-discover beacon root device (LVM-aware)
+  kernel_cmdline: "root=/dev/vda rw console=ttyS0 quiet init=/vm-init-relay.sh"
+  mount_point: /mnt/relay
+  memory_mib: 512
+  vcpus: 1
+  # libvirt_uri: qemu:///system

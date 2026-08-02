@@ -1,0 +1,14 @@
+[package]
+name = "qemu-vdw-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/darthevader/qemu-direct-device-write"
+description = "SDK-first library: root-device discovery, QEMU/libvirt VM provisioning, and guest mount orchestration for qemu-direct-device-write."
+
+[dependencies]
+base64 = "0.23.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+virt = { version = "0.4.3", features = ["qemu"] }

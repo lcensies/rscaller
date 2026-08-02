@@ -128,6 +128,54 @@ inode size is 0, even with `FOPEN_DIRECT_IO`. Fix in `rscfuse/src/stat.rs`: regu
 with `st_size=0` get a 4 MiB sentinel size so the kernel issues reads; actual EOF is
 signalled when the read handler returns 0 bytes.
 
+## QEMU relay exec (mount profiles with a `relay:` section)
+
+Relay mode is toggled by config: any mount profile carrying a `relay:` section
+(`mount_config::RelayConfig`) switches `rsc exec` into QEMU relay mode. The built-in
+`qemu-relay` profile is just the defaults. Custom profiles (YAML path,
+`~/.config/rsc/profiles/`, `/etc/rsc/profiles/`) can override artifacts, device,
+kernel cmdline, guest mount point, memory/vcpus, and libvirt URI. Precedence:
+CLI (`--relay-artifacts`, `--relay-device`) > profile `relay:` section > built-in
+defaults. Preparing a custom boot image: `docs/qemu-relay.md`.
+
+In relay mode, `rsc exec` provisions a local QEMU/KVM VM on the client, attaches a
+**beacon** block device through rscfuse as a file-backed raw disk, mounts it in the
+guest, and runs the target command via the QEMU Guest Agent. Raw device I/O happens
+inside the VM, invisible to host EDR.
+
+### Requirements (automated)
+- `security_driver = "none"` in `/etc/libvirt/qemu.conf` on the client — AppArmor's
+  per-VM profile generator cannot open FUSE paths, domain start fails otherwise.
+  Set by `bootstrap.sh` (step 1.5).
+- `user_allow_other` in `/etc/fuse.conf` — needed for non-root `rsc fuse` mounts so the
+  QEMU process user can open the disk. Set by `bootstrap.sh`.
+- Relay boot artifacts at `/var/lib/libvirt/images/rscaller-relay/` on the client —
+  synced from repo `qemu-relay-artifacts/` by `deploy.sh` (checksum-based).
+
+### rscfuse block-device rules (hard-won, do not regress)
+- Block devices are reported as **regular files** (`rdev=0`). If the kernel sees a real
+  block-device rdev it bypasses FUSE and reads the *local* device with that major:minor —
+  reads return zero bytes. Size is filled in via remote `lseek(SEEK_END)`.
+- Mount options must include `MountOption::Dev` and `MountOption::AllowOther`
+  (`rscfuse/src/lib.rs`); without `Dev` the kernel refuses to open device nodes, without
+  `AllowOther` the QEMU process user gets EACCES.
+- FUSE-backed disks in the VM XML use `type='file'` + `cache='writeback'`
+  (`qemu-vdw-core/src/provisioning/xml.rs`); QEMU's `host_device` driver issues ioctls
+  FUSE cannot serve, and `cache='none'` implies O_DIRECT.
+- Device auto-discovery (`relay.rs`) reads the beacon's `/proc/mounts` via FUSE and
+  resolves the root device — LVM-aware (`/dev/mapper/<vg>-<lv>` → PV via sysfs slaves,
+  mounted in the guest through `vgchange -ay`). Name-pattern `/dev/` scan is only the
+  last-resort fallback. No `is_block_device()` checks anywhere — the FUSE view reports
+  regular files.
+
+### Test device on the beacon: `/dev/vdb`
+The beacon (dev-vm-2) has a 64 MiB scratch disk attached **at the hypervisor level**:
+`virsh attach-disk dev-vm-2 /var/lib/libvirt/images/dev-vm-2-relay-scratch.img vdb
+--live --config` (image created + `mkfs.ext4` host-side). No in-guest setup ever runs
+on the beacon — no losetup, no mounts. `test_qemu_relay.py` writes a sentinel through
+the relay VM and reads it back through a second relay invocation; it never runs
+verification commands on the beacon.
+
 ## Shell / Tmux Workflow
 
 - **Use tmux panes for all long-running commands** (deploy, build, SSH). Never use

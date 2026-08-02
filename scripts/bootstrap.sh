@@ -55,6 +55,8 @@ PKGS=(
   #   libelf-dev  — BPF object (ELF) loading support
   #   bpftool     — inspect/debug loaded XDP programs and maps
   clang llvm libbpf-dev libelf-dev bpftool
+  # libvirt SDK for qemu-vdw-core relay VM provisioning
+  libvirt-dev
 )
 
 # Check which are missing
@@ -75,6 +77,35 @@ echo "  gcc:     $(gcc --version | head -1)"
 echo "  headers: $(ls /lib/modules/${KERNEL}/build/Makefile 2>/dev/null && echo present || echo MISSING)"
 ENDSSH
 ok "system deps"
+
+# ---------------------------------------------------------------------------
+# 1.5 libvirt/FUSE config for qemu-relay
+# ---------------------------------------------------------------------------
+step "Configuring libvirt/FUSE for qemu-relay on $REMOTE"
+ssh "$REMOTE" 'bash -s' <<'ENDSSH'
+set -euo pipefail
+CHANGED=0
+# rsc relay attaches rscfuse-backed disks to a local VM. AppArmor's per-VM
+# profile generator cannot open FUSE paths, so domain start fails unless
+# libvirt's security driver is disabled.
+if ! sudo grep -q '^security_driver = "none"' /etc/libvirt/qemu.conf 2>/dev/null; then
+  if sudo grep -qE '^#?security_driver' /etc/libvirt/qemu.conf; then
+    sudo sed -i -E 's/^#?security_driver.*/security_driver = "none"/' /etc/libvirt/qemu.conf
+  else
+    echo 'security_driver = "none"' | sudo tee -a /etc/libvirt/qemu.conf >/dev/null
+  fi
+  CHANGED=1
+fi
+# Non-root `rsc fuse` mounts need allow_other so the QEMU process user can
+# open the FUSE-backed disk.
+if ! grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null; then
+  echo 'user_allow_other' | sudo tee -a /etc/fuse.conf >/dev/null
+fi
+if [ "$CHANGED" -eq 1 ]; then
+  sudo systemctl restart libvirtd
+fi
+ENDSSH
+ok "libvirt/FUSE config"
 
 # ---------------------------------------------------------------------------
 # 2. Rust toolchain

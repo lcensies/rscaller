@@ -14,6 +14,22 @@ const CGROUP_BASE: &str = "/sys/fs/cgroup/rscaller";
 // ---------------------------------------------------------------------------
 
 pub fn run_exec_sync(args: ExecArgs) -> Result<()> {
+    // Relay mode is toggled by the mount profile carrying a `relay:` section
+    // (built-in `qemu-relay` profile, or any custom YAML with one).
+    // If the profile fails to load here, fall through — run_seccomp loads it
+    // again and reports the parse error properly.
+    let relay_cfg = crate::mount_config::load(&args.mount_profile)
+        .ok()
+        .and_then(|p| p.relay);
+    if let Some(cfg) = relay_cfg {
+        #[cfg(feature = "relay")]
+        return crate::relay::run_relay_exec(args, &cfg);
+        #[cfg(not(feature = "relay"))]
+        anyhow::bail!(
+            "mount profile {:?} enables qemu relay mode, which requires the 'relay' feature",
+            args.mount_profile
+        );
+    }
     if args.transport.ctl == "kmod" {
         run_kmod(args)
     } else {
@@ -23,7 +39,7 @@ pub fn run_exec_sync(args: ExecArgs) -> Result<()> {
 
 pub fn run_shell_sync(args: ShellArgs) -> Result<()> {
     let cmd = shell_cmd(&args);
-    run_exec_sync(ExecArgs { transport: args.transport, image: args.image, backend: args.backend, microvm: args.microvm, microvm_backend: args.microvm_backend, microvm_kernel: args.microvm_kernel, microvm_mem: args.microvm_mem, microvm_cpus: args.microvm_cpus, kmod_param: String::from("/sys/module/rscaller/parameters/target_cgroup_ino"), cmd, mount_profile: args.mount_profile })
+    run_exec_sync(ExecArgs { transport: args.transport, image: args.image, backend: args.backend, microvm: args.microvm, microvm_backend: args.microvm_backend, microvm_kernel: args.microvm_kernel, microvm_mem: args.microvm_mem, microvm_cpus: args.microvm_cpus, kmod_param: String::from("/sys/module/rscaller/parameters/target_cgroup_ino"), cmd, mount_profile: args.mount_profile, relay_artifacts: args.relay_artifacts, relay_device: args.relay_device })
 }
 
 // ---------------------------------------------------------------------------
@@ -44,7 +60,7 @@ pub async fn run_exec_async(args: ExecArgs) -> Result<()> {
 #[cfg(feature = "container")]
 pub async fn run_shell_async(args: ShellArgs) -> Result<()> {
     let cmd = shell_cmd(&args);
-    run_exec_async(ExecArgs { transport: args.transport, image: args.image, backend: args.backend, microvm: args.microvm, microvm_backend: args.microvm_backend, microvm_kernel: args.microvm_kernel, microvm_mem: args.microvm_mem, microvm_cpus: args.microvm_cpus, kmod_param: String::from("/sys/module/rscaller/parameters/target_cgroup_ino"), cmd, mount_profile: args.mount_profile }).await
+    run_exec_async(ExecArgs { transport: args.transport, image: args.image, backend: args.backend, microvm: args.microvm, microvm_backend: args.microvm_backend, microvm_kernel: args.microvm_kernel, microvm_mem: args.microvm_mem, microvm_cpus: args.microvm_cpus, kmod_param: String::from("/sys/module/rscaller/parameters/target_cgroup_ino"), cmd, mount_profile: args.mount_profile, relay_artifacts: args.relay_artifacts, relay_device: args.relay_device }).await
 }
 
 /// Build the shell command vector for `rsc shell`.

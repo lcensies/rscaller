@@ -346,7 +346,7 @@ def rsbeacon_on_beacon(pytestconfig, beacon_host, beacon_port, deploy_beacon):
     """Start rsbeacon on beacon_host, listening on all interfaces."""
     if pytestconfig.getoption("--no-e2e"):
         pytest.skip("E2E disabled via --no-e2e")
-    run(beacon_host, "pkill -9 rsbeacon 2>/dev/null || true")
+    run(beacon_host, "sudo pkill -9 rsbeacon 2>/dev/null || true")
     run_bg(beacon_host,
            f"nohup sudo {BEACON_BIN} "
            f"--listen 0.0.0.0:{beacon_port} "
@@ -358,7 +358,10 @@ def rsbeacon_on_beacon(pytestconfig, beacon_host, beacon_port, deploy_beacon):
         log = run(beacon_host, "cat /tmp/rsbeacon.log 2>/dev/null")
         pytest.fail(f"rsbeacon failed to start on {beacon_host}:\n{log.stdout}")
     yield
-    run(beacon_host, "sudo pkill -9 rsbeacon 2>/dev/null || true")
+    # Deliberately NOT killing rsbeacon here: the interface must stay usable
+    # between/after test runs (manual relay commands, iterative debugging).
+    # The next run's setup pkill refreshes it; VM snapshot reverts clean it
+    # up for good. A leftover rsbeacon on a throwaway beacon VM is harmless.
 
 
 # ---------------------------------------------------------------------------
