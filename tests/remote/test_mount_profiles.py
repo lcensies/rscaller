@@ -54,7 +54,7 @@ def _rsc_exec(client: str, beacon_ip: str, beacon_port: int,
     # Use -l (lazy) only — -f is for NFS and can cause FUSE umount to fail.
     # Check /proc/mounts to only unmount if actually mounted.
     run(client,
-        f"sudo pkill -9 -f '{name}' 2>/dev/null || true; sleep 0.4; "
+        f"for p in $(pgrep -f '{name}'); do [ \"$p\" != \"$\" ] && sudo kill -9 $p 2>/dev/null || true; done; sleep 0.4; "
         f"grep -qF '{mount_point}' /proc/mounts && sudo umount -l '{mount_point}' 2>/dev/null || true; "
         f"sudo rm -rf '{mount_point}' 2>/dev/null || true")
 
@@ -70,7 +70,7 @@ def _rsc_exec(client: str, beacon_ip: str, beacon_port: int,
 
     # Post-run cleanup: rscfuse stays alive as orphan, kill and lazy-unmount.
     run(client,
-        f"sudo pkill -9 -f '{name}' 2>/dev/null || true; sleep 0.4; "
+        f"for p in $(pgrep -f '{name}'); do [ \"$p\" != \"$\" ] && sudo kill -9 $p 2>/dev/null || true; done; sleep 0.4; "
         f"grep -qF '{mount_point}' /proc/mounts && sudo umount -l '{mount_point}' 2>/dev/null || true; "
         f"sudo rm -rf '{mount_point}' 2>/dev/null || true")
 
@@ -267,7 +267,7 @@ def test_net_routing_route_arg(client, beacon_host, beacon_ip, beacon_port, rsbe
     
     run(client, f"mkdir -p '{MOUNT_BASE}'")
     run(client,
-        f"sudo pkill -9 -f '{name}' 2>/dev/null || true; sleep 0.4; "
+        f"for p in $(pgrep -f '{name}'); do [ \"$p\" != \"$\" ] && sudo kill -9 $p 2>/dev/null || true; done; sleep 0.4; "
         f"grep -qF '{mount_point}' /proc/mounts && sudo umount -l '{mount_point}' 2>/dev/null || true; "
         f"sudo rm -rf '{mount_point}' 2>/dev/null || true")
     
@@ -294,7 +294,7 @@ def test_net_routing_route_arg(client, beacon_host, beacon_ip, beacon_port, rsbe
     
     # Clean up
     run(client,
-        f"sudo pkill -9 -f '{name}' 2>/dev/null || true; sleep 0.4; "
+        f"for p in $(pgrep -f '{name}'); do [ \"$p\" != \"$\" ] && sudo kill -9 $p 2>/dev/null || true; done; sleep 0.4; "
         f"grep -qF '{mount_point}' /proc/mounts && sudo umount -l '{mount_point}' 2>/dev/null || true")
 
 

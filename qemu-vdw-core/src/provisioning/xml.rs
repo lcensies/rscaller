@@ -7,9 +7,13 @@ use super::ProvisionRequest;
 pub(super) fn build_domain_xml(name: &str, req: &ProvisionRequest) -> String {
     let mut disks = disk_xml(&req.disk_image, "vda");
     if let Some(device) = &req.passthrough_device {
-        // Paths under /rsc/ are FUSE-proxied beacon devices; present them as
-        // file-backed raw disks so QEMU does buffered I/O through rscfuse.
-        let is_fuse = device.to_string_lossy().starts_with("/rsc/");
+        // FUSE-proxied beacon devices must be presented as file-backed raw
+        // disks so QEMU does buffered I/O through rscfuse (host_device/block
+        // sources issue ioctls FUSE cannot serve). Paths under /rsc/ are
+        // always FUSE; otherwise check /proc/mounts for a fuse mount covering
+        // the path (relay mode mounts rscfuse under --mount-base, e.g.
+        // /tmp/rsc-profiles/<name>/dev/vdb).
+        let is_fuse = device.to_string_lossy().starts_with("/rsc/") || is_fuse_path(device);
         disks.push_str(&passthrough_disk_xml(device, super::PASSTHROUGH_TARGET_DEV, is_fuse));
     }
 
@@ -101,6 +105,21 @@ fn passthrough_disk_xml(path: &Path, target_dev: &str, as_file: bool) -> String 
 
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+/// True when `path` sits under a fuse mount, per /proc/mounts.
+fn is_fuse_path(path: &Path) -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    let s = path.to_string_lossy();
+    mounts.lines().any(|line| {
+        let mut parts = line.split_whitespace();
+        let _src = parts.next();
+        let mount_point = parts.next().unwrap_or("");
+        let fs_type = parts.next().unwrap_or("");
+        fs_type.starts_with("fuse") && s.starts_with(mount_point)
+    })
 }
 
 fn xml_escape(input: &str) -> String {

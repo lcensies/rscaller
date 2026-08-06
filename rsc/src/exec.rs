@@ -314,11 +314,35 @@ fn launch_rscfuse(
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
+    // Built pre-fork: allocating in the forked child of a multithreaded
+    // process can deadlock on the malloc lock.
+    let devnull = CString::new("/dev/null").unwrap();
+    let logpath = CString::new("/tmp/rscfuse.log").unwrap();
+
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => bail!("fork for rscfuse failed: {}", std::io::Error::last_os_error()),
         0 => {
-            unsafe { libc::execvpe(argv_ptrs[0], argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
+            // Detach from the parent's stdio: rsc is often run over ssh, and an
+            // orphaned rscfuse inheriting ssh's pipes keeps the session open
+            // forever. stdin ← /dev/null, stdout/stderr → /tmp/rscfuse.log.
+            unsafe {
+                libc::setsid();
+                let dn = libc::open(devnull.as_ptr(), libc::O_RDWR);
+                if dn >= 0 {
+                    libc::dup2(dn, libc::STDIN_FILENO);
+                }
+                let lg = libc::open(
+                    logpath.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                    0o644,
+                );
+                if lg >= 0 {
+                    libc::dup2(lg, libc::STDOUT_FILENO);
+                    libc::dup2(lg, libc::STDERR_FILENO);
+                }
+                libc::execvpe(argv_ptrs[0], argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+            }
             eprintln!("rsc: exec rscfuse failed: {}", std::io::Error::last_os_error());
             std::process::exit(1);
         }

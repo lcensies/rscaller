@@ -161,7 +161,10 @@ inside the VM, invisible to host EDR.
   `AllowOther` the QEMU process user gets EACCES.
 - FUSE-backed disks in the VM XML use `type='file'` + `cache='writeback'`
   (`qemu-vdw-core/src/provisioning/xml.rs`); QEMU's `host_device` driver issues ioctls
-  FUSE cannot serve, and `cache='none'` implies O_DIRECT.
+  FUSE cannot serve, and `cache='none'` implies O_DIRECT. FUSE detection: `/rsc/` prefix
+  OR a fuse mount covering the path in `/proc/mounts` (relay passes mount-base paths
+  like `/tmp/rsc-profiles/<name>/dev/vdb` — prefix-only matching silently emits a block
+  disk and the domain fails to start).
 - Device auto-discovery (`relay.rs`) reads the beacon's `/proc/mounts` via FUSE and
   resolves the root device — LVM-aware (`/dev/mapper/<vg>-<lv>` → PV via sysfs slaves,
   mounted in the guest through `vgchange -ay`). Name-pattern `/dev/` scan is only the
