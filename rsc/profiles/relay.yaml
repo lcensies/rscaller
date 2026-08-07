@@ -1,5 +1,5 @@
 name: relay
-description: "Network relay — socket/connect/bind forwarded through beacon, no filesystem overlay"
+description: "Network relay — INET socket family forwarded through beacon, no filesystem overlay"
 mounts: []
 forward:
   - name: network
@@ -14,3 +14,28 @@ forward:
       - recvmsg
       - getsockopt
       - setsockopt
+      - getsockname
+      - getpeername
+      - shutdown
+    filter:
+      # Full relay: every INET/INET6 socket is created on the beacon and all
+      # its control-plane ops run there; data flows via the socket-proxy.
+      # Non-INET domains and fds the beacon doesn't own stay local (enforced
+      # in rsclient's dispatch). Caveat: DNS to a loopback stub resolver
+      # (127.0.0.53) is serviced by the BEACON's resolver.
+      default_direction: REMOTE
+
+  # read/write/close/poll/ppoll on beacon-owned (virtual-range) socket fds —
+  # the relay data plane when the socket proxy is disabled
+  # (RSC_SOCKET_PROXY=0). Ordinary local fds are below the virtual range and
+  # never intercepted (the check is in the seccomp BPF filter itself).
+  - name: socket-fd-ops
+    syscalls:
+      - read
+      - write
+      - close
+      - poll
+      - ppoll
+      - fcntl
+    filter:
+      fd_range: virtual

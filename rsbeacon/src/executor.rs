@@ -94,6 +94,25 @@ fn execute_syscall_direct(req: &SyscallRequest) -> SyscallResponse {
         args[*arg_idx as usize] = buf.as_mut_ptr() as u64;
     }
 
+    // poll/ppoll: the pollfds in the arg0 buffer reference the TRACEE's
+    // fds; socket fds the client shifted into the virtual range
+    // (>= VIRTUAL_FD_BASE, see rsclient's relay) must be translated back to
+    // the beacon's real fd numbers before the kernel call, and restored
+    // afterwards so the tracee gets its own fds back in the result.
+    let mut translated_pollfds: Vec<(usize, i32)> = Vec::new();
+    if matches!(num, 7 | 271) {
+        if let Some((_, buf)) = local_bufs.iter_mut().find(|(i, _)| *i == 0) {
+            for (idx, c) in buf.chunks_exact_mut(8).enumerate() {
+                let fd = i32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
+                if fd as i64 >= rscaller_proto::types::VIRTUAL_FD_BASE {
+                    translated_pollfds.push((idx, fd));
+                    let real = (fd as i64 - rscaller_proto::types::VIRTUAL_FD_BASE) as i32;
+                    c[0..4].copy_from_slice(&real.to_ne_bytes());
+                }
+            }
+        }
+    }
+
     debug!("Executing syscall {} with args {:?}", num, args);
 
     // Safety: intentionally executing arbitrary syscalls as directed by rsclient.
@@ -110,7 +129,32 @@ fn execute_syscall_direct(req: &SyscallRequest) -> SyscallResponse {
         )
     };
 
-    debug!("Syscall {} returned {} (errno={})", num, ret, unsafe { *libc::__errno_location() });
+    // libc::syscall reports failure as ret == -1 with the reason in errno.
+    // The tracee's syscall ABI expects the kernel convention (-errno in the
+    // return register) — forwarding a literal -1 would turn every failure
+    // (including benign EINPROGRESS/EAGAIN from non-blocking sockets, which
+    // curl relies on) into EPERM.
+    let ret = if ret == -1 {
+        let errno = unsafe { *libc::__errno_location() };
+        debug!("Syscall {} failed: errno={}", num, errno);
+        -(errno as i64)
+    } else {
+        ret as i64
+    };
+
+    // Restore translated pollfds to the tracee's virtual fd numbers before
+    // the out-buffers are collected below.
+    if !translated_pollfds.is_empty() {
+        if let Some((_, buf)) = local_bufs.iter_mut().find(|(i, _)| *i == 0) {
+            for (idx, orig_fd) in translated_pollfds {
+                buf.chunks_exact_mut(8)
+                    .nth(idx)
+                    .expect("pollfd index")
+                    [0..4]
+                    .copy_from_slice(&orig_fd.to_ne_bytes());
+            }
+        }
+    }
 
     // Collect OUT/INOUT results from the local buffers (must happen before
     // local_bufs is dropped so the raw pointers we passed remain valid for
@@ -131,7 +175,7 @@ fn execute_syscall_direct(req: &SyscallRequest) -> SyscallResponse {
 
     SyscallResponse {
         slot_idx: req.slot_idx,
-        ret: ret as i64,
+        ret,
         out_bufs,
     }
 }

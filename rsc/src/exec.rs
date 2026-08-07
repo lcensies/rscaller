@@ -233,12 +233,15 @@ fn run_seccomp(args: ExecArgs) -> Result<()> {
             eprintln!("rsc: received seccomp notify fd {}", notify_fd);
 
             let cgroup_gated = mount_profile.cgroup_gated_nrs();
+            let (net_routes, route_default) = mount_profile.net_route_args();
             exec_rsclient(
                 &args.transport.rsclient_bin(),
                 &args.transport,
                 notify_fd,
                 session_cgroup.as_deref(),
                 &cgroup_gated,
+                &net_routes,
+                route_default,
             );
         }
     }
@@ -530,6 +533,8 @@ fn exec_rsclient(
     notify_fd: libc::c_int,
     session_cgroup: Option<&str>,
     cgroup_gated_nrs: &[u32],
+    net_routes: &[String],
+    route_default: Option<&str>,
 ) -> ! {
     let mut argv_strs = vec![
         rsclient_bin.to_string(),
@@ -557,6 +562,14 @@ fn exec_rsclient(
             argv_strs.push("--cgroup-gated-nrs".into());
             argv_strs.push(nrs);
         }
+    }
+    for route in net_routes {
+        argv_strs.push("--route".into());
+        argv_strs.push(route.clone());
+    }
+    if let Some(d) = route_default {
+        argv_strs.push("--route-default".into());
+        argv_strs.push(d.to_string());
     }
 
     let argv: Vec<CString> = argv_strs

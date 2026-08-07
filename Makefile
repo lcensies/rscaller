@@ -142,7 +142,12 @@ deploy-beacon: deploy
 	 ssh ubuntu@$$BEACON_IP "sudo pkill -f rsbeacon 2>/dev/null; sleep 0.3; true" 2>/dev/null || true; \
 	 echo "==> Copying rsbeacon from $(REMOTE) to ubuntu@$$BEACON_IP:$(BEACON_BIN_REMOTE)"; \
 	 scp $(REMOTE):/home/ubuntu/rscaller/target/release/rsbeacon \
-	     ubuntu@$$BEACON_IP:$(BEACON_BIN_REMOTE)
+	     ubuntu@$$BEACON_IP:$(BEACON_BIN_REMOTE); \
+	 echo "==> Copying rsc/rsclient to ubuntu@$$BEACON_IP (same-host relay PoC)"; \
+	 ssh ubuntu@$$BEACON_IP "mkdir -p /home/ubuntu/rscaller/target/release"; \
+	 scp $(REMOTE):/home/ubuntu/rscaller/target/release/rsc \
+	     $(REMOTE):/home/ubuntu/rscaller/target/release/rsclient \
+	     ubuntu@$$BEACON_IP:/home/ubuntu/rscaller/target/release/
 
 # Full two-VM deploy: build on REMOTE, push rsbeacon to BEACON_VM, open ghost shell.
 deploy-all: deploy-beacon

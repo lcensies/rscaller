@@ -159,6 +159,38 @@ impl MountProfile {
             .flat_map(|r| r.syscall_nrs())
             .collect()
     }
+
+    /// The forward rules' network routing policy as rsclient CLI values:
+    /// (`--route` strings in rule order, optional `--route-default` value).
+    pub fn net_route_args(&self) -> (Vec<String>, Option<&'static str>) {
+        let mut routes = Vec::new();
+        let mut default = None;
+        for rule in &self.forward {
+            let Some(filter) = rule.filter.as_ref() else { continue };
+            if let Some(rs) = filter.net_routes.as_ref() {
+                for r in rs {
+                    let mut s = r.subnet.clone();
+                    if let Some(p) = r.port.filter(|p| *p != 0) {
+                        s.push_str(&format!(":{p}"));
+                    }
+                    let dir = match r.direction {
+                        NetRouteDirection::Local => "local",
+                        NetRouteDirection::Remote => "remote",
+                    };
+                    routes.push(format!("{s}={dir}"));
+                }
+            }
+            if default.is_none() {
+                if let Some(d) = filter.default_direction.as_ref() {
+                    default = Some(match d {
+                        NetRouteDirection::Local => "local",
+                        NetRouteDirection::Remote => "remote",
+                    });
+                }
+            }
+        }
+        (routes, default)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +266,13 @@ pub struct ForwardFilter {
     /// First match wins. Applies to `connect()` and `sendto()` syscalls.
     #[serde(default)]
     pub net_routes: Option<Vec<NetRoute>>,
+    /// Direction for network syscalls that carry no matchable destination
+    /// (`socket`/`bind`/`listen`/...), and for `connect`/`sendto` matching no
+    /// route. Absent = LOCAL. REMOTE turns the rule into a full relay:
+    /// every INET/INET6 socket is created on the beacon and all its
+    /// control-plane ops are serviced there (relay profile).
+    #[serde(default)]
+    pub default_direction: Option<NetRouteDirection>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -618,6 +657,25 @@ forward:
         assert_eq!(cfg.vcpus, DEFAULT_RELAY_VCPUS); // untouched field keeps default
         let plain: MountProfile = serde_yaml::from_str("name: t\n").unwrap();
         assert!(plain.relay.is_none());
+    }
+
+    #[test]
+    #[test]
+    fn forward_filter_default_direction_and_route_args() {
+        let p: MountProfile = serde_yaml::from_str(
+            "name: t\nforward:\n  - syscalls: [socket, connect]\n    filter:\n      default_direction: REMOTE\n      net_routes:\n        - subnet: 10.0.0.0/8\n          port: 443\n          direction: LOCAL\n",
+        )
+        .unwrap();
+        let (routes, default) = p.net_route_args();
+        assert_eq!(routes, vec!["10.0.0.0/8:443=local".to_string()]);
+        assert_eq!(default, Some("remote"));
+    }
+
+    #[test]
+    fn builtin_relay_profile_defaults_remote() {
+        let profile = builtin_preset("relay").expect("relay preset exists");
+        let (_, default) = profile.net_route_args();
+        assert_eq!(default, Some("remote"));
     }
 
     #[test]

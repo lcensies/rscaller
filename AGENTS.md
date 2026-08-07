@@ -62,7 +62,9 @@ khook stub), `use_count` leaks and rmmod hangs. The test script enforces:
 
 ### Two-VM topology
 - **dev-vm-1** — rsc client (build host): full Rust workspace built here via `deploy.sh`
-- **dev-vm-2** — beacon host: receives only the `rsbeacon` binary (scp'd from dev-vm-1)
+ - **dev-vm-2** — beacon host: receives `rsbeacon` (at `~/rsbeacon`) plus `rsc`/`rsclient`
+   (at `~/rscaller/target/release/`, for the same-host relay PoC — `poc.sh --scenario network-local`),
+   all scp'd from dev-vm-1
 
 ### Dependency: `libfuse3-dev`
 `deploy.sh` installs `libfuse3-dev` on dev-vm-1 automatically. rscfuse is now a library
@@ -73,6 +75,14 @@ Required by the `smoltcp-xdp` rsbeacon network backend (compiling `bpf/*.c` to B
 bytecode and loading/inspecting XDP programs). Installed by `scripts/bootstrap.sh`'s
 `PKGS` array — **never `apt-get install` these by hand on a dev VM**; add the package to
 `bootstrap.sh` instead so provisioning stays idempotent and reproducible from a clean VM.
+
+### smoltcp-xdp: `--xdp-ip` must differ from the iface's kernel IP
+The XDP program redirects by destination address (`filter_config` map holds smoltcp's
+own IPv4). If smoltcp shares the kernel's address, its ARP redirect steals the host's
+ARP resolutions and the host becomes unreachable within minutes (killed dev-vm-2 once —
+needed `virsh reboot`). `rsbeacon` refuses that config; always pass a distinct,
+unused on-subnet `--xdp-ip` (PoC default: 192.168.122.250). Rebuild `xdp_prog.o` on
+dev-vm-1 with the clang command in `rsbeacon/bpf/xdp_prog.c`'s header.
 
 ### Never hand-install packages on dev VMs — fix the harness instead
 If a dev VM is missing a system package (build tool, library, etc.), **do not**

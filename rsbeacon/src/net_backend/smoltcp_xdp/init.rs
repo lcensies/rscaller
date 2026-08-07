@@ -75,12 +75,28 @@ pub fn init(config: XdpConfig) -> Result<Arc<dyn NetBackend>> {
         .local_mac(iface)
         .with_context(|| format!("detecting MAC address of interface '{iface}'"))?;
 
+    let kernel_ip = info.local_ipv4(iface).ok();
+
     let local_ip = match config.ip {
         Some(ip) => Ipv4Address::from(ip),
         None => info.local_ipv4(iface).with_context(|| {
             format!("auto-detecting IPv4 address of interface '{iface}' (pass --xdp-ip to override)")
         })?,
     };
+
+    // smoltcp MUST own a distinct IPv4 on a shared interface. The XDP
+    // program redirects ARP/ICMP/TCP/UDP by destination address; if the
+    // smoltcp address equals the kernel's, every ARP resolution for the
+    // host gets stolen, the host's neighbors' caches expire, and the host
+    // becomes unreachable (observed on dev-vm-2: SSH + outbound died
+    // minutes after attach). Refuse that configuration.
+    if kernel_ip == Some(local_ip) {
+        anyhow::bail!(
+            "smoltcp-xdp address {local_ip} equals interface '{iface}'s kernel address; \
+             pass a distinct --xdp-ip on the same subnet (sharing the kernel address \
+             lets the XDP program steal the host's ARP and kills host networking)"
+        );
+    }
 
     let prefix_len = match config.prefix {
         Some(p) => p,
@@ -111,6 +127,13 @@ pub fn init(config: XdpConfig) -> Result<Arc<dyn NetBackend>> {
 
     let mut xdp_program = XdpProgram::load_and_attach(iface)
         .with_context(|| format!("loading/attaching XDP program to interface '{iface}'"))?;
+
+    xdp_program
+        // `octets()` are wire order; the BPF program compares against the
+        // raw in-packet __u32, so store them exactly as they appear on the
+        // wire (native-endian load of the 4 octets).
+        .set_local_ip(u32::from_ne_bytes(local_ip.octets()))
+        .context("arming XDP redirect filter with smoltcp's IPv4 address")?;
 
     let xsk = XdpSocket::bind(ifindex, config.queue)
         .with_context(|| format!("binding AF_XDP socket to '{iface}' queue {}", config.queue))?;

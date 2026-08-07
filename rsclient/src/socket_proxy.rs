@@ -147,22 +147,73 @@ async fn proxy_loop(local: tokio::net::UnixStream, virtual_fd: i64, cfg: ProxyCo
     debug!(virtual_fd, "socket-proxy: connected");
     let conn = std::sync::Arc::new(tokio::sync::Mutex::new(SharedConn { r, w }));
 
+    // Half-close semantics: the tracee may shutdown(WR) (or close its
+    // read side of the pair) and STILL expect the response tail — HTTP/2
+    // teardown does exactly this (GOAWAY then final frames). So outbound
+    // ending must NOT stop the inbound reader: inbound ends on server
+    // FIN (ret=0), on EBADF (fd gone), or via `stop` from the inbound
+    // side itself. The fd-reuse zombie risk this leaves is bounded by the
+    // server's close latency after our shutdown(WR), not unbounded.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let local_fd = {
+        use std::os::unix::io::AsRawFd;
+        local.as_raw_fd()
+    };
     let (mut local_r, mut local_w) = tokio::io::split(local);
 
-    let outbound = async {
-        let mut buf = vec![0u8; CHUNK];
-        loop {
-            let n = match local_r.read(&mut buf).await {
-                Ok(0) => break, // tracee closed / shutdown(WR) its end
-                Ok(n) => n,
-                Err(e) => {
-                    debug!(virtual_fd, error = %e, "socket-proxy: local read error");
+    let outbound = {
+        let stop = stop.clone();
+        let conn = conn.clone();
+        async move {
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-            };
-            loop {
-                match roundtrip(&conn, write_req(virtual_fd, &buf[..n])).await {
-                    Ok(resp) if resp.ret >= 0 => break,
+                let n = match local_r.read(&mut buf).await {
+                    Ok(0) => {
+                        // Read-side EOF: tracee shutdown(WR) or closed.
+                        // Disambiguate via poll revents on the pair fd:
+                        // POLLRDHUP without POLLHUP = half-close — the
+                        // tracee still reads (HTTP/2 teardown does this),
+                        // so the inbound reader must stay alive for the
+                        // response tail. Full close (POLLHUP, or a reset
+                        // below) means nobody will read again — stop
+                        // inbound, or it becomes a zombie that can steal
+                        // data once the beacon kernel reuses the fd number.
+                        let mut pfd = libc::pollfd {
+                            fd: local_fd,
+                            events: 0,
+                            revents: 0,
+                        };
+                        unsafe { libc::poll(&mut pfd, 1, 0) };
+                        let half_close = pfd.revents & libc::POLLRDHUP != 0
+                            && pfd.revents & libc::POLLHUP == 0;
+                        if !half_close {
+                            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        break;
+                    }
+                    Ok(n) => n,
+                    Err(e) => {
+                        debug!(virtual_fd, error = %e, "socket-proxy: local read error");
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                };
+            // sendto may report a SHORT write (ret < len) — retry the
+            // remaining tail, or the peer sees a truncated stream.
+            let mut sent = 0usize;
+            while sent < n {
+                match roundtrip(&conn, write_req(virtual_fd, &buf[sent..n])).await {
+                    Ok(resp) if resp.ret > 0 => {
+                        sent += resp.ret as usize;
+                    }
+                    // Zero-length write: no progress, treat like EAGAIN.
+                    Ok(resp) if resp.ret == 0 => {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    }
                     // EAGAIN (send buffer full) and ENOTCONN (this write
                     // raced ahead of the tracee's own connect() — same
                     // startup race as the inbound loop's first read, see
@@ -174,19 +225,28 @@ async fn proxy_loop(local: tokio::net::UnixStream, virtual_fd: i64, cfg: ProxyCo
                     }
                     Ok(resp) => {
                         debug!(virtual_fd, ret = resp.ret, "socket-proxy: remote write failed, stopping outbound");
-                        return;
+                        break;
                     }
                     Err(e) => {
                         warn!(virtual_fd, error = %e, "socket-proxy: outbound roundtrip failed");
-                        return;
+                        break;
                     }
                 }
             }
+            }
+            // Outbound ended (tracee closed/shut its write side) — do NOT
+            // touch `stop`: inbound may still be delivering the response
+            // tail (half-close). Inbound ends on server EOF/EBADF.
         }
     };
 
     let inbound = async {
+        let mut total_read = 0u64;
+        let mut total_written = 0u64;
         loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             let resp = match roundtrip(&conn, read_req(virtual_fd, CHUNK)).await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -222,10 +282,28 @@ async fn proxy_loop(local: tokio::net::UnixStream, virtual_fd: i64, cfg: ProxyCo
                 .find(|b| b.arg_idx == 1)
                 .map(|b| b.data.as_slice())
                 .unwrap_or(&[]);
-            if local_w.write_all(data).await.is_err() {
-                break;
+            // The out buffer is allocated at the full requested size —
+            // recvfrom's ret is how much the kernel actually wrote.
+            // Writing the whole buffer would inject a zero tail (or stale
+            // bytes) into the stream whenever a short read occurs.
+            let n = (resp.ret as usize).min(data.len());
+            total_read += resp.ret as u64;
+            if n < resp.ret as usize {
+                warn!(virtual_fd, ret = resp.ret, buf = data.len(), "socket-proxy: SHORT BUFFER, dropping bytes");
+            }
+            match local_w.write_all(&data[..n]).await {
+                Ok(()) => {
+                    total_written += n as u64;
+                    debug!(virtual_fd, n, total_read, total_written, "socket-proxy: pair write");
+                }
+                Err(e) => {
+                    warn!(virtual_fd, error = %e, total_read, total_written, "socket-proxy: pair write failed");
+                    break;
+                }
             }
         }
+        // Remote EOF/error — outbound has nothing left to do either.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         // Signal EOF to the tracee's own read() calls.
         let _ = local_w.shutdown().await;
     };

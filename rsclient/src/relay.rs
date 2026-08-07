@@ -151,14 +151,19 @@ impl NetFilter {
     /// `sa_bytes`: the raw sockaddr bytes already read from tracee memory
     /// (i.e. `in_data` for connect arg 1, sendto arg 4).
     pub fn route(&self, nr: u64, sa_bytes: Option<&[u8]>) -> NetRouteDirection {
-        // Only route connect and sendto.
+        // Only connect/sendto carry a matchable destination; every other
+        // syscall takes the default direction (LOCAL unless configured —
+        // the relay profile sets REMOTE so socket()/bind()/... are serviced
+        // by the beacon too).
         if nr != 42 && nr != 44 {
-            return NetRouteDirection::Local;
+            return self.default_direction;
         }
 
-        // If no sockaddr data, default to LOCAL.
+        // No sockaddr (e.g. sendto on an already-connected socket): take
+        // the default direction — with default REMOTE the socket is
+        // beacon-owned, so its data plane must be forwarded too.
         let Some(sa) = sa_bytes else {
-            return NetRouteDirection::Local;
+            return self.default_direction;
         };
 
         // Parse sockaddr_in: u16 family + u16 port_be + u32 addr_be
@@ -306,6 +311,13 @@ where
     /// `connect`/`listen` complete — see `socket_proxy::spawn_proxy`'s doc
     /// for why starting the proxy is deferred that long.
     pending_proxies: HashMap<i32, PendingProxy>,
+    /// Virtual fds this relay shifted into the virtual range itself
+    /// (direct backend returns the beacon's raw fd for `socket`/`accept4`;
+    /// the seccomp fd gate only recognizes fds >= VIRTUAL_FD_BASE, so the
+    /// tracee is handed `raw + VIRTUAL_FD_BASE`). Used to translate back
+    /// on the way out. smoltcp-xdp fds are born in-range and never appear
+    /// here.
+    offset_fds: std::collections::HashSet<i64>,
 }
 
 impl<C, R, W> Relay<C, R, W>
@@ -324,6 +336,7 @@ where
             proxy_cfg: None,
             proxy_fds: HashMap::new(),
             pending_proxies: HashMap::new(),
+            offset_fds: std::collections::HashSet::new(),
         }
     }
 
@@ -439,6 +452,39 @@ where
             }
         }
 
+        // ── Socket-family scoping ─────────────────────────────────────────
+        // socket(): only INET/INET6 domains can be serviced by the beacon —
+        // AF_UNIX/AF_NETLINK/... always stay local, regardless of routing
+        // policy (forwarding them would create the socket on the beacon's
+        // kernel/filesystem, breaking local consumers like nscd).
+        if nr == 41 {
+            let domain = notif.args[0] as i32;
+            if domain != libc::AF_INET && domain != libc::AF_INET6 {
+                debug!(id, nr, domain, "socket: non-INET domain, continuing locally");
+                self.controller.continue_syscall(id).await?;
+                return Ok(());
+            }
+        }
+
+        // fd-first-arg socket ops (connect/bind/listen/send/recv-family/...):
+        // only forward when the fd is beacon-owned (a proxied real fd or a
+        // bare virtual-range fd). Anything else is a genuinely local fd —
+        // forwarding its number to the beacon would operate on an unrelated
+        // beacon-side fd. With the default-LOCAL policy this is a no-op
+        // (routing already continues them); it matters once a profile sets
+        // default REMOTE (relay).
+        const FD_ARG_SOCKET_NRS: [u64; 14] = [42, 44, 45, 46, 47, 48, 49, 50, 51, 52, 54, 55, 72, 288];
+        if FD_ARG_SOCKET_NRS.contains(&nr) {
+            let fd = notif.args[0] as i64;
+            let beacon_owned =
+                self.proxy_fds.contains_key(&(fd as i32)) || fd >= rscaller_proto::types::VIRTUAL_FD_BASE;
+            if !beacon_owned {
+                debug!(id, nr, fd, "socket op on local fd, continuing locally");
+                self.controller.continue_syscall(id).await?;
+                return Ok(());
+            }
+        }
+
         // ── Network routing ───────────────────────────────────────────────
         // For connect(42): sockaddr is arg 1.
         // For sendto(44):  sockaddr is arg 4 (may be null for connected sockets).
@@ -487,17 +533,39 @@ where
         // existing behavior unchanged (rsbeacon's own `parse_owned_pollfds`
         // requires every fd to be virtual-and-tracked to claim it either).
         if matches!(nr, 7 | 271) {
-            if let Some(raw) = notif.in_data.iter().find(|b| b.arg_idx == 0).map(|b| &b.data) {
+            // poll/ppoll: forward ONLY when every fd in the array is a
+            // bare beacon virtual fd (unproxied path). All-proxied
+            // (socketpair) and all-local arrays are handled by the local
+            // kernel; an unparsable/empty array is continued locally too —
+            // forwarding it would make the beacon poll an unrelated fd of
+            // its own, potentially blocking the relay lane for the poll's
+            // full (possibly infinite) timeout.
+            let raw = notif.in_data.iter().find(|b| b.arg_idx == 0).map(|b| &b.data);
+            let mut action = Some(()); // Some = continue locally
+            if let Some(raw) = raw {
                 if !raw.is_empty() && raw.len() % 8 == 0 {
-                    let all_proxied = raw
-                        .chunks_exact(8)
-                        .all(|c| self.proxy_fds.contains_key(&i32::from_ne_bytes([c[0], c[1], c[2], c[3]])));
-                    if all_proxied {
-                        debug!(id, nr, "socket-proxy: continuing poll/ppoll locally (all fds real)");
-                        self.controller.continue_syscall(id).await?;
-                        return Ok(());
+                    let (mut proxied, mut virtual_, mut local) = (0usize, 0usize, 0usize);
+                    for c in raw.chunks_exact(8) {
+                        let fd = i32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
+                        if self.proxy_fds.contains_key(&fd) {
+                            proxied += 1;
+                        } else if self.offset_fds.contains(&(fd as i64))
+                            || fd as i64 >= rscaller_proto::types::VIRTUAL_FD_BASE
+                        {
+                            virtual_ += 1;
+                        } else {
+                            local += 1;
+                        }
+                    }
+                    if proxied == 0 && local == 0 && virtual_ > 0 {
+                        action = None; // all beacon-owned virtual → forward
                     }
                 }
+            }
+            if action.is_some() {
+                debug!(id, nr, "continuing poll/ppoll locally");
+                self.controller.continue_syscall(id).await?;
+                return Ok(());
             }
         } else if let Some(&virtual_fd) = self.proxy_fds.get(&(notif.args[0] as i32)) {
             match nr {
@@ -511,7 +579,7 @@ where
                 }
                 // Control-plane ops: rsbeacon must actually service these
                 // against the virtual fd — translate before relaying.
-                42 | 49 | 50 | 54 | 55 | 288 => {
+                42 | 48 | 49 | 50 | 51 | 52 | 54 | 55 | 288 => {
                     debug!(id, nr, real_fd = notif.args[0], virtual_fd, "socket-proxy: translating fd");
                     notif.args[0] = virtual_fd as u64;
                 }
@@ -521,6 +589,22 @@ where
 
         // ── Forward to beacon ─────────────────────────────────────────────
         debug!(id, nr, pid = notif.pid, "dispatching to beacon");
+
+        // Strip the virtual-range marker off beacon-owned fds before the
+        // request goes out: the beacon works with its real fd numbers.
+        // (Proxied fds were already translated to their bare virtual fd
+        // above, which is the beacon's real fd — leave those alone.)
+        const FD0_NRS: [u64; 17] = [0, 1, 3, 42, 44, 45, 46, 47, 48, 49, 50, 51, 52, 54, 55, 72, 288];
+        if FD0_NRS.contains(&nr) {
+            let fd = notif.args[0] as i64;
+            if self.offset_fds.contains(&fd) {
+                notif.args[0] = (fd - rscaller_proto::types::VIRTUAL_FD_BASE) as u64;
+                if nr == 3 {
+                    // close(): forget the mapping along with the fd.
+                    self.offset_fds.remove(&fd);
+                }
+            }
+        }
 
         let req = notification_to_request(&notif);
 
@@ -581,8 +665,23 @@ where
             .into_iter()
             .map(|b| (b.arg_idx, b.data))
             .collect();
+        // No proxy for this fresh socket fd (proxy disabled or injection
+        // failed): shift the beacon's raw fd into the virtual range so the
+        // seccomp fd gate recognizes it as beacon-owned on every later
+        // syscall. Only direct-backend fds (< VIRTUAL_FD_BASE) need this;
+        // smoltcp-xdp hands out in-range fds already.
+        let ret = if matches!(nr, 41 | 288)
+            && resp.ret >= 0
+            && resp.ret < rscaller_proto::types::VIRTUAL_FD_BASE
+        {
+            let virtual_fd = resp.ret + rscaller_proto::types::VIRTUAL_FD_BASE;
+            self.offset_fds.insert(virtual_fd);
+            virtual_fd
+        } else {
+            resp.ret
+        };
         self.controller
-            .complete(resp.slot_idx, resp.ret, &out_bufs, &notif.args)
+            .complete(resp.slot_idx, ret, &out_bufs, &notif.args)
             .await?;
         Ok(())
     }
@@ -698,13 +797,37 @@ mod tests {
     #[test]
     fn test_netfilter_empty_routes_defaults_to_local() {
         let filter = NetFilter::from_cli(vec![]).unwrap();
-        
+
         // connect() with any address should default to LOCAL
         let sa = sockaddr_in_bytes(std::net::Ipv4Addr::new(192, 168, 1, 100), 443);
         assert_eq!(filter.route(42, Some(&sa)), NetRouteDirection::Local);
-        
+
         // sendto() with any address should default to LOCAL
         assert_eq!(filter.route(44, Some(&sa)), NetRouteDirection::Local);
+
+        // socket()/bind() (no destination) default to LOCAL
+        assert_eq!(filter.route(41, None), NetRouteDirection::Local);
+        assert_eq!(filter.route(49, None), NetRouteDirection::Local);
+    }
+
+    #[test]
+    fn test_netfilter_default_remote_covers_socket_family() {
+        // relay profile semantics: default REMOTE relays socket()/bind()/...
+        // (no destination to match) and unmatched connect() alike.
+        let mut filter = NetFilter::from_cli(vec![]).unwrap();
+        filter.default_direction = NetRouteDirection::Remote;
+
+        assert_eq!(filter.route(41, None), NetRouteDirection::Remote); // socket
+        assert_eq!(filter.route(49, None), NetRouteDirection::Remote); // bind
+        let sa = sockaddr_in_bytes(std::net::Ipv4Addr::new(140, 82, 121, 4), 443);
+        assert_eq!(filter.route(42, Some(&sa)), NetRouteDirection::Remote); // connect
+
+        // An explicit LOCAL route still wins over the REMOTE default.
+        let mut filter = NetFilter::from_cli(vec!["127.0.0.0/8=local".to_string()]).unwrap();
+        filter.default_direction = NetRouteDirection::Remote;
+        let sa = sockaddr_in_bytes(std::net::Ipv4Addr::new(127, 0, 0, 53), 53);
+        assert_eq!(filter.route(42, Some(&sa)), NetRouteDirection::Local);
+        assert_eq!(filter.route(41, None), NetRouteDirection::Remote);
     }
 
     #[test]

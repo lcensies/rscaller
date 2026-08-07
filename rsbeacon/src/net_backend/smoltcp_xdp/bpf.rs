@@ -13,6 +13,7 @@ use std::os::unix::io::RawFd;
 
 use anyhow::{Context, Result};
 use aya::maps::xdp::XskMap;
+use aya::maps::Array as AyaArray;
 use aya::maps::HashMap as AyaHashMap;
 use aya::programs::xdp::XdpMode;
 use aya::programs::Xdp;
@@ -31,6 +32,7 @@ const XDP_PROG_NAME: &str = "xdp_sock_prog";
 const XSKS_MAP_NAME: &str = "xsks_map";
 const TCP_PORTS_MAP_NAME: &str = "tcp_ports";
 const UDP_PORTS_MAP_NAME: &str = "udp_ports";
+const FILTER_CONFIG_MAP_NAME: &str = "filter_config";
 
 /// Owns the loaded/attached XDP program and its maps for the lifetime of
 /// the `smoltcp-xdp` backend. Detaches/unloads on drop.
@@ -40,6 +42,7 @@ pub struct XdpProgram {
     xsks_map: XskMap<aya::maps::MapData>,
     tcp_ports: AyaHashMap<aya::maps::MapData, u32, u8>,
     udp_ports: AyaHashMap<aya::maps::MapData, u32, u8>,
+    filter_config: AyaArray<aya::maps::MapData, u32>,
     _ebpf: Ebpf,
 }
 
@@ -79,12 +82,29 @@ impl XdpProgram {
             .try_into()
             .context("udp_ports is not a HASH map")?;
 
+        let filter_config: AyaArray<_, u32> = ebpf
+            .take_map(FILTER_CONFIG_MAP_NAME)
+            .with_context(|| format!("no map named '{FILTER_CONFIG_MAP_NAME}' in xdp_prog.o"))?
+            .try_into()
+            .context("filter_config is not an ARRAY map")?;
+
         Ok(Self {
             xsks_map,
             tcp_ports,
             udp_ports,
+            filter_config,
             _ebpf: ebpf,
         })
+    }
+
+    /// Writes the smoltcp stack's own IPv4 address (`ip_be`, network byte
+    /// order) into `filter_config[0]`, arming the XDP program's redirect
+    /// branches. Until this is called the program XDP_PASS-es everything
+    /// (fail-safe — see `bpf/xdp_prog.c`'s header).
+    pub fn set_local_ip(&mut self, ip_be: u32) -> Result<()> {
+        self.filter_config
+            .set(0, ip_be, 0)
+            .context("writing local IPv4 to filter_config map")
     }
 
     /// Registers the backend's AF_XDP socket fd into `xsks_map` at

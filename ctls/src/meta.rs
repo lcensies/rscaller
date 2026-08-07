@@ -308,6 +308,24 @@ pub fn build_table() -> HashMap<u64, SyscallMeta> {
         },
         // ── 50: listen(fd, backlog) — no pointers ────────────────────────────
         SyscallMeta { nr: 50, ptr_params: vec![] },
+        // ── 48: shutdown(fd, how) — no pointers ──────────────────────────────
+        SyscallMeta { nr: 48, ptr_params: vec![] },
+        // ── 51: getsockname(fd, addr, addrlen*) — same OUT shape as accept4 ──
+        SyscallMeta {
+            nr: 51,
+            ptr_params: vec![
+                PtrParam { idx: 2, dir: Dir::InOut, ptr_type: PtrType::Buf, size: Size::Static(4) },
+                PtrParam { idx: 1, dir: Dir::Out, ptr_type: PtrType::Buf, size: Size::FromPtrU32(2) },
+            ],
+        },
+        // ── 52: getpeername(fd, addr, addrlen*) — same as getsockname ────────
+        SyscallMeta {
+            nr: 52,
+            ptr_params: vec![
+                PtrParam { idx: 2, dir: Dir::InOut, ptr_type: PtrType::Buf, size: Size::Static(4) },
+                PtrParam { idx: 1, dir: Dir::Out, ptr_type: PtrType::Buf, size: Size::FromPtrU32(2) },
+            ],
+        },
         // ── 44: sendto(fd, buf, len, flags, dest_addr, addrlen) ──────────────
         SyscallMeta {
             nr: 44,

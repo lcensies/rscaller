@@ -7,27 +7,26 @@
 // host kernel's normal network stack (and any other traffic sharing
 // this interface, e.g. SSH) is completely unaffected.
 //
-// ARP redirect: design decision D6 (see design.md) has `smoltcp::iface
-// ::Interface` resolve neighbor MACs itself via its own ARP requests
-// sent over the AF_XDP-backed `XdpDevice`, rather than pre-seeding a
-// resolved gateway MAC the way xdplganger's gVisor bridge needed to.
-// That only works end-to-end if ingress ARP replies (and ARP requests
-// targeting smoltcp's own address) actually reach smoltcp's neighbor
-// cache — found missing in testing (task 8.x): without this branch,
-// every ARP reply is XDP_PASS-ed to the host kernel's own ARP table
-// instead, so smoltcp's neighbor cache never populates and NO outbound
-// traffic (TCP connect, UDP send, or even an ICMP echo reply, which
-// itself must resolve the request's source IP back to a destination
-// MAC) ever actually gets transmitted. Same "always redirect, no
-// per-flow tracking" treatment as ICMP, for the same reason: ARP has no
-// port to gate on, and is inherently a control-plane protocol the
-// userspace stack must see in full to function at all. Trade-off: the
-// host kernel loses ARP visibility on this interface once smoltcp-xdp
-// is active (existing kernel neighbor-cache entries, e.g. for an
-// already-connected SSH session, remain valid and unaffected; only
-// *new* kernel-side ARP resolutions on this interface would be
-// impacted) — acceptable for rscaller's disposable-beacon-VM threat
-// model, and no worse than ICMP's existing unconditional redirect.
+// filter_config: single-entry ARRAY holding the smoltcp stack's own IPv4
+// address (network byte order), written from Rust at backend init
+// (`--xdp-ip`). Every redirect branch requires the packet to target THAT
+// address — never the host kernel's address:
+//
+//   - ARP: redirected only when the target protocol address (TPA) is the
+//     smoltcp IP. ARP has no ports and smoltcp must resolve neighbor MACs
+//     itself (design D6), so it needs "who-has <smoltcp-ip>" requests and
+//     the replies to its own requests — both carry TPA == smoltcp IP.
+//     Redirecting ARP unconditionally starves the HOST kernel's ARP on a
+//     shared interface: neighbors' caches for the host expire and the
+//     host becomes unreachable (observed: SSH/curl on the VM died minutes
+//     after attach). smoltcp therefore MUST run on its own address,
+//     distinct from the interface's kernel address — enforced by backend
+//     init.
+//   - ICMP/TCP/UDP: redirected only when ip->daddr is the smoltcp IP
+//     (plus a registered destination port for TCP/UDP).
+//
+// If filter_config is unset (0), everything is XDP_PASS-ed — fail-safe,
+// the backend never steals traffic it wasn't configured for.
 //
 // Originally ported from xdplganger's bpf/xdp_prog.c
 // (../../xdplganger/bpf/xdp_prog.c) — see design decision D4 in
@@ -56,12 +55,44 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+// <linux/if_arp.h> drags in libc headers (via <linux/netdevice.h>) that
+// don't exist in a -target bpf sysroot without multilib; the one constant
+// needed is trivially defined here instead.
+#ifndef ARPHRD_ETHER
+#define ARPHRD_ETHER 1
+#endif
+// Bare ARP header — same layout as struct arphdr (ar_sha/ar_sip/... are
+// parsed manually below, so only the fixed part is declared).
+struct arphdr {
+    __u16 ar_hrd;
+    __u16 ar_pro;
+    __u8 ar_hln;
+    __u8 ar_pln;
+    __u16 ar_op;
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
     __type(key, __u32);
     __type(value, __u32);
     __uint(max_entries, 64);
 } xsks_map SEC(".maps");
+
+// filter_config[0]: the smoltcp stack's own IPv4 address, network byte
+// order. 0 = unset → XDP_PASS everything (fail-safe). See file header.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 1);
+} filter_config SEC(".maps");
+
+static __always_inline __u32 smoltcp_ip(void)
+{
+    __u32 key = 0;
+    __u32 *ip = bpf_map_lookup_elem(&filter_config, &key);
+    return ip ? *ip : 0;
+}
 
 // tcp_ports: set of local TCP ports currently owned by the smoltcp-xdp
 // backend's userspace socket table. Key = destination port in host byte
@@ -93,14 +124,41 @@ int xdp_sock_prog(struct xdp_md *ctx)
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
-    if (eth->h_proto == bpf_htons(ETH_P_ARP))
+    __u32 local_ip = smoltcp_ip();
+    if (local_ip == 0)
+        return XDP_PASS;
+
+    if (eth->h_proto == bpf_htons(ETH_P_ARP)) {
+        // Ethernet/IPv4 ARP: redirect only when the TARGET protocol
+        // address is smoltcp's IP (requests for it, and replies to its
+        // own requests — a reply swaps sender/target, so both match on
+        // TPA). Host-kernel ARP (TPA == host IP) is XDP_PASS-ed.
+        struct arphdr *arp = (void *)(eth + 1);
+        if ((void *)(arp + 1) > data_end)
+            return XDP_PASS;
+        if (arp->ar_hrd != bpf_htons(ARPHRD_ETHER) ||
+            arp->ar_pro != bpf_htons(ETH_P_IP) ||
+            arp->ar_hln != ETH_ALEN || arp->ar_pln != 4)
+            return XDP_PASS;
+        // payload: sender_hw[6] sender_ip[4] target_hw[6] target_ip[4]
+        __u8 *p = (__u8 *)(arp + 1);
+        if ((void *)(p + 2 * ETH_ALEN + 2 * 4) > data_end)
+            return XDP_PASS;
+        __u32 tpa;
+        __builtin_memcpy(&tpa, p + ETH_ALEN + 4 + ETH_ALEN, 4);
+        if (tpa != local_ip)
+            return XDP_PASS;
         goto redirect;
+    }
 
     if (eth->h_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
 
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
+        return XDP_PASS;
+
+    if (ip->daddr != local_ip)
         return XDP_PASS;
 
     if (ip->protocol == IPPROTO_ICMP)
