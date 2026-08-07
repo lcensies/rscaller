@@ -57,6 +57,22 @@ pub struct PendingProxy {
     local: tokio::net::UnixStream,
     virtual_fd: i64,
     cfg: ProxyConfig,
+    /// Set once the outbound (tracee→beacon) direction has read EOF from
+    /// the pair AND finished its final write round-trip — i.e. every byte
+    /// the tracee wrote is in the beacon kernel's hands. `relay.rs` waits
+    /// on this before closing beacon fds at session teardown; without the
+    /// wait, a tracee that writes-then-exits (e.g. `cat big >&socket`)
+    /// loses whatever was still queued in the pair (~256 KiB observed).
+    drained: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PendingProxy {
+    pub fn drained_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.drained.clone()
+    }
+    pub fn virtual_fd(&self) -> i64 {
+        self.virtual_fd
+    }
 }
 
 /// Creates the socketpair for `virtual_fd` (a fd rsbeacon just allocated,
@@ -107,13 +123,14 @@ pub fn spawn_proxy(virtual_fd: i64, cfg: ProxyConfig) -> Result<(RawFd, PendingP
         }
     };
 
-    Ok((tracee_end, PendingProxy { local: tokio_sock, virtual_fd, cfg }))
+    let drained = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    Ok((tracee_end, PendingProxy { local: tokio_sock, virtual_fd, cfg, drained }))
 }
 
 /// Activates a [`PendingProxy`] — see `spawn_proxy`'s doc for when this
 /// should be called.
 pub fn start_proxy(pending: PendingProxy) {
-    tokio::spawn(proxy_loop(pending.local, pending.virtual_fd, pending.cfg));
+    tokio::spawn(proxy_loop(pending.local, pending.virtual_fd, pending.cfg, pending.drained));
 }
 
 /// One connection, shared by both directions of a single proxied socket.
@@ -135,7 +152,12 @@ async fn roundtrip(conn: &tokio::sync::Mutex<SharedConn>, req: SyscallRequest) -
     Ok(resp)
 }
 
-async fn proxy_loop(local: tokio::net::UnixStream, virtual_fd: i64, cfg: ProxyConfig) {
+async fn proxy_loop(
+    local: tokio::net::UnixStream,
+    virtual_fd: i64,
+    cfg: ProxyConfig,
+    drained: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     debug!(virtual_fd, "socket-proxy: proxy_loop starting");
     let (r, w) = match connect_beacon(cfg.beacon_addr, &cfg.conn).await {
         Ok(c) => c,
@@ -182,14 +204,18 @@ async fn proxy_loop(local: tokio::net::UnixStream, virtual_fd: i64, cfg: ProxyCo
                         // below) means nobody will read again — stop
                         // inbound, or it becomes a zombie that can steal
                         // data once the beacon kernel reuses the fd number.
+                        // POLLRDHUP must be requested in events or the
+                        // kernel never reports it; POLLHUP always is.
                         let mut pfd = libc::pollfd {
                             fd: local_fd,
-                            events: 0,
+                            events: libc::POLLRDHUP,
                             revents: 0,
                         };
                         unsafe { libc::poll(&mut pfd, 1, 0) };
                         let half_close = pfd.revents & libc::POLLRDHUP != 0
                             && pfd.revents & libc::POLLHUP == 0;
+                        debug!(virtual_fd, half_close, revents = pfd.revents,
+                            "socket-proxy: outbound EOF");
                         if !half_close {
                             stop.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -237,6 +263,9 @@ async fn proxy_loop(local: tokio::net::UnixStream, virtual_fd: i64, cfg: ProxyCo
             // Outbound ended (tracee closed/shut its write side) — do NOT
             // touch `stop`: inbound may still be delivering the response
             // tail (half-close). Inbound ends on server EOF/EBADF.
+            // Everything the tracee wrote is now flushed to the beacon —
+            // mark drained so teardown can close safely.
+            drained.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     };
 

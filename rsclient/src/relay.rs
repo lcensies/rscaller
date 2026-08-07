@@ -306,6 +306,10 @@ where
     /// Real fd (as installed in the tracee) → virtual fd (as rsbeacon
     /// knows it), for every socket currently proxied via `proxy_cfg`.
     proxy_fds: HashMap<i32, i64>,
+    /// virtual_fd → flag set once that proxy's outbound direction is fully
+    /// flushed to the beacon. Waited on in `shutdown_proxies` — see
+    /// `socket_proxy::PendingProxy::drained_flag`.
+    proxy_drained: HashMap<i64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Real fd → not-yet-started background proxy, for a socket that's
     /// been created (and had its real fd injected) but hasn't yet had its
     /// `connect`/`listen` complete — see `socket_proxy::spawn_proxy`'s doc
@@ -335,6 +339,7 @@ where
             cgroup_filter: None,
             proxy_cfg: None,
             proxy_fds: HashMap::new(),
+            proxy_drained: HashMap::new(),
             pending_proxies: HashMap::new(),
             offset_fds: std::collections::HashSet::new(),
         }
@@ -396,6 +401,35 @@ where
     /// `rsbeacon` restart, silently blocking every later connection
     /// attempt from ever completing its handshake.
     async fn shutdown_proxies(&mut self) {
+        // Drain first: the tracee is gone (its pair ends are closed), so
+        // each proxy's outbound loop sees EOF, forwards the remaining
+        // buffered bytes and sets its drained flag — but only if we give
+        // the tasks time to run. Closing the beacon fds immediately would
+        // truncate any write-then-exit transfer (observed: the final
+        // ~256 KiB of a 50 MiB write silently lost). Bounded so a wedged
+        // proxy can't hang session teardown forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if self
+                .proxy_drained
+                .values()
+                .all(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let pending = self
+                    .proxy_drained
+                    .iter()
+                    .filter(|(_, f)| !f.load(std::sync::atomic::Ordering::Relaxed))
+                    .map(|(vfd, _)| *vfd)
+                    .collect::<Vec<_>>();
+                warn!(?pending, "socket-proxy: teardown drain timed out, closing anyway");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        self.proxy_drained.clear();
         let virtual_fds: Vec<i64> = self.proxy_fds.values().copied().collect();
         for virtual_fd in virtual_fds {
             let req = SyscallRequest {
@@ -720,6 +754,7 @@ where
                 if start_immediately {
                     // `accept4()` result: already an established
                     // connection, no `connect`/`listen` to wait for.
+                    self.proxy_drained.insert(virtual_fd, pending.drained_flag());
                     socket_proxy::start_proxy(pending);
                 } else {
                     // `socket()` result: not started yet — see
@@ -748,6 +783,7 @@ where
     /// fd at all, or already started).
     fn start_pending_proxy(&mut self, real_fd: i32) {
         if let Some(pending) = self.pending_proxies.remove(&real_fd) {
+            self.proxy_drained.insert(pending.virtual_fd(), pending.drained_flag());
             socket_proxy::start_proxy(pending);
         }
     }

@@ -162,6 +162,12 @@ enum SocketEntry {
     Udp {
         handle: SocketHandle,
         local_port: Option<u16>,
+        /// Default peer recorded by connect(2). Required by real-world
+        /// callers like the glibc resolver, which connect()s a UDP socket
+        /// and then sendto()s with a NULL destination — the kernel uses
+        /// the connected peer in that case; without it we returned
+        /// EDESTADDRREQ and DNS-over-smoltcp silently died.
+        peer: Option<(smoltcp::wire::Ipv4Address, u16)>,
         nonblock: bool,
     },
 }
@@ -290,6 +296,7 @@ impl SmoltcpXdpBackend {
                 self.table.insert(SocketEntry::Udp {
                     handle,
                     local_port: None,
+                    peer: None,
                     nonblock,
                 })
             }
@@ -470,8 +477,13 @@ impl SmoltcpXdpBackend {
                     });
                     self.ports.lock().expect("ports mutex poisoned").track_udp(port);
                 }
-                let _ = remote_addr; // peer tracking handled per-datagram by sendto/recvfrom
-                let _ = remote_port;
+                // Record the default peer so a later sendto()/write() with
+                // no explicit destination uses it (kernel UDP semantics).
+                self.table.with(fd, |entry| {
+                    if let SocketEntry::Udp { peer, .. } = entry {
+                        *peer = Some((remote_addr, remote_port));
+                    }
+                });
                 ok(req, 0)
             }
             Some(Plan::Tcp { handle, local_port, nonblock }) => {
@@ -754,6 +766,18 @@ impl SmoltcpXdpBackend {
         let dest = dest_arg_idx.and_then(|idx| {
             req.in_bufs.iter().find(|b| b.arg_idx == idx).and_then(|b| parse_sockaddr_in(&b.data))
         });
+        // No explicit destination → fall back to the connect(2)ed peer,
+        // like the kernel does for UDP sendto(NULL)/write().
+        let dest = match dest {
+            Some(_) => dest,
+            None => self
+                .table
+                .with(fd, |e| match e {
+                    SocketEntry::Udp { peer, .. } => *peer,
+                    _ => None,
+                })
+                .flatten(),
+        };
 
         // See the matching comment in `recv_common`: args[3] (`flags`) is
         // only meaningful for the sendto variant (`dest_arg_idx.is_some()`)
@@ -923,8 +947,101 @@ impl SmoltcpXdpBackend {
         SyscallResponse { slot_idx: req.slot_idx, ret: 0, out_bufs }
     }
 
-    // ── fcntl() ──────────────────────────────────────────────────────
+    // ── shutdown / getsockname / getpeername ───────────────────────────
 
+    /// Builds the sockaddr_in OUT response shared by getsockname and
+    /// getpeername (arg 1 = addr, arg 2 = addrlen*).
+    fn sockaddr_out_resp(&self, req: &SyscallRequest, addr: Ipv4Address, port: u16) -> SyscallResponse {
+        let encoded = encode_sockaddr_in(addr, port);
+        let capped = match req.out_sizes.iter().find(|&&(i, _)| i == 1) {
+            Some(&(_, cap)) => encoded[..(cap as usize).min(SOCKADDR_IN_LEN)].to_vec(),
+            None => encoded.to_vec(),
+        };
+        SyscallResponse {
+            slot_idx: req.slot_idx,
+            ret: 0,
+            out_bufs: vec![
+                SyscallBuf { arg_idx: 1, data: capped },
+                SyscallBuf { arg_idx: 2, data: (SOCKADDR_IN_LEN as u32).to_ne_bytes().to_vec() },
+            ],
+        }
+    }
+
+    fn sys_getsockname(&self, req: &SyscallRequest) -> SyscallResponse {
+        let fd = req.args[0] as i64;
+        let local = self.table.with(fd, |entry| match entry {
+            SocketEntry::Tcp { handle, .. } => {
+                let mut state = self.state.lock().expect("PollState mutex poisoned");
+                state
+                    .sockets
+                    .get::<tcp::Socket>(*handle)
+                    .local_endpoint()
+                    .map(|ep| ep.port)
+            }
+            SocketEntry::TcpListener { port, .. } => Some(*port),
+            SocketEntry::TcpIdle { bound_port, .. } => *bound_port,
+            SocketEntry::Udp { local_port, .. } => *local_port,
+        });
+        match local.flatten() {
+            // glibc's getaddrinfo rfc3484 sort probe asserts the family —
+            // always answer a well-formed AF_INET sockaddr.
+            Some(port) => self.sockaddr_out_resp(req, self.local_ip, port),
+            None => self.sockaddr_out_resp(req, Ipv4Address::UNSPECIFIED, 0),
+        }
+    }
+
+    fn sys_getpeername(&self, req: &SyscallRequest) -> SyscallResponse {
+        let fd = req.args[0] as i64;
+        let peer = self.table.with(fd, |entry| match entry {
+            SocketEntry::Tcp { handle, .. } => {
+                let mut state = self.state.lock().expect("PollState mutex poisoned");
+                state
+                    .sockets
+                    .get::<tcp::Socket>(*handle)
+                    .remote_endpoint()
+                    .and_then(|ep| match ep.addr {
+                        IpAddress::Ipv4(a) => Some((a, ep.port)),
+                        _ => None,
+                    })
+            }
+            SocketEntry::Udp { peer, .. } => *peer,
+            _ => None,
+        });
+        match peer.flatten() {
+            Some((addr, port)) => self.sockaddr_out_resp(req, addr, port),
+            None => err(req, libc::ENOTCONN),
+        }
+    }
+
+    /// shutdown(fd, how) — smoltcp TCP has only full close(); any `how`
+    /// closes the send side (FIN), which is what relay teardown paths use
+    /// it for. UDP: success iff a peer is connected (kernel semantics),
+    /// no wire effect.
+    fn sys_shutdown(&self, req: &SyscallRequest) -> SyscallResponse {
+        let fd = req.args[0] as i64;
+        let outcome = self.table.with(fd, |entry| match entry {
+            SocketEntry::Tcp { handle, .. } => {
+                let mut state = self.state.lock().expect("PollState mutex poisoned");
+                state.sockets.get_mut::<tcp::Socket>(*handle).close();
+                Some(())
+            }
+            SocketEntry::Udp { peer, .. } => {
+                if peer.is_some() {
+                    Some(())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        });
+        match outcome {
+            Some(Some(())) => ok(req, 0),
+            Some(None) => err(req, libc::ENOTCONN),
+            None => err(req, libc::EBADF),
+        }
+    }
+
+    // ── fcntl() ──────────────────────────────────────────────────────
     /// `fcntl(fd, cmd, arg)` for a beacon-owned virtual fd. Only
     /// `F_GETFL`/`F_SETFL` have concrete meaning for a socket in this
     /// backend (toggling/reading `O_NONBLOCK` — see `SocketEntry::nonblock`);
@@ -1151,6 +1268,14 @@ impl NetBackend for SmoltcpXdpBackend {
             // `handle` are ever called out of step in a future refactor).
             41 => req.args[0] as i32 == libc::AF_INET,
             42 | 49 | 50 | 44 | 45 | 54 | 55 | 288 => true,
+            // fd-carrying socket ops: claim only fds this backend owns —
+            // otherwise the raw virtual fd would reach the beacon kernel
+            // (EBADF at best). Missing 51 here crashed glibc's
+            // getaddrinfo rfc3484 sort probe with a fatal assert.
+            48 | 51 | 52 => {
+                let fd = req.args[0] as i64;
+                SocketTable::<SocketEntry>::is_virtual_fd(fd) && self.table.contains(fd)
+            }
             0 | 1 | 3 | 72 | 16 => {
                 let fd = req.args[0] as i64;
                 SocketTable::<SocketEntry>::is_virtual_fd(fd) && self.table.contains(fd)
@@ -1173,6 +1298,9 @@ impl NetBackend for SmoltcpXdpBackend {
             45 => self.sys_recvfrom(req),
             54 => self.sys_setsockopt(req),
             55 => self.sys_getsockopt(req),
+            48 => self.sys_shutdown(req),
+            51 => self.sys_getsockname(req),
+            52 => self.sys_getpeername(req),
             3 => self.sys_close(req),
             72 => self.sys_fcntl(req),
             16 => self.sys_ioctl(req),

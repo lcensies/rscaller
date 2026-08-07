@@ -55,6 +55,9 @@ pub struct XdpDevice {
     /// out as an `RxToken` (a single `read_batch` call may return more
     /// than one packet worth of work).
     pending: VecDeque<Desc>,
+    /// Advertised MTU (drives smoltcp's TCP MSS). Defaults to
+    /// [`BRIDGE_MTU`]; override via [`XdpDevice::with_mtu`].
+    mtu: usize,
 }
 
 impl XdpDevice {
@@ -63,7 +66,15 @@ impl XdpDevice {
             sock,
             local_mac,
             pending: VecDeque::with_capacity(RX_BATCH),
+            mtu: BRIDGE_MTU,
         }
+    }
+
+    /// Override the advertised MTU (smoltcp has no PMTUD — see
+    /// `XdpConfig::mtu`).
+    pub fn with_mtu(mut self, mtu: usize) -> Self {
+        self.mtu = mtu;
+        self
     }
 
     /// Returns `true` if `desc`'s frame is one `smoltcp` should see:
@@ -105,7 +116,7 @@ impl Device for XdpDevice {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = BRIDGE_MTU + ETHERNET_HEADER_LEN;
+        caps.max_transmission_unit = self.mtu + ETHERNET_HEADER_LEN;
         caps.max_burst_size = Some(RX_BATCH);
         caps.medium = Medium::Ethernet;
         // RX checksum verification disabled for TCP/UDP. Verified by direct

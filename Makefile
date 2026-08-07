@@ -137,6 +137,7 @@ deploy:
 # Runs scp from this host so VM-to-VM hostname resolution is not required.
 # BEACON_VM is resolved to an IP via virsh (falls back to the name itself).
 deploy-beacon: deploy
+	@bash scripts/provision-beacon.sh
 	@BEACON_IP=$$(bash scripts/vm_ip.sh $(VM_DOMAIN_BEACON)); \
 	 echo "==> Stopping rsbeacon on $$BEACON_IP (unlock binary for overwrite)"; \
 	 ssh ubuntu@$$BEACON_IP "sudo pkill -f rsbeacon 2>/dev/null; sleep 0.3; true" 2>/dev/null || true; \

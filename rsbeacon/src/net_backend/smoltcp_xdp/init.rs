@@ -47,6 +47,12 @@ pub struct XdpConfig {
     /// [`init`] proceeds without a default route rather than failing —
     /// only on-link traffic for `ip`'s subnet is reachable in that case.
     pub gateway: Option<Ipv4Addr>,
+    /// IPv4 MTU the virtual interface advertises (drives smoltcp's TCP
+    /// MSS). smoltcp has no PMTUD, so on paths with a tunnel/overlay in
+    /// the middle (lab DLP tunnel: 1376) a 1500 MTU blackholes every
+    /// full-size segment with DF set. Pass the path MTU when one is
+    /// known; default 1500.
+    pub mtu: usize,
 }
 
 /// Builds the `smoltcp-xdp` [`NetBackend`]. Every failure path is fatal —
@@ -143,7 +149,7 @@ pub fn init(config: XdpConfig) -> Result<Arc<dyn NetBackend>> {
         .register_xsk(config.queue, xsk.fd())
         .context("registering AF_XDP socket fd into xsks_map")?;
 
-    let mut device = XdpDevice::new(xsk, local_mac);
+    let mut device = XdpDevice::new(xsk, local_mac).with_mtu(config.mtu);
     let iface_state = build_interface(
         &mut device,
         local_mac,

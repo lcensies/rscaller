@@ -84,6 +84,13 @@ struct Args {
     /// `--xdp-ip`'s subnet will be reachable).
     #[arg(long)]
     xdp_gateway: Option<String>,
+
+    /// MTU for the smoltcp virtual interface (`--netstack smoltcp-xdp`
+    /// only). smoltcp does no PMTU discovery — lower this to the path
+    /// MTU when a tunnel/overlay sits between the beacon and its peers
+    /// (lab DLP tunnel: 1376), or full-size DF segments blackhole.
+    #[arg(long, default_value = "1500")]
+    xdp_mtu: usize,
 }
 
 /// Builds and initializes the selected [`NetBackend`]. Fails fast with an
@@ -139,6 +146,7 @@ fn init_smoltcp_xdp_backend(args: &Args) -> Result<Arc<dyn NetBackend>> {
         ip,
         prefix: args.xdp_prefix,
         gateway,
+        mtu: args.xdp_mtu,
     })
 }
 
