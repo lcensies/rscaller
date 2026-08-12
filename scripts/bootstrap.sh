@@ -48,6 +48,8 @@ KERNEL="$(uname -r)"
 PKGS=(
   build-essential gcc make git curl
   pkg-config libssl-dev
+  # linux-libc-dev — <asm/unistd_64.h> for rsc/build.rs syscall table codegen
+  linux-libc-dev
   "linux-headers-${KERNEL}"
   # XDP/eBPF toolchain (beacon-smoltcp-xdp-netstack net backend):
   #   clang/llvm  — compile bpf/*.c to BPF bytecode (clang -target bpf)

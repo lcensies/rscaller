@@ -20,24 +20,24 @@ const AT_FDCWD: u64 = (-100i64) as u64;
 // AT_SYMLINK_NOFOLLOW flag for newfstatat
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 
-// Syscall numbers (x86-64)
-const SYS_CLOSE: u64 = 3;
-const SYS_LSEEK: u64 = 8;
-const SYS_PREAD64: u64 = 17;
-const SYS_PWRITE64: u64 = 18;
-const SYS_GETDENTS64: u64 = 217;
-const SYS_OPENAT: u64 = 257;
-const SYS_NEWFSTATAT: u64 = 262;
-const SYS_READLINKAT: u64 = 267;
-const SYS_FCHMODAT: u64 = 268;
-const SYS_FCHOWNAT: u64 = 260;
-const SYS_UNLINKAT: u64 = 263;
-const SYS_RENAMEAT: u64 = 264;
-const SYS_MKDIRAT: u64 = 258;
-const SYS_SYMLINKAT: u64 = 266;
-const SYS_LINKAT: u64 = 265;
-const SYS_FTRUNCATE: u64 = 77;
-const SYS_UTIMENSAT: u64 = 280;
+// Syscall numbers (x86-64) — derived from libc, not handwritten.
+const SYS_CLOSE: u64 = libc::SYS_close as u64;
+const SYS_LSEEK: u64 = libc::SYS_lseek as u64;
+const SYS_PREAD64: u64 = libc::SYS_pread64 as u64;
+const SYS_PWRITE64: u64 = libc::SYS_pwrite64 as u64;
+const SYS_GETDENTS64: u64 = libc::SYS_getdents64 as u64;
+const SYS_OPENAT: u64 = libc::SYS_openat as u64;
+const SYS_NEWFSTATAT: u64 = libc::SYS_newfstatat as u64;
+const SYS_READLINKAT: u64 = libc::SYS_readlinkat as u64;
+const SYS_FCHMODAT: u64 = libc::SYS_fchmodat as u64;
+const SYS_FCHOWNAT: u64 = libc::SYS_fchownat as u64;
+const SYS_UNLINKAT: u64 = libc::SYS_unlinkat as u64;
+const SYS_RENAMEAT: u64 = libc::SYS_renameat as u64;
+const SYS_MKDIRAT: u64 = libc::SYS_mkdirat as u64;
+const SYS_SYMLINKAT: u64 = libc::SYS_symlinkat as u64;
+const SYS_LINKAT: u64 = libc::SYS_linkat as u64;
+const SYS_FTRUNCATE: u64 = libc::SYS_ftruncate as u64;
+const SYS_UTIMENSAT: u64 = libc::SYS_utimensat as u64;
 
 const TTL: Duration = Duration::from_secs(1);
 

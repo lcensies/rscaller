@@ -11,30 +11,43 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// syscall_nrs.rs — generated from files/syscall_nrs
+// syscall_nrs.rs — auto-derived from the build host's <asm/unistd_64.h>
+// (x86_64 syscall ABI; the same source bindgen would parse, without libclang).
+// ponytail: build-host headers, cross-arch builds must set SYSCALL_HEADER.
 // ---------------------------------------------------------------------------
 
-fn gen_syscall_nrs(out_dir: &PathBuf, manifest_dir: &PathBuf) {
-    let src = manifest_dir.join("../files/syscall_nrs");
+fn gen_syscall_nrs(out_dir: &PathBuf, _manifest_dir: &PathBuf) {
+    let mut candidates: Vec<PathBuf> = env::var("SYSCALL_HEADER")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    candidates.extend([
+        PathBuf::from("/usr/include/x86_64-linux-gnu/asm/unistd_64.h"),
+        PathBuf::from("/usr/include/asm/unistd_64.h"),
+    ]);
+    let src = candidates.into_iter().find(|p| p.is_file()).unwrap_or_else(|| {
+        panic!("build.rs: <asm/unistd_64.h> not found; install linux-libc-dev or set SYSCALL_HEADER")
+    });
     println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-env-changed=SYSCALL_HEADER");
 
     let content = fs::read_to_string(&src)
         .unwrap_or_else(|e| panic!("build.rs: cannot read {}: {}", src.display(), e));
 
     let mut arms = String::new();
     for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        // "#define __NR_openat 257"
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("#define") {
             continue;
         }
-        let (name, nr_str) = line
-            .split_once('=')
-            .unwrap_or_else(|| panic!("build.rs: syscall_nrs: expected name=number, got {:?}", line));
-        let nr: u32 = nr_str
-            .trim()
-            .parse()
-            .unwrap_or_else(|_| panic!("build.rs: syscall_nrs: {:?} is not u32", nr_str));
-        arms.push_str(&format!("        {:?} => Some({nr}),\n", name.trim()));
+        let Some(name) = fields.next().and_then(|n| n.strip_prefix("__NR_")) else {
+            continue;
+        };
+        let Ok(nr) = fields.next().unwrap_or("").parse::<u32>() else {
+            continue;
+        };
+        arms.push_str(&format!("        {:?} => Some({nr}),\n", name));
     }
 
     let code = format!(

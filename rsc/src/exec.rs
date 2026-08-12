@@ -464,9 +464,6 @@ fn install_seccomp_filter(always_nrs: &[u32], fd_gated_nrs: &[u32]) -> Result<li
 /// pidfd_getfd to atomically duplicate the fd from the child's fd table into
 /// the parent's, without any sendmsg/recvmsg round-trip.
 fn recv_notify_fd(pipe_read: libc::c_int, child_pid: libc::pid_t) -> Result<libc::c_int> {
-    const SYS_PIDFD_OPEN: libc::c_long = 434; // x86_64
-    const SYS_PIDFD_GETFD: libc::c_long = 438; // x86_64
-
     let mut buf = [0u8; 4];
     let ret = unsafe { libc::read(pipe_read, buf.as_mut_ptr() as _, 4) };
     if ret != 4 {
@@ -478,14 +475,14 @@ fn recv_notify_fd(pipe_read: libc::c_int, child_pid: libc::pid_t) -> Result<libc
     }
     let fd_num = u32::from_ne_bytes(buf) as libc::c_int;
 
-    let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, child_pid as libc::c_long, 0i64) };
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid as libc::c_long, 0i64) };
     if pidfd < 0 {
         bail!("pidfd_open({}): {}", child_pid, std::io::Error::last_os_error());
     }
     let pidfd = pidfd as libc::c_int;
 
     let duped = unsafe {
-        libc::syscall(SYS_PIDFD_GETFD, pidfd as libc::c_long, fd_num as libc::c_long, 0i64)
+        libc::syscall(libc::SYS_pidfd_getfd, pidfd as libc::c_long, fd_num as libc::c_long, 0i64)
     };
     unsafe { libc::close(pidfd) };
 

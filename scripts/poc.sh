@@ -49,7 +49,7 @@
 #   recon  — /proc + /sys overlaid; grep /proc/net/fib_trie shows beacon IP
 #   relay  — network syscalls forwarded through beacon; no filesystem overlay
 #   shadow — full identity overlay (/proc + /sys + /etc) + network forwarding
-#   ghost  — shadow + writable /mnt/target + process signal forwarding
+#   ghost  — merged local+beacon /proc + writable /mnt/target + process signal forwarding
 #
 # Scenarios (--scenario NAME), each is a --compare run:
 #   exec     — cat /etc/shadow via ghost's /mnt/target FUSE anchor vs. cat
@@ -239,7 +239,10 @@ if [[ -n "$SCENARIO" ]]; then
 		[[ "$CMD_SET" -eq 1 ]] || CMD="cat /mnt/target/etc/shadow"
 		[[ "$BASELINE_CMD_SET" -eq 1 ]] || BASELINE_CMD="sudo cat /etc/shadow"
 		[[ "$EVENTS_SET" -eq 1 ]] || TRACEE_EVENTS="execve,execveat"
-		[[ "$QUERY_SET" -eq 1 ]] || QUERY="cat"
+		# "shadow", not "cat": both payload cmdlines contain the path, and
+		# daemon noise (update-motd cat /var/run/reboot-required etc.) no
+		# longer false-fails the comparison
+		[[ "$QUERY_SET" -eq 1 ]] || QUERY="shadow"
 		COMPARE=1
 		;;
 	file)
@@ -567,11 +570,12 @@ for line in sys.stdin:
             elif fam == 'AF_INET6':
                 cmdline = '[%s]:%s' % (ra.get('sin6_addr', '?'), ra.get('sin6_port', '?'))
             else:
-                cmdline = str(ra.get('sun_path', ra))
-    # Skip unix-socket rows (cmdline = sun_path): local IPC (nscd etc.),
-    # not network activity — outside this scenario's claim either way.
-    if cmdline.startswith('/'):
-        continue
+                # Skip unix-socket rows (cmdline = sun_path): local IPC
+                # (nscd etc.), not network activity. Do NOT blanket-drop
+                # cmdline.startswith('/') — pathname-derived rows
+                # (security_file_open/magic_write) start with '/' too and
+                # are exactly what the file scenario must show.
+                continue
     if not cmdline and evt.startswith('net_packet_dns'):
         md = next((a.get('value') for a in args
                    if isinstance(a, dict) and a.get('name') == 'metadata'), {}) or {}

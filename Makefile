@@ -207,7 +207,7 @@ demo-teardown:
 # Run PoC with all defaults: profile=proc, tracee on beacon.
 # Usage:
 #   make poc                                       # proc profile, default cmd
-#   make poc PROFILE=full CMD=hostname             # full profile
+#   make poc PROFILE=shadow CMD=hostname           # shadow profile
 #   make poc PROFILE=none CMD="ip -4 addr"
 #   make poc NETSTACK=smoltcp-xdp XDP_IFACE=enp1s0 # exercise the smoltcp-xdp backend
 #     (NETSTACK/XDP_IFACE/XDP_QUEUE reach poc.sh as env vars — see that

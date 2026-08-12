@@ -1,7 +1,7 @@
 name: ghost
-description: "Beacon process control — beacon procfs at /proc, rootfs at /mnt/target; kill forwarded with local-cgroup exclusion"
+description: "Beacon process control — merged local+beacon procfs at /proc, rootfs at /mnt/target; kill forwarded with local-cgroup exclusion"
 mounts:
-  # Beacon's process table replaces local /proc — ps/top/kill see beacon PIDs.
+  # rscfuse merges local PIDs with beacon PIDs (+10,000,000) for ps/top/kill.
   - remote: /proc
     local: /proc
     type: bind

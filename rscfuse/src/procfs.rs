@@ -12,11 +12,11 @@ use crate::stat::stat_bytes_to_attr;
 pub const BEACON_PID_OFFSET: u64 = 10_000_000;
 
 const AT_FDCWD: u64 = (-100i64) as u64;
-const SYS_CLOSE: u64 = 3;
-const SYS_PREAD64: u64 = 17;
-const SYS_OPENAT: u64 = 257;
-const SYS_NEWFSTATAT: u64 = 262;
-const SYS_READLINKAT: u64 = 267;
+const SYS_CLOSE: u64 = libc::SYS_close as u64;
+const SYS_PREAD64: u64 = libc::SYS_pread64 as u64;
+const SYS_OPENAT: u64 = libc::SYS_openat as u64;
+const SYS_NEWFSTATAT: u64 = libc::SYS_newfstatat as u64;
+const SYS_READLINKAT: u64 = libc::SYS_readlinkat as u64;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 
 /// Classification of a /proc path for merged-proc routing.
