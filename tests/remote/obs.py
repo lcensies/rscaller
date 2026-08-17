@@ -59,10 +59,17 @@ class Tracee:
         self._name = name
 
     def ensure_image(self) -> None:
-        r = self._run(f"sudo docker inspect {TRACEE_IMAGE} >/dev/null 2>&1 || "
-                      f"sudo docker pull {TRACEE_IMAGE} 2>&1 | tail -3")
-        if not r.ok:
-            raise RuntimeError(f"Could not pull tracee image: {r.stderr}")
+        # The 421MB pull happens after every baseline revert (image is not
+        # baked in) and lab network to docker.io flakes — retry a few times.
+        last_err = ""
+        for attempt in range(3):
+            r = self._run(f"sudo docker inspect {TRACEE_IMAGE} >/dev/null 2>&1 || "
+                          f"sudo docker pull {TRACEE_IMAGE} 2>&1 | tail -3")
+            if r.ok:
+                return
+            last_err = r.stderr
+            time.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"Could not pull tracee image after 3 attempts: {last_err}")
 
     def start(self, settle_secs: float = 2.0) -> None:
         """Start tracee container; wait briefly for eBPF probes to load."""
@@ -87,6 +94,13 @@ class Tracee:
         raw = r.stdout if r.ok else ""
         self._run(f"sudo docker rm -f {self._name} 2>/dev/null || true")
         return _parse_events(raw)
+
+    def peek(self) -> list[dict]:
+        """Read events captured so far WITHOUT stopping the container.
+        Tracee flushes JSON events with a lag; poll this when waiting for a
+        specific exec instead of sleeping a fixed time."""
+        r = self._run(f"sudo docker logs {self._name} 2>&1")
+        return _parse_events(r.stdout if r.ok else "")
 
     # ── Event predicates ──────────────────────────────────────────────────────
 

@@ -225,6 +225,7 @@ def client_snapshotted(client, vm_name, client_vm_snapshot):
     vm_restore(vm_name, client_vm_snapshot)
     print(f"[fixture] waiting for SSH on {client}", flush=True)
     wait_for_ssh(client)
+    vm_sync_clock(client)
     print(f"[fixture] {client} is up", flush=True)
     yield
 
@@ -236,8 +237,23 @@ def beacon_snapshotted(beacon_host, beacon_vm_name, beacon_vm_snapshot):
     vm_restore(beacon_vm_name, beacon_vm_snapshot)
     print(f"[fixture] waiting for SSH on {beacon_host}", flush=True)
     wait_for_ssh(beacon_host)
+    vm_sync_clock(beacon_host)
     print(f"[fixture] {beacon_host} is up", flush=True)
     yield
+
+
+def vm_sync_clock(host: str) -> None:
+    """Set the VM clock from the test host after a snapshot revert.
+
+    Internal snapshots freeze the clock at snapshot time; on revert the VM
+    believes it is weeks in the past, and lab NTP is untrustworthy (it once
+    claimed a date that made docker.io's TLS cert 'not yet valid'). Anything
+    TLS/image-pull related then fails spuriously. chronyd is stopped first —
+    otherwise it steps the clock right back.
+    """
+    now = subprocess.run(["date", "-u", "+%Y-%m-%d %H:%M:%S"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    run(host, f"sudo systemctl stop chronyd 2>/dev/null; sudo date -s '{now}'")
 
 
 @pytest.fixture(scope="session")

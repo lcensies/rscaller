@@ -22,7 +22,7 @@ from __future__ import annotations
 import time
 import pytest
 
-from conftest import run, run_bg, REMOTE_DIR
+from conftest import run, run_bg, REMOTE_DIR, vm_sync_clock
 from obs import Tracee
 
 BEACON_BIN = "/home/ubuntu/rsbeacon"
@@ -122,6 +122,10 @@ def _rsc_read_fib_trie(client: str, beacon_ip: str, beacon_port: int) -> set[str
 
 @pytest.fixture(scope="module", autouse=True)
 def ensure_tracee_image(beacon_host):
+    # Sync the VM clock first: on a freshly reverted baseline the clock is
+    # weeks behind and docker.io's TLS cert is "not yet valid", so the pull
+    # fails spuriously (seen in practice).
+    vm_sync_clock(beacon_host)
     _make_tracee(beacon_host).ensure_image()
 
 
@@ -150,7 +154,7 @@ def rsbeacon(beacon_host, beacon_port):
 # Tests
 # ---------------------------------------------------------------------------
 
-@pytest.mark.timeout(60)
+@pytest.mark.timeout(300)
 def test_negative_control(beacon_host):
     """
     Negative control: ip addr run directly on dev-vm-2 must appear in tracee.
@@ -163,7 +167,14 @@ def test_negative_control(beacon_host):
     r = run(beacon_host, "readlink -f $(which ip 2>/dev/null) 2>/dev/null || echo /usr/sbin/ip")
     ip_bin = r.stdout.strip() or "/usr/sbin/ip"
     run(beacon_host, f"{ip_bin} addr >/dev/null 2>&1 || true")
-    time.sleep(1)
+
+    # Tracee flushes events with a lag — poll until the execve appears
+    # (fixed 1s sleep raced the flush and lost the event in practice).
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if tracee.execve_matches(tracee.peek(), pattern="ip"):
+            break
+        time.sleep(1)
 
     events = tracee.stop()
 
@@ -178,7 +189,7 @@ def test_negative_control(beacon_host):
     )
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(300)
 def test_evasion(client, beacon_host, beacon_ip, beacon_port,
                  client_snapshotted, beacon_snapshotted, rsbeacon):
     """
