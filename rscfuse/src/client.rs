@@ -103,10 +103,10 @@ async fn io_task(
         }
         (Transport::Tcp, Encryption::Tls { ca_cert_pem }) => {
             use rscaller_proto::transport::tls::connect_tls;
-            // Use the beacon host as the server name for TLS SNI.
-            let server_name = beacon.ip().to_string();
+            // SNI must match the beacon cert's SAN ("rsbeacon" for the
+            // embedded identity) — not the beacon's IP, which is never a SAN.
             let (mut reader, mut writer) =
-                connect_tls(beacon, &server_name, &ca_cert_pem).await?;
+                connect_tls(beacon, "rsbeacon", &ca_cert_pem).await?;
             run_loop(&mut reader, &mut writer, rx).await
         }
         (Transport::Uds, Encryption::None) => {

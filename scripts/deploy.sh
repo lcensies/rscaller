@@ -48,6 +48,9 @@ ok "relay artifacts done"
 
 step "Installing build dependencies on $REMOTE"
 ssh "$REMOTE" "sudo apt-get install -y libfuse3-dev libvirt-dev 2>&1 | tail -3" || true
+# rscfuse mounts with allow_other (QEMU relay user needs it) — requires
+# user_allow_other in /etc/fuse.conf. Idempotent; same step as bootstrap.sh.
+ssh "$REMOTE" "grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf >/dev/null"
 ok "apt done"
 
 step "Building Rust workspace on $REMOTE (release)"

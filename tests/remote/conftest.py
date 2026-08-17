@@ -288,6 +288,9 @@ def deploy_beacon(pytestconfig, remote, beacon_host):
     """Copy the rsbeacon binary from remote (dev-vm-1) to beacon_host (dev-vm-2)."""
     if pytestconfig.getoption("--no-deploy") or pytestconfig.getoption("--no-e2e"):
         return
+    # Kill any running beacon first: scp onto a running executable fails
+    # with ETXTBSY (sftp "Failure").
+    run(beacon_host, "sudo pkill -9 rsbeacon 2>/dev/null || true")
     # scp from remote where it was built — no build on beacon_host needed.
     subprocess.run(
         ["scp", f"{remote}:{REMOTE_DIR}/target/release/rsbeacon",

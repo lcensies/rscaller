@@ -91,6 +91,11 @@ struct Args {
     /// (lab DLP tunnel: 1376), or full-size DF segments blackhole.
     #[arg(long, default_value = "1500")]
     xdp_mtu: usize,
+
+    /// Print the embedded CA certificate (PEM) to stdout and exit.
+    /// Clients use this as --ca-cert for TLS to the embedded identity.
+    #[arg(long)]
+    print_ca: bool,
 }
 
 /// Builds and initializes the selected [`NetBackend`]. Fails fast with an
@@ -179,6 +184,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if args.print_ca {
+        std::io::Write::write_all(&mut std::io::stdout(), EMBEDDED_CA_PEM)?;
+        return Ok(());
+    }
 
     let cert_pem = if let Some(p) = &args.cert {
         std::fs::read(p)?
