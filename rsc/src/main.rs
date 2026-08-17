@@ -8,6 +8,7 @@
 
 mod exec;
 mod deploy;
+mod beacon_gen;
 mod mount_config;
 #[cfg(feature = "relay")]
 mod relay;
@@ -36,6 +37,8 @@ enum Cmd {
     /// FUSE daemon for remote FS access via rsbeacon (spawned internally by exec).
     #[command(hide = true)]
     Fuse(rscfuse::FuseArgs),
+    /// Compile a zero-config rsbeacon (baked listen addr + TLS identity, no flags needed).
+    BeaconGen(BeaconGenCli),
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +242,21 @@ pub struct DeployArgs {
 // Entry point
 // ---------------------------------------------------------------------------
 
+#[derive(clap::Args)]
+pub struct BeaconGenCli {
+    /// Address the generated beacon listens on (baked in).
+    #[arg(long, default_value = "0.0.0.0:9999")]
+    pub listen: String,
+
+    /// Disable baked-in TLS (plain TCP beacon).
+    #[arg(long)]
+    pub no_tls: bool,
+
+    /// Output directory for rsbeacon + ca.pem.
+    #[arg(long, default_value = "./beacon-out")]
+    pub out: std::path::PathBuf,
+}
+
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = dispatch(cli.cmd) {
@@ -276,6 +294,11 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             exec::run_shell_sync(args)
         }
         Cmd::Deploy(args) => deploy::run_deploy(args),
+        Cmd::BeaconGen(args) => beacon_gen::run_beacon_gen(beacon_gen::BeaconGenArgs {
+            listen: args.listen,
+            tls: !args.no_tls,
+            out: args.out,
+        }),
         Cmd::Fuse(args) => {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             tracing_subscriber::fmt()

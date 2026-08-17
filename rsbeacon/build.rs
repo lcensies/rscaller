@@ -17,6 +17,9 @@ fn main() {
 
     // Tell cargo to rerun only if build.rs itself changes — not on every build.
     println!("cargo:rerun-if-changed=build.rs");
+    // `rsc beacon-gen` bakes defaults via these (see option_env! in main.rs).
+    println!("cargo:rerun-if-env-changed=RSC_BEACON_LISTEN");
+    println!("cargo:rerun-if-env-changed=RSC_BEACON_ENCRYPTION");
 }
 
 /// `bpf/xdp_prog.o` is produced ahead-of-time from `bpf/xdp_prog.c` and

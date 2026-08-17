@@ -18,17 +18,28 @@ const EMBEDDED_CERT_PEM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cert.
 const EMBEDDED_KEY_PEM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/key.pem"));
 pub const EMBEDDED_CA_PEM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ca.pem"));
 
+// Compile-time defaults, overridable by `rsc beacon-gen` via env vars so a
+// generated beacon runs with zero arguments.
+const BAKED_LISTEN: &str = match option_env!("RSC_BEACON_LISTEN") {
+    Some(v) => v,
+    None => "0.0.0.0:9999",
+};
+const BAKED_ENCRYPTION: &str = match option_env!("RSC_BEACON_ENCRYPTION") {
+    Some(v) => v,
+    None => "none",
+};
+
 #[derive(Parser)]
 #[command(name = "rsbeacon", about = "Remote syscall execution beacon")]
 struct Args {
-    #[arg(long, default_value = "0.0.0.0:9999")]
-    listen: String,
+    #[arg(long)]
+    listen: Option<String>,
 
-    #[arg(long, default_value = "tcp", help = "Transport: tcp|uds")]
-    transport: String,
+    #[arg(long, help = "Transport: tcp|uds")]
+    transport: Option<String>,
 
-    #[arg(long, default_value = "none", help = "Encryption: none|tls")]
-    encryption: String,
+    #[arg(long, help = "Encryption: none|tls")]
+    encryption: Option<String>,
 
     /// Override embedded TLS certificate (PEM)
     #[arg(long)]
@@ -201,16 +212,19 @@ async fn main() -> Result<()> {
         EMBEDDED_KEY_PEM.to_vec()
     };
 
-    let use_tls = args.encryption == "tls";
+    let encryption = args.encryption.as_deref().unwrap_or(BAKED_ENCRYPTION);
+    let use_tls = encryption == "tls";
 
     // Fail fast, before binding any listener or accepting connections, if
     // the selected backend can't be initialized.
     let backend = init_backend(&args)?;
     tracing::info!("Network backend: {}", backend.name());
 
-    match args.transport.as_str() {
+    let transport = args.transport.as_deref().unwrap_or("tcp");
+    match transport {
         "tcp" => {
-            let addr: SocketAddr = args.listen.parse()?;
+            let listen = args.listen.as_deref().unwrap_or(BAKED_LISTEN);
+            let addr: SocketAddr = listen.parse()?;
             if use_tls {
                 server::run_tls(addr, cert_pem, key_pem, backend).await
             } else {
