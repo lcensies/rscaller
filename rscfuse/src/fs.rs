@@ -665,6 +665,10 @@ impl Filesystem for RscFs {
 
         // Collect ALL entries via getdents64 loop, then emit from `offset`.
         let mut all_entries = Vec::new();
+        let mut total_bytes = 0usize;
+        // ponytail: cap accumulated dirents at 32 MiB; bigger dirs get truncated listings
+        // rather than OOM. Upgrade path: stateful per-offset pagination.
+        const MAX_READDIR_BYTES: usize = 32 * 1024 * 1024;
         loop {
             let res = self.client.syscall(
                 SYS_GETDENTS64,
@@ -684,7 +688,12 @@ impl Filesystem for RscFs {
                         .unwrap_or_default();
                     let bytes = ret as usize;
                     let mut parsed = parse_dirent64(&buf[..bytes.min(buf.len())]);
+                    total_bytes += bytes;
                     all_entries.append(&mut parsed);
+                    if total_bytes >= MAX_READDIR_BYTES {
+                        tracing::warn!("getdents64 fh={}: hit 32 MiB cap, truncating listing", fh);
+                        break;
+                    }
                 }
                 Err(e) => {
                     tracing::debug!("getdents64 fh={}: {}", fh, e);

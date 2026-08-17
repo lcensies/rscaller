@@ -208,11 +208,15 @@ async fn main() -> Result<()> {
             }
         }
         "uds" => {
+            if use_tls {
+                // UDS is local-only; TLS over UDS is unsupported, don't silently downgrade.
+                anyhow::bail!("--encryption tls is not supported with --transport uds");
+            }
             let path = args
                 .uds_path
                 .as_deref()
                 .unwrap_or("/tmp/rsbeacon.sock");
-            server::run_uds(path, use_tls, cert_pem, key_pem, backend).await
+            server::run_uds(path, backend).await
         }
         other => anyhow::bail!("Unknown transport: {}", other),
     }

@@ -3,18 +3,6 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-#[derive(Clone, Debug)]
-pub enum Transport {
-    Tcp,
-    Uds,
-}
-
-#[derive(Clone, Debug)]
-pub enum Encryption {
-    None,
-    Tls { ca_cert_pem: Vec<u8> },
-}
-
 // ── Client side ───────────────────────────────────────────────────────────────
 
 pub async fn connect_tcp_plain(

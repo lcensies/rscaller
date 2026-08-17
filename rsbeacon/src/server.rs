@@ -59,13 +59,7 @@ pub async fn run_tls(
     }
 }
 
-pub async fn run_uds(
-    path: &str,
-    _use_tls: bool, // UDS+TLS is unusual; always run plain for UDS
-    _cert_pem: Vec<u8>,
-    _key_pem: Vec<u8>,
-    backend: Arc<dyn NetBackend>,
-) -> Result<()> {
+pub async fn run_uds(path: &str, backend: Arc<dyn NetBackend>) -> Result<()> {
     use tokio::net::UnixListener;
 
     let _ = std::fs::remove_file(path);

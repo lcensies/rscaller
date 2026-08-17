@@ -660,7 +660,6 @@ forward:
     }
 
     #[test]
-    #[test]
     fn forward_filter_default_direction_and_route_args() {
         let p: MountProfile = serde_yaml::from_str(
             "name: t\nforward:\n  - syscalls: [socket, connect]\n    filter:\n      default_direction: REMOTE\n      net_routes:\n        - subnet: 10.0.0.0/8\n          port: 443\n          direction: LOCAL\n",

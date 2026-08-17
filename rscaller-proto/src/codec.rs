@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Largest framed message accepted on the wire (64 MiB covers max syscall I/O buffers).
+pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 /// Read a length-prefixed bincode message from an async reader.
 pub async fn read_message<T, R>(reader: &mut R) -> Result<T>
 where
@@ -14,6 +17,10 @@ where
         .await
         .context("reading message length")?;
     let len = u32::from_le_bytes(len_buf) as usize;
+    // Cap allocation: length prefix is attacker-controlled on untrusted links.
+    if len > MAX_MESSAGE_SIZE {
+        anyhow::bail!("message length {len} exceeds MAX_MESSAGE_SIZE {MAX_MESSAGE_SIZE}");
+    }
 
     let mut buf = vec![0u8; len];
     reader

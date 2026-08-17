@@ -152,7 +152,14 @@ impl ProcFs {
         let rel = Self::local_rel(pid, rest);
         let rel_cstr = std::ffi::CString::new(rel.as_str()).unwrap();
         let open_flags = (flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC)) | libc::O_CLOEXEC;
-        let fd = unsafe { libc::openat(self.real_proc_dirfd, rel_cstr.as_ptr(), open_flags, 0u32) };
+        let fd = unsafe {
+            libc::openat(
+                self.real_proc_dirfd,
+                rel_cstr.as_ptr(),
+                open_flags | libc::O_CLOEXEC,
+                0u32,
+            )
+        };
         if fd < 0 {
             anyhow::bail!("local openat({:?}): {}", rel, std::io::Error::last_os_error());
         }
