@@ -5,6 +5,7 @@ members = [
     "rsbeacon",
     "rsclient",
     "rscfuse",
+    "rsserver",
     "tools/codegen",
     "rsc",
     "qemu-vdw-core",

@@ -94,6 +94,15 @@ struct Args {
     /// Path to CA cert PEM for TLS verification
     #[arg(long)]
     ca_cert: Option<String>,
+
+    /// Rendezvous mode: reach the beacon through an rsserver
+    /// ([token@]host:port) instead of connecting to it directly.
+    #[arg(long)]
+    server: Option<String>,
+
+    /// Auth token for rsserver (overridden by token@ in --server).
+    #[arg(long)]
+    auth: Option<String>,
 }
 
 fn default_ca_cert_path() -> std::path::PathBuf {
@@ -122,6 +131,21 @@ fn write_filter_cmd(ctl: &mut ctls::kmod::KmodController, key: &str, value: &str
     ctl.write_cmd(&format!("{} {}\n", key, value))?;
     info!("kmod config: {} {}", key, value);
     Ok(())
+}
+
+/// Resolve the beacon endpoint: direct by default, rsserver rendezvous when
+/// --server is given. Session name = --name, falling back to "default" in
+/// rendezvous mode (matching rsbeacon's default).
+fn connect_target(
+    args: &Args,
+    beacon_addr: std::net::SocketAddr,
+) -> Result<rscaller_proto::transport::ConnectTarget> {
+    use rscaller_proto::transport::{parse_relay_target, ConnectTarget};
+    if let Some(server) = &args.server {
+        let name = args.name.as_deref().unwrap_or("default");
+        return parse_relay_target(server, args.auth.as_deref(), name);
+    }
+    Ok(ConnectTarget::Direct(beacon_addr))
 }
 
 #[tokio::main]
@@ -199,29 +223,21 @@ async fn run_kmod(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()> {
     }
 
     let use_tls = args.encryption == "tls";
+    let target = connect_target(&args, beacon_addr)?;
+    let ca_pem = if use_tls {
+        Some(load_ca_pem(args.ca_cert.as_deref())?)
+    } else {
+        None
+    };
 
     loop {
-        info!("Connecting to beacon at {}", beacon_addr);
+        info!("Connecting to beacon at {:?}", target);
 
         let result: Result<()> = async {
             let ctl = KmodController::open(&args.proc_path)?;
-
-            if use_tls {
-                let ca_pem = load_ca_pem(args.ca_cert.as_deref())?;
-                let (r, w) = rscaller_proto::transport::tls::connect_tls(
-                    beacon_addr,
-                    "rsbeacon",
-                    &ca_pem,
-                )
+            let (r, w) = rscaller_proto::transport::connect(&target, use_tls, ca_pem.as_deref())
                 .await?;
-                relay::Relay::new(ctl, r, w).with_filter(filter.clone()).run().await
-            } else {
-                use tokio::net::TcpStream;
-                let stream = TcpStream::connect(beacon_addr).await?;
-                let _ = stream.set_nodelay(true);
-                let (r, w) = tokio::io::split(stream);
-                relay::Relay::new(ctl, r, w).with_filter(filter.clone()).run().await
-            }
+            relay::Relay::new(ctl, r, w).with_filter(filter.clone()).run().await
         }
         .await;
 
@@ -261,41 +277,32 @@ async fn run_seccomp(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()
     info!("Connecting to beacon at {}", beacon_addr);
 
     let use_tls = args.encryption == "tls";
-    // The socket-proxy data plane (per-socket socketpair + background
-    // shuttle) can be disabled with RSC_SOCKET_PROXY=0: sockets then keep
-    // the bare beacon virtual fd and every data syscall round-trips
-    // through the main relay connection. Used by the relay profile, where
-    // the fd-gated read/write rule makes that path complete.
+    let target = connect_target(&args, beacon_addr)?;
+    // The socket-proxy data plane opens its own per-socket connections to the
+    // beacon; that path isn't rendezvous-aware yet, so via --server every
+    // data syscall round-trips through the main relay connection instead
+    // (the same mode the relay profile uses with RSC_SOCKET_PROXY=0).
     let socket_proxy = !matches!(std::env::var("RSC_SOCKET_PROXY").as_deref(), Ok("0"));
-    let result = if use_tls {
-        let ca_pem = load_ca_pem(args.ca_cert.as_deref())?;
-        let (r, w) = rscaller_proto::transport::tls::connect_tls(
-            beacon_addr,
-            "rsbeacon",
-            &ca_pem,
-        )
-        .await?;
-        let mut relay = relay::Relay::new(ctl, r, w)
-            .with_filter(filter)
-            .with_cgroup_filter(cgroup_filter);
-        if socket_proxy {
-            relay.with_socket_proxy(beacon_addr, use_tls, Some(ca_pem)).run().await
-        } else {
-            relay.run().await
+    let socket_proxy = match target {
+        rscaller_proto::transport::ConnectTarget::Relay { .. } if socket_proxy => {
+            warn!("--server: socket data-plane not rendezvous-aware, using main relay connection");
+            false
         }
+        _ => socket_proxy,
+    };
+    let ca_pem = if use_tls {
+        Some(load_ca_pem(args.ca_cert.as_deref())?)
     } else {
-        use tokio::net::TcpStream;
-        let stream = TcpStream::connect(beacon_addr).await?;
-        let _ = stream.set_nodelay(true);
-        let (r, w) = tokio::io::split(stream);
-        let mut relay = relay::Relay::new(ctl, r, w)
-            .with_filter(filter)
-            .with_cgroup_filter(cgroup_filter);
-        if socket_proxy {
-            relay.with_socket_proxy(beacon_addr, use_tls, None).run().await
-        } else {
-            relay.run().await
-        }
+        None
+    };
+    let (r, w) = rscaller_proto::transport::connect(&target, use_tls, ca_pem.as_deref()).await?;
+    let mut relay = relay::Relay::new(ctl, r, w)
+        .with_filter(filter)
+        .with_cgroup_filter(cgroup_filter);
+    let result = if socket_proxy {
+        relay.with_socket_proxy(beacon_addr, use_tls, ca_pem).run().await
+    } else {
+        relay.run().await
     };
 
     // Child has exited (notify fd closed). Clean up the session cgroup.

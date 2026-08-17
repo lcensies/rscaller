@@ -166,9 +166,7 @@ fn run_seccomp(args: ExecArgs) -> Result<()> {
     let mount_point = format!("{}/{}", args.transport.mount_base, name);
     let merged_proc = mount_profile.has_proc_bind();
     let fuse_pid = launch_rscfuse(
-        &args.transport.beacon,
-        &args.transport.encryption,
-        args.transport.ca_cert.as_deref(),
+        &args.transport,
         &mount_point,
         &name,
         merged_proc,
@@ -254,9 +252,7 @@ fn run_seccomp(args: ExecArgs) -> Result<()> {
 /// Returns the child PID (left as a zombie until rsc exits;
 /// AutoUnmount will clean up the FUSE mount on process death).
 fn launch_rscfuse(
-    beacon: &str,
-    encryption: &str,
-    ca_cert: Option<&str>,
+    transport: &TransportArgs,
     mount_point: &str,
     name: &str,
     merged_proc: bool,
@@ -282,17 +278,25 @@ fn launch_rscfuse(
         rsc_exe.clone(),
         "fuse".to_string(),
         "--beacon".to_string(),
-        beacon.to_string(),
+        transport.beacon.to_string(),
         "--mount".to_string(),
         mount_point.to_string(),
         "--name".to_string(),
         name.to_string(),
         "--encryption".to_string(),
-        encryption.to_string(),
+        transport.encryption.to_string(),
     ];
-    if let Some(ca) = ca_cert {
+    if let Some(ca) = &transport.ca_cert {
         argv_strs.push("--ca-cert".to_string());
         argv_strs.push(ca.to_string());
+    }
+    if let Some(server) = &transport.server {
+        argv_strs.push("--server".to_string());
+        argv_strs.push(server.to_string());
+        if let Some(auth) = &transport.auth {
+            argv_strs.push("--auth".to_string());
+            argv_strs.push(auth.to_string());
+        }
     }
     if merged_proc {
         argv_strs.push("--merged-proc".to_string());
@@ -547,6 +551,17 @@ fn exec_rsclient(
     if let Some(ca) = &transport.ca_cert {
         argv_strs.push("--ca-cert".into());
         argv_strs.push(ca.clone());
+    }
+    if let Some(server) = &transport.server {
+        argv_strs.push("--server".into());
+        argv_strs.push(server.clone());
+        if let Some(auth) = &transport.auth {
+            argv_strs.push("--auth".into());
+            argv_strs.push(auth.clone());
+        }
+        // Rendezvous session name — must match rsbeacon's --name.
+        argv_strs.push("--name".into());
+        argv_strs.push(transport.resolve_name());
     }
     if let Some(cgroup) = session_cgroup {
         argv_strs.push("--local-cgroup".into());

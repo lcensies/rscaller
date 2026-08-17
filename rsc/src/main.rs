@@ -63,6 +63,16 @@ pub struct TransportArgs {
     #[arg(long)]
     pub ca_cert: Option<String>,
 
+    /// Rendezvous mode: reach the beacon through an rsserver
+    /// ([token@]host:port) instead of connecting to it directly.
+    /// The beacon must be running with --connect to the same server.
+    #[arg(long)]
+    pub server: Option<String>,
+
+    /// Auth token for rsserver (overridden by token@ in --server).
+    #[arg(long)]
+    pub auth: Option<String>,
+
     /// rscfuse mount base directory.
     #[arg(long, default_value = "/rsc")]
     pub mount_base: String,
@@ -79,7 +89,12 @@ pub struct TransportArgs {
 impl TransportArgs {
     pub fn resolve_name(&self) -> String {
         self.name.clone().unwrap_or_else(|| {
-            self.beacon.split(':').next().unwrap_or("remote").to_string()
+            if self.server.is_some() {
+                // Rendezvous default session — matches rsbeacon's --name default.
+                "default".to_string()
+            } else {
+                self.beacon.split(':').next().unwrap_or("remote").to_string()
+            }
         })
     }
 

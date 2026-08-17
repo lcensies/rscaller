@@ -22,8 +22,17 @@ use procfs::ProcFs;
 #[command(name = "fuse", about = "FUSE daemon for remote FS access via rsbeacon")]
 pub struct FuseArgs {
     /// rsbeacon address (host:port)
+    #[arg(long, required_unless_present = "server")]
+    pub beacon: Option<String>,
+
+    /// Rendezvous mode: reach the beacon through an rsserver
+    /// ([token@]host:port) instead of connecting directly.
     #[arg(long)]
-    pub beacon: String,
+    pub server: Option<String>,
+
+    /// Auth token for rsserver (overridden by token@ in --server).
+    #[arg(long)]
+    pub auth: Option<String>,
 
     /// Local mount point
     #[arg(long)]
@@ -71,13 +80,25 @@ pub fn run(args: FuseArgs) -> Result<()> {
         other => anyhow::bail!("unknown encryption {:?}; use none or tls", other),
     };
 
-    let beacon: SocketAddr = args
-        .beacon
-        .parse()
-        .with_context(|| format!("parsing beacon address {:?}", args.beacon))?;
+    let target = if let Some(server) = &args.server {
+        if args.transport != "tcp" {
+            anyhow::bail!("--server requires tcp transport");
+        }
+        // Session name = fs name: rsc passes the same --name to rsclient and
+        // rscfuse, so both land on the same beacon session.
+        rscaller_proto::transport::parse_relay_target(server, args.auth.as_deref(), &args.name)?
+    } else {
+        let beacon: SocketAddr = args
+            .beacon
+            .as_deref()
+            .context("--beacon is required without --server")?
+            .parse()
+            .with_context(|| format!("parsing beacon address {:?}", args.beacon))?;
+        rscaller_proto::transport::ConnectTarget::Direct(beacon)
+    };
 
-    tracing::info!("Connecting to beacon {} ...", beacon);
-    let client = Arc::new(Client::new(beacon, transport, encryption)?);
+    tracing::info!("Connecting to beacon {:?} ...", target);
+    let client = Arc::new(Client::new(target, transport, encryption)?);
 
     // Open a real /proc fd BEFORE mounting. After fuser::mount2 replaces /proc
     // (via bind-mount applied by rsc shell), openat(real_proc_dirfd, …) still

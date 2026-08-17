@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rscaller_proto::codec::{read_message, write_message};
+use rscaller_proto::transport::ConnectTarget;
 use rscaller_proto::types::{SyscallBuf, SyscallRequest, SyscallResponse};
-use std::net::SocketAddr;
 use std::sync::mpsc;
 use tokio::runtime::Runtime;
 
@@ -33,7 +33,7 @@ pub struct Client {
 
 impl Client {
     pub fn new(
-        beacon: SocketAddr,
+        target: ConnectTarget,
         transport: Transport,
         encryption: Encryption,
     ) -> Result<Self> {
@@ -44,7 +44,7 @@ impl Client {
 
         // Spawn the async I/O loop inside the runtime.
         rt.spawn(async move {
-            if let Err(e) = io_task(beacon, transport, encryption, rx).await {
+            if let Err(e) = io_task(target, transport, encryption, rx).await {
                 tracing::error!("rscfuse client I/O task exited: {:#}", e);
             }
         });
@@ -87,32 +87,28 @@ impl Client {
 
 /// Async I/O loop: owns the transport connection, serialises requests.
 async fn io_task(
-    beacon: SocketAddr,
+    target: ConnectTarget,
     transport: Transport,
     encryption: Encryption,
     rx: mpsc::Receiver<Req>,
 ) -> Result<()> {
     match (transport, encryption) {
-        (Transport::Tcp, Encryption::None) => {
-            use tokio::net::TcpStream;
-            let stream = TcpStream::connect(beacon)
-                .await
-                .context("TCP connect to beacon")?;
-            let (mut reader, mut writer) = tokio::io::split(stream);
-            run_loop(&mut reader, &mut writer, rx).await
-        }
-        (Transport::Tcp, Encryption::Tls { ca_cert_pem }) => {
-            use rscaller_proto::transport::tls::connect_tls;
-            // SNI must match the beacon cert's SAN ("rsbeacon" for the
-            // embedded identity) — not the beacon's IP, which is never a SAN.
+        (Transport::Tcp, enc) => {
+            let (use_tls, ca) = match enc {
+                Encryption::None => (false, None),
+                Encryption::Tls { ca_cert_pem } => (true, Some(ca_cert_pem)),
+            };
             let (mut reader, mut writer) =
-                connect_tls(beacon, "rsbeacon", &ca_cert_pem).await?;
+                rscaller_proto::transport::connect(&target, use_tls, ca.as_deref()).await?;
             run_loop(&mut reader, &mut writer, rx).await
         }
         (Transport::Uds, Encryption::None) => {
             // For UDS, the SocketAddr is not meaningful; callers should arrange
             // for a path. We accept the display string as a best-effort path.
-            let path = beacon.to_string();
+            let ConnectTarget::Direct(addr) = target else {
+                anyhow::bail!("--server requires tcp transport");
+            };
+            let path = addr.to_string();
             use tokio::net::UnixStream;
             let stream = UnixStream::connect(&path)
                 .await

@@ -107,6 +107,20 @@ struct Args {
     /// Clients use this as --ca-cert for TLS to the embedded identity.
     #[arg(long)]
     print_ca: bool,
+
+    /// Reverse mode: dial out to an rsserver rendezvous (host:port) instead
+    /// of listening. The beacon parks under --name and serves one client per
+    /// parked connection from a --max-connections worker pool.
+    #[arg(long)]
+    connect: Option<String>,
+
+    /// Auth token for rsserver (only with --connect).
+    #[arg(long)]
+    auth: Option<String>,
+
+    /// Session name at the rsserver (only with --connect).
+    #[arg(long, default_value = "default")]
+    name: String,
 }
 
 /// Builds and initializes the selected [`NetBackend`]. Fails fast with an
@@ -221,6 +235,25 @@ async fn main() -> Result<()> {
     tracing::info!("Network backend: {}", backend.name());
 
     let transport = args.transport.as_deref().unwrap_or("tcp");
+
+    if let Some(server) = &args.connect {
+        if transport != "tcp" {
+            anyhow::bail!("--connect (reverse mode) requires tcp transport");
+        }
+        let addr: SocketAddr = server.parse()?;
+        return server::run_reverse(
+            addr,
+            args.name.clone(),
+            args.auth.clone().unwrap_or_default(),
+            use_tls,
+            cert_pem,
+            key_pem,
+            backend,
+            args.max_connections,
+        )
+        .await;
+    }
+
     match transport {
         "tcp" => {
             let listen = args.listen.as_deref().unwrap_or(BAKED_LISTEN);

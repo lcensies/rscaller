@@ -58,3 +58,23 @@ pub struct SyscallResponse {
     /// OUT/INOUT buffer contents after syscall execution, for copy_to_user.
     pub out_bufs: Vec<SyscallBuf>,
 }
+
+// ── Rendezvous server (rsserver) handshake ─────────────────────────────────
+
+/// First frame on every rsserver connection: identifies the role and the
+/// session to join. After the server replies with [`RelayAck`], the
+/// connection becomes a raw byte pipe to the paired peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RelayHello {
+    /// A beacon dialing out; parked until a client for `name` arrives.
+    Beacon { name: String, token: String },
+    /// A client; paired with a waiting beacon for `name` (or parked).
+    Client { name: String, token: String },
+}
+
+/// Server's answer to a [`RelayHello`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayAck {
+    pub ok: bool,
+    pub msg: String,
+}

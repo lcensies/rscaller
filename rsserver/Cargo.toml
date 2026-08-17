@@ -1,0 +1,20 @@
+[package]
+name = "rsserver"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rsserver"
+path = "src/main.rs"
+
+[dependencies]
+rscaller-proto = { path = "../rscaller-proto" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+yamux = "0.13.9"
+tokio-util = { version = "0.7.19", features = ["compat"] }
+futures-util = "0.3.34"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
