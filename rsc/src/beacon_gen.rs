@@ -17,6 +17,11 @@ pub struct BeaconGenArgs {
     pub listen: String,
     pub tls: bool,
     pub out: PathBuf,
+    /// Bake reverse mode: the generated beacon dials out to this rsserver
+    /// ([token@]host:port) instead of listening.
+    pub connect: Option<String>,
+    /// Session name baked for --connect mode (default "default").
+    pub name: Option<String>,
 }
 
 /// Workspace root, baked at rsc compile time (…/rscaller/rsc → …/rscaller).
@@ -58,13 +63,30 @@ pub fn run_beacon_gen(args: BeaconGenArgs) -> Result<()> {
     }
 
     let encryption = if args.tls { "tls" } else { "none" };
+    // --connect may carry the token as token@host:port; split for baking.
+    // Absent values must be UNSET (not empty): option_env! sees Some("").
+    let mut envs = format!(
+        "RSC_BEACON_LISTEN='{}' RSC_BEACON_ENCRYPTION='{}'",
+        args.listen, encryption
+    );
+    if let Some(c) = &args.connect {
+        let (addr, token) = match c.split_once('@') {
+            Some((t, h)) => (h, t),
+            None => (c.as_str(), ""),
+        };
+        envs.push_str(&format!(" RSC_BEACON_CONNECT='{addr}'"));
+        if !token.is_empty() {
+            envs.push_str(&format!(" RSC_BEACON_AUTH='{token}'"));
+        }
+    }
+    if let Some(n) = &args.name {
+        envs.push_str(&format!(" RSC_BEACON_NAME='{n}'"));
+    }
     let status = Command::new("bash")
         .arg("-c")
         .arg(format!(
             "source \"$HOME/.cargo/env\" 2>/dev/null; \
-             RSC_BEACON_LISTEN='{}' RSC_BEACON_ENCRYPTION='{}' \
-             cargo build -p rsbeacon --release",
-            args.listen, encryption
+             {envs} cargo build -p rsbeacon --release"
         ))
         .current_dir(&ws)
         .status()
@@ -91,7 +113,17 @@ pub fn run_beacon_gen(args: BeaconGenArgs) -> Result<()> {
     }
 
     eprintln!("rsc: beacon written to {}", args.out.display());
-    eprintln!("  beacon:  {}/rsbeacon   (run with no args, listens on {})", args.out.display(), args.listen);
+    match &args.connect {
+        Some(c) => eprintln!(
+            "  beacon:  {}/rsbeacon   (run with no args; dials out to rsserver {c})",
+            args.out.display()
+        ),
+        None => eprintln!(
+            "  beacon:  {}/rsbeacon   (run with no args, listens on {})",
+            args.out.display(),
+            args.listen
+        ),
+    }
     if args.tls {
         eprintln!("  client:  --encryption tls --ca-cert {}/ca.pem", args.out.display());
     }

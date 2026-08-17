@@ -270,6 +270,15 @@ pub struct BeaconGenCli {
     /// Output directory for rsbeacon + ca.pem.
     #[arg(long, default_value = "./beacon-out")]
     pub out: std::path::PathBuf,
+
+    /// Bake reverse mode: beacon dials out to this rsserver
+    /// ([token@]host:port) instead of listening.
+    #[arg(long)]
+    pub connect: Option<String>,
+
+    /// Session name baked for --connect mode (default "default").
+    #[arg(long)]
+    pub name: Option<String>,
 }
 
 fn main() {
@@ -313,6 +322,8 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             listen: args.listen,
             tls: !args.no_tls,
             out: args.out,
+            connect: args.connect,
+            name: args.name,
         }),
         Cmd::Fuse(args) => {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

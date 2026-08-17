@@ -132,3 +132,71 @@ def test_rev_bad_token_rejected(rsc_reverse, client, beacon_host):
     time.sleep(1)
     log = run(client, "cat /tmp/rsserver.log").stdout
     assert "rejected" in log, f"bad token not rejected:\n{log}"
+
+
+# ---------------------------------------------------------------------------
+# beacon-gen × reverse: zero-arg dial-out beacon
+# ---------------------------------------------------------------------------
+
+GENREV_DIR = "/tmp/beacon-gen-rev"
+GENREV_BIN = "/home/ubuntu/rsbeacon-genrev"
+GENREV_MOUNT = "/tmp/rsc-mount-genrev"
+GENREV_NAME = "genrev"
+
+
+def test_rev_gen_beacon_zero_args(rsc_reverse, client, beacon_host):
+    """rsc beacon-gen --connect bakes server+token+name: the beacon runs with
+    literally no arguments and still lands on the right rsserver session."""
+    server_ip = run(client, "hostname -I").stdout.split()[0]
+    rsc = f"{REMOTE_DIR}/target/release/rsc"
+
+    run(client, f"rm -rf {GENREV_DIR} {GENREV_MOUNT} && mkdir -p {GENREV_MOUNT}")
+    run(beacon_host, f"sudo pkill -9 -f rsbeacon-genrev 2>/dev/null || true")
+
+    r = run(client,
+            f"{rsc} beacon-gen "
+            f"--connect '{TOKEN}@{server_ip}:{SERVER_PORT}' "
+            f"--name {GENREV_NAME} "
+            f"--out {GENREV_DIR}",
+            timeout=300)
+    assert r.ok, f"beacon-gen --connect failed:\n{r.stdout}\n{r.stderr}"
+
+    import subprocess
+    run(beacon_host, f"rm -f {GENREV_BIN}")
+    subprocess.run(["scp", f"{client}:{GENREV_DIR}/rsbeacon",
+                    f"{beacon_host}:{GENREV_BIN}"], check=True)
+    run(beacon_host, f"chmod +x {GENREV_BIN}")
+
+    # NO arguments — everything baked.
+    run_bg(beacon_host, f"nohup sudo {GENREV_BIN} >/tmp/rsbeacon-genrev.log 2>&1")
+    time.sleep(2)
+    log = run(client, "cat /tmp/rsserver.log").stdout
+    assert f"session '{GENREV_NAME}'" in log and "registered" in log, \
+        f"generated reverse beacon did not register:\n{log}"
+
+    rsclient = f"{REMOTE_DIR}/target/release/rsclient"
+    run_bg(client,
+           f"nohup {rsc} exec "
+           f"--server '{TOKEN}@127.0.0.1:{SERVER_PORT}' "
+           f"--encryption tls "
+           f"--ca-cert {GENREV_DIR}/ca.pem "
+           f"--rsclient {rsclient} "
+           f"--mount-base {GENREV_MOUNT} "
+           f"--name {GENREV_NAME} "
+           f"-- sh -c 'kill -0 1; exec sleep 60' "
+           f">/tmp/rsc-genrev.log 2>&1")
+    time.sleep(3)
+
+    sentinel = "rscaller-genrev-sentinel"
+    run(beacon_host, f"echo '{sentinel}' > /tmp/rsc-e2e-genrev.txt")
+    r = run(client, f"cat {GENREV_MOUNT}/{GENREV_NAME}/tmp/rsc-e2e-genrev.txt")
+    assert r.ok and sentinel in r.stdout, \
+        f"read via zero-arg reverse beacon failed: {r.stdout!r} {r.stderr!r}"
+
+    # Teardown (this test runs after the shared-fixture ones).
+    run(client, "pkill -9 rsclient 2>/dev/null; pkill -9 sleep 2>/dev/null || true")
+    run(client,
+        f"fusermount -u {GENREV_MOUNT}/{GENREV_NAME} 2>/dev/null || "
+        f"umount -l {GENREV_MOUNT}/{GENREV_NAME} 2>/dev/null || true; "
+        f"rm -rf {GENREV_MOUNT} {GENREV_DIR}")
+    run(beacon_host, f"sudo pkill -9 -f rsbeacon-genrev 2>/dev/null || true")

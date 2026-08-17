@@ -20,6 +20,9 @@ fn main() {
     // `rsc beacon-gen` bakes defaults via these (see option_env! in main.rs).
     println!("cargo:rerun-if-env-changed=RSC_BEACON_LISTEN");
     println!("cargo:rerun-if-env-changed=RSC_BEACON_ENCRYPTION");
+    println!("cargo:rerun-if-env-changed=RSC_BEACON_CONNECT");
+    println!("cargo:rerun-if-env-changed=RSC_BEACON_AUTH");
+    println!("cargo:rerun-if-env-changed=RSC_BEACON_NAME");
 }
 
 /// `bpf/xdp_prog.o` is produced ahead-of-time from `bpf/xdp_prog.c` and
