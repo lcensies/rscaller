@@ -69,15 +69,17 @@ rscaller/
 │   │   ├── relay.yaml         network relay only, no FS overlay
 │   │   └── qemu-relay.yaml    run inside local QEMU VM, beacon block device
 │   └── src/
-│       ├── main.rs        subcommands: exec, shell, fuse, deploy
+│       ├── main.rs        subcommands: exec, shell, fuse, deploy, beacon-gen
 │       ├── exec.rs        seccomp/kmod/relay dispatch logic
+│       ├── beacon_gen.rs  zero-config beacon compiler (baked listen/TLS/reverse)
 │       └── mount_config.rs profile loading + mount namespace application
 ├── rscfuse/               FUSE filesystem library (embedded in rsc; `rsc fuse`)
 ├── rsbeacon/              syscall executor daemon (runs on beacon host)
 │   └── src/
-│       ├── main.rs        CLI: --listen, --tls, --tls-cert/key
-│       ├── server.rs      TCP / TLS accept loop
+│       ├── main.rs        CLI: --listen/--connect, --encryption, --cert/--key, --print-ca
+│       ├── server.rs      TCP / TLS accept loop + reverse-mode yamux dial-out
 │       └── executor.rs    raw libc::syscall() dispatch + blocklist
+├── rsserver/              optional rendezvous ("C2") server for reverse mode
 ├── rsclient/              syscall relay (spawned by rsc; not invoked directly)
 │   └── src/
 │       ├── relay.rs       seccomp unotify poller + beacon I/O
@@ -93,8 +95,7 @@ rscaller/
 └── scripts/
     ├── deploy.sh          rsync source to REMOTE + remote cargo build
     ├── bootstrap.sh       idempotent dev-VM provisioning (packages, libvirt, fuse)
-    ├── poc.sh             manual PoC: rsbeacon + tracee + rsc exec in one shot
-    └── gen_certs.sh       generate self-signed TLS certs
+    └── poc.sh             manual PoC: rsbeacon + tracee + rsc exec in one shot
 ```
 
 ## Prerequisites
@@ -184,11 +185,112 @@ sudo /home/ubuntu/rscaller/target/release/rsclient \
 
 ### TLS
 
+Zero-config (embedded identity): rsbeacon carries a build-time CA + server cert.
+
 ```bash
-bash scripts/gen_certs.sh certs/
-sudo rsbeacon --listen 192.0.2.1:9999 --tls --tls-cert certs/server.crt --tls-key certs/server.key
-sudo rsc shell --beacon 0.0.0.0:9999 --encryption tls --ca-cert certs/ca.crt
+# beacon side — no flags needed beyond --encryption tls
+sudo rsbeacon --listen 0.0.0.0:9999 --encryption tls
+
+# client side: fetch the beacon's CA and connect
+ssh <beacon> /home/ubuntu/rsbeacon --print-ca > ca.pem
+rsc shell --beacon <beacon-ip>:9999 --encryption tls --ca-cert ca.pem
 ```
+
+Custom identity instead of the embedded one (no shell scripts — `rsc certs-gen`):
+
+```bash
+rsc certs-gen --out certs/        # ca.pem + cert.pem + key.pem, SAN includes DNS:rsbeacon
+sudo rsbeacon --listen 0.0.0.0:9999 --encryption tls --cert certs/cert.pem --key certs/key.pem
+rsc shell --beacon <beacon-ip>:9999 --encryption tls --ca-cert certs/ca.pem
+```
+
+Notes:
+- TLS over UDS is rejected (`--transport uds --encryption tls` bails).
+- Client SNI is always `rsbeacon`; custom certs must carry that SAN.
+
+### rsc beacon-gen — zero-config beacon compiler
+
+Bakes listen address, encryption and (optionally) reverse-mode rendezvous into a
+fresh rsbeacon binary with a per-generation CA identity. The generated beacon
+needs **no arguments**:
+
+```bash
+rsc beacon-gen --listen 0.0.0.0:9999 --out ./beacon-out
+# → ./beacon-out/rsbeacon   (TLS on by default; --no-tls opts out)
+# → ./beacon-out/ca.pem     (client --ca-cert)
+
+# reverse mode baked in (dial-out beacon, see below):
+rsc beacon-gen --connect token@<server-ip>:4444 --name op1 --out ./beacon-out
+```
+
+CLI flags on the generated beacon still override the baked values.
+
+### Reverse mode — rsserver rendezvous ("C2")
+
+Default topology (client connects straight to the beacon) requires the beacon to
+be reachable. Reverse mode inverts it: the beacon **dials out** to an optional
+`rsserver`, and clients meet it there. Use when the beacon sits behind NAT or
+egress-only filtering.
+
+```bash
+# 1. anywhere reachable by both sides:
+rsserver --listen 0.0.0.0:4444 --auth-token s3cret
+
+# 2. beacon dials out (no listen socket on the beacon):
+sudo rsbeacon --connect <server-ip>:4444 --auth s3cret --encryption tls
+sudo rsbeacon --print-ca > ca.pem   # provision client CA as usual
+
+# 3. client rendezvous (token in URL or via --auth):
+rsc exec --server s3cret@<server-ip>:4444 --encryption tls --ca-cert ca.pem -- id
+```
+
+- All client connections to one beacon are multiplexed (yamux) over its single
+  outbound connection; `--max-connections` bounds concurrent streams.
+- TLS terminates at the beacon — rsserver only relays ciphertext.
+- Sessions are keyed by `--name` (default `default`); several beacons/sessions
+  share one rsserver.
+- Client connect blocks until a beacon is parked (30s timeout), so a missing
+  beacon is a clear error, not a hang.
+- Limitation: the per-socket proxy data plane is not rendezvous-aware; with
+  `--server`, socket data syscalls use the main relay connection
+  (same behavior as `RSC_SOCKET_PROXY=0`).
+- `--server` is not wired into the container/microVM (`--image`/`--microvm`)
+  spawn paths.
+
+### rsbeacon reference
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--listen <addr:port>` | `0.0.0.0:9999` | TCP listen address |
+| `--transport tcp\|uds` | `tcp` | Transport |
+| `--uds-path <path>` | `/tmp/rsbeacon.sock` | Socket path (uds only) |
+| `--encryption none\|tls` | `none` | TLS on/off (uds: rejected) |
+| `--cert/--key <path>` | embedded | Override embedded TLS identity |
+| `--print-ca` | — | Print embedded CA PEM and exit |
+| `--max-connections <n>` | `10` | Connection/stream bound |
+| `--connect <addr:port>` | — | Reverse mode: dial out to rsserver |
+| `--auth <token>` | — | rsserver auth token |
+| `--name <name>` | `default` | rsserver session name |
+| `--netstack direct\|smoltcp-xdp` | `direct` | Network syscall backend |
+| `--xdp-iface` | — | AF_XDP interface (smoltcp-xdp, required) |
+| `--xdp-queue` | `0` | AF_XDP queue index |
+| `--xdp-mode copy` | `copy` | Only `copy` implemented; `zerocopy` rejected |
+| `--xdp-ip/--xdp-prefix/--xdp-gateway` | auto | Override interface IP/CIDR/route auto-detection |
+| `--xdp-mtu` | `1500` | smoltcp MTU — lower to path MTU behind tunnels (no PMTUD) |
+
+### rsc subcommands
+
+- `rsc exec` / `rsc shell` — run forwarded (flags: `--beacon`, `--encryption`,
+  `--ca-cert`, `--server`, `--auth`, `--mount-profile`, `--mount-base`,
+  `--name`, `--rc`).
+- `rsc beacon-gen` — zero-config beacon compiler (see above).
+- `rsc deploy --host <vm>` — rsync + codegen + build on a remote host
+  (`--remote-dir`, `--skip-codegen`, `--skip-kmod`).
+- `rsc exec --image <ref> [--backend docker|podman]` — run inside an OCI
+  container with forwarding wired in.
+- `rsc exec --microvm [--microvm-backend qemu] [--microvm-kernel <path>]
+  [--microvm-mem <MiB>] [--microvm-cpus <n>]` — run inside a local QEMU
+  microVM (Firecracker backend is a stub).
 
 ## Configurable Make variables
 
@@ -198,7 +300,7 @@ sudo rsc shell --beacon 0.0.0.0:9999 --encryption tls --ca-cert certs/ca.crt
 | `BEACON_VM` | `dev-vm-2` | Beacon host — receives `rsbeacon` binary via scp from REMOTE |
 | `BEACON_PORT` | `9999` | Beacon port |
 | `BEACON_SNAPSHOT` | `baseline` | Snapshot name for `snapshot-beacon` |
-| `VM_SNAPSHOT` | `clean-base-docker-nokmod` | Snapshot name for `snapshot-create/restore` |
+| `VM_SNAPSHOT` | `baseline` | Snapshot name for `snapshot-create/restore` |
 
 Examples:
 ```bash
@@ -500,8 +602,12 @@ make test-vm
 make test-vm NO_DEPLOY=1
 
 # TLS roundtrip
-bash scripts/gen_certs.sh certs/
 cargo test -p rscaller-proto -- --ignored test_tls_roundtrip
+
+# Focused E2E files (from tests/remote):
+uv run pytest test_tls.py        # TLS encryption end-to-end
+uv run pytest test_beacon_gen.py # beacon-gen zero-config beacons
+uv run pytest test_reverse.py    # rsserver reverse mode + auth + zero-arg beacon
 ```
 
 ## Adding forwarded syscalls

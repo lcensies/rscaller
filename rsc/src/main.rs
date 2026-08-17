@@ -9,6 +9,7 @@
 mod exec;
 mod deploy;
 mod beacon_gen;
+mod certs_gen;
 mod mount_config;
 #[cfg(feature = "relay")]
 mod relay;
@@ -39,6 +40,8 @@ enum Cmd {
     Fuse(rscfuse::FuseArgs),
     /// Compile a zero-config rsbeacon (baked listen addr + TLS identity, no flags needed).
     BeaconGen(BeaconGenCli),
+    /// Generate a CA + beacon server identity (PEM) for custom TLS deployments.
+    CertsGen(CertsGenCli),
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +292,13 @@ fn main() {
     }
 }
 
+#[derive(clap::Args)]
+pub struct CertsGenCli {
+    /// Output directory for ca.pem + cert.pem + key.pem.
+    #[arg(long, default_value = "./certs")]
+    pub out: std::path::PathBuf,
+}
+
 fn dispatch(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Exec(args) => {
@@ -325,6 +335,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             connect: args.connect,
             name: args.name,
         }),
+        Cmd::CertsGen(args) => certs_gen::run_certs_gen(args.out),
         Cmd::Fuse(args) => {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             tracing_subscriber::fmt()

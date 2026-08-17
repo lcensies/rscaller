@@ -25,6 +25,7 @@ ctls = { path = "../ctls", default-features = false, features = ["seccomp"] }
 rscfuse = { path = "../rscfuse" }
 qemu-vdw-core = { path = "../qemu-vdw-core", optional = true }
 rustls = { workspace = true }
+rcgen = "0.13"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { workspace = true, optional = true }
 ociman = { git = "https://github.com/mbj/mrs", optional = true }

@@ -13,10 +13,10 @@ Use `vm_flags_set(vma, flags)` / `vm_flags_clear(vma, flags)` on 6.3+.
 Compat shim defined in `main.c` for kernels < 6.3.
 **Note:** In Linux 6.15+ these helpers are GPL-only exports. Non-GPL modules on 6.15+ must use `vm_flags_reset()` instead.
 
-### vm_insert_page (2.6.15+)
-Safe to use on all supported kernels. Used in `rscaller_dev_mmap_new` instead of
-`remap_pfn_range` because `remap_pfn_range` rejects normal RAM (struct-page-backed) PFNs
-on Linux 6.x without additional setup.
+### mmap: remap_pfn_range without VM_IO
+`rscaller_dev_mmap_new` uses `remap_pfn_range` and deliberately omits `VM_IO` —
+with `VM_IO` set, `remap_pfn_range` rejects normal RAM (struct-page-backed) PFNs
+on Linux 6.x. An earlier `vm_insert_page` experiment is in git history.
 
 ### mmap size check
 `mmap(len)` is rounded up to `PAGE_SIZE` by the kernel before reaching the driver's mmap
@@ -188,6 +188,21 @@ The beacon (dev-vm-2) has a 64 MiB scratch disk attached **at the hypervisor lev
 on the beacon — no losetup, no mounts. `test_qemu_relay.py` writes a sentinel through
 the relay VM and reads it back through a second relay invocation; it never runs
 verification commands on the beacon.
+
+## TLS / beacon-gen / rsserver (reverse mode)
+
+- Client TLS SNI is hardcoded `"rsbeacon"` — custom certs MUST carry `DNS:rsbeacon`
+  in SAN (`rsc certs-gen` does; gen_certs.sh is retired). Never verify against the beacon IP.
+- `rsbeacon --print-ca` prints the embedded CA: the zero-config client provisioning path.
+- UDS+TLS is rejected at startup (not silently downgraded).
+- `rsc beacon-gen` bakes config via RSC_BEACON_* env vars read by `option_env!` in
+  rsbeacon/main.rs — absent values must be UNSET in the env (empty string = Some("")).
+  Fresh CA per gen = pem files deleted from rsbeacon OUT_DIR before cargo build.
+- rsserver: yamux mux, one outbound conn per beacon; yamux 0.13 has NO Control handle —
+  stream opens go through a driver-task actor (mpsc+oneshot). Keepalive via TcpSocket on
+  both dial-out and listener (accepted sockets inherit SO_KEEPALIVE on Linux).
+- `--server` mode: socket-proxy data plane unsupported (auto-disabled, main-conn
+  round-trip); not wired into container/microVM spawn paths.
 
 ## Shell / Tmux Workflow
 

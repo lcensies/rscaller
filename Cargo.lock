@@ -1162,6 +1162,7 @@ dependencies = [
  "libc",
  "ociman",
  "qemu-vdw-core",
+ "rcgen",
  "rscfuse",
  "rustls",
  "serde",
