@@ -158,13 +158,17 @@ deploy-all: deploy-beacon
 # Snapshots
 # ---------------------------------------------------------------------------
 
-# Snapshot REMOTE (dev-vm-1) — call after a clean deploy.
+# Snapshot REMOTE (dev-vm-1) — only needed after SYSTEM-level changes
+# (packages/config); binaries are re-pushed from the vms/bin/ host cache on
+# every test revert, so code changes never require a baseline refresh.
 snapshot-create:
 	virsh snapshot-create-as $(VM_DOMAIN) $(VM_SNAPSHOT) \
 	  --description "clean boot, no kmod loaded" --atomic
 
-# Refresh the client baseline snapshot to include the currently deployed binaries.
-# Run after 'make deploy' when new binaries change the client's expected state.
+# Refresh the client baseline snapshot. Only needed for SYSTEM-level changes
+# (packages, config, new users) — binary changes no longer require this:
+# deploy.sh caches binaries host-side (vms/bin/) and conftest re-pushes them
+# after every per-test snapshot revert.
 snapshot-update-client:
 	virsh snapshot-delete $(VM_DOMAIN) $(VM_SNAPSHOT) 2>/dev/null || true
 	virsh snapshot-create-as $(VM_DOMAIN) $(VM_SNAPSHOT) \
@@ -296,6 +300,18 @@ test-evasion:
 # Full clean run: reset VMs, then run evasion tests without a second deploy.
 test-evasion-clean: vm-reset
 	$(MAKE) test-evasion NO_DEPLOY=1
+
+# Run QEMU relay tests (test_qemu_relay.py).
+test-qemu-relay:
+	cd tests/remote && uv run pytest $(if $(NO_DEPLOY),--no-deploy,) \
+	  --no-header -v -s \
+	  --log-cli-level=INFO \
+	  --remote=$(REMOTE) \
+	  --beacon-host=$(BEACON_VM) \
+	  --beacon-port=$(BEACON_PORT) \
+	  --beacon-vm-snapshot=$(BEACON_SNAPSHOT) \
+	  --client-vm-snapshot=$(VM_SNAPSHOT) \
+	  test_qemu_relay.py
 
 # Run mount profile overlay tests.
 # Usage:

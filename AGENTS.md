@@ -126,6 +126,12 @@ make test-evasion NO_DEPLOY=1
 ### VM snapshot strategy (used by pytest fixtures)
 - Both `client_snapshotted` and `beacon_snapshotted` fixtures **revert to a persistent
   `baseline` snapshot** at the start of each test — no new snapshot is created per-test.
+- **Binaries survive reverts via host cache, NOT via baseline re-baking**: `deploy.sh`
+  fetches `rsc`/`rsclient`/`rsbeacon` back into `vms/bin/` (gitignored) after every
+  build, and the snapshot fixtures kill leftovers (ETXTBSY guard) and re-push the
+  cache after each revert. Baselines only capture system state — refresh them
+  (`make snapshot-update-client` / beacon equivalent) only after package/config
+  changes, never for code changes.
 - `vm-reset` reverts **both** VMs to their `baseline` snapshots before deploying, so tests
   always start from clean state.
 - `VM_SNAPSHOT` and `BEACON_SNAPSHOT` both default to `baseline`.

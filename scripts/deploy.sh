@@ -24,7 +24,9 @@ ssh "$REMOTE" "echo ${BECOME_PASS} | sudo -S bash -c \
 ok "sudoers done"
 
 step "Syncing repo source to $REMOTE:$REMOTE_DIR"
-rsync -az --delete \
+# --checksum, not mtime: the VM clock can run ahead of the host (snapshot
+# reverts + lab NTP), and mtime-skipped files then silently no-op the build.
+rsync -az --checksum --delete \
 	--exclude='.git/' \
 	--exclude='target/' \
 	--exclude='kmod/*.ko' \
@@ -47,17 +49,34 @@ ssh "$REMOTE" "sudo mkdir -p /var/lib/libvirt/images/rscaller-relay && \
 ok "relay artifacts done"
 
 step "Installing build dependencies on $REMOTE"
-ssh "$REMOTE" "sudo apt-get install -y libfuse3-dev libvirt-dev 2>&1 | tail -3" || true
+# apt-get update first: after a baseline revert the index is stale and pinned
+# package versions 404.
+ssh "$REMOTE" "sudo apt-get update -qq 2>&1 | tail -1; sudo apt-get install -y libfuse3-dev libvirt-dev 2>&1 | tail -3" || true
 # rscfuse mounts with allow_other (QEMU relay user needs it) — requires
 # user_allow_other in /etc/fuse.conf. Idempotent; same step as bootstrap.sh.
 ssh "$REMOTE" "grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf >/dev/null"
 ok "apt done"
 
 step "Building Rust workspace on $REMOTE (release)"
+# pipefail so a failed cargo build aborts the deploy instead of leaving a
+# stale binary in place while "Deploy done" prints.
 ssh "$REMOTE" "source \$HOME/.cargo/env 2>/dev/null; \
   cd $REMOTE_DIR && \
+  set -o pipefail && \
   cargo build --workspace --release --features rsc/relay 2>&1 | grep -E '^error|Finished'"
 ok "remote build done"
+
+step "Fetching built artifacts back to host cache (vms/bin/)"
+# The per-test snapshot reverts wipe binaries back to whatever the baseline
+# captured. Caching them host-side lets conftest re-push after every revert,
+# so baselines never need re-baking for code changes.
+mkdir -p "$REPO_ROOT/vms/bin"
+rsync -az --checksum \
+	"$REMOTE:$REMOTE_DIR/target/release/rsc" \
+	"$REMOTE:$REMOTE_DIR/target/release/rsclient" \
+	"$REMOTE:$REMOTE_DIR/target/release/rsbeacon" \
+	"$REPO_ROOT/vms/bin/"
+ok "host cache updated"
 
 echo ""
 echo "==> Deploy done. Binaries are in $REMOTE_DIR/target/release/ on $REMOTE."

@@ -275,3 +275,4 @@ cython_debug/
 certs/
 kmod/handler_wrappers.h
 kmod/syscalls.c
+vms/bin/

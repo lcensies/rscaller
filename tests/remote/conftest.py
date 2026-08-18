@@ -217,6 +217,30 @@ def client_vm_snapshot(pytestconfig):
 
 _SNAP = "pytest-clean"
 
+# Host-side cache of the last deployed binaries (filled by deploy.sh).
+# Snapshot reverts restore baseline binaries, so we re-push the cache after
+# every revert — baselines then only capture system state (packages, config),
+# never code, and never need re-baking for binary changes.
+BIN_CACHE = REPO_ROOT / "vms" / "bin"
+
+
+def _push_cached(host: str, names: list[str], dest_dir: str) -> None:
+    files = [BIN_CACHE / n for n in names]
+    if not all(f.exists() for f in files):
+        print(f"[fixture] bin cache missing {names} — keeping baseline binaries",
+              flush=True)
+        return
+    # Kill leftovers first: scp onto a running executable fails (ETXTBSY).
+    # Needed even with "clean" baselines — a memory snapshot accidentally
+    # baked mid-test resurrects rsc/fuse processes on every revert.
+    run(host, "sudo pkill -9 -x rsc 2>/dev/null; sudo pkill -9 -x rsclient 2>/dev/null; "
+              "mount | awk '$5==\"fuse\" && $3 ~ /rsc/ {print $3}' | "
+              "xargs -r sudo umount -l 2>/dev/null; true")
+    run(host, f"mkdir -p {dest_dir}")
+    subprocess.run(["scp", "-q", *[str(f) for f in files], f"{host}:{dest_dir}/"],
+                   check=True)
+    print(f"[fixture] pushed cached {', '.join(names)} to {host}", flush=True)
+
 
 @pytest.fixture()
 def client_snapshotted(client, vm_name, client_vm_snapshot):
@@ -226,6 +250,7 @@ def client_snapshotted(client, vm_name, client_vm_snapshot):
     print(f"[fixture] waiting for SSH on {client}", flush=True)
     wait_for_ssh(client)
     vm_sync_clock(client)
+    _push_cached(client, ["rsc", "rsclient"], f"{REMOTE_DIR}/target/release")
     print(f"[fixture] {client} is up", flush=True)
     yield
 
@@ -238,6 +263,9 @@ def beacon_snapshotted(beacon_host, beacon_vm_name, beacon_vm_snapshot):
     print(f"[fixture] waiting for SSH on {beacon_host}", flush=True)
     wait_for_ssh(beacon_host)
     vm_sync_clock(beacon_host)
+    # pkill first: scp onto a running executable fails with ETXTBSY.
+    run(beacon_host, "sudo pkill -9 rsbeacon 2>/dev/null || true")
+    _push_cached(beacon_host, ["rsbeacon"], "/home/ubuntu")
     print(f"[fixture] {beacon_host} is up", flush=True)
     yield
 
@@ -317,6 +345,74 @@ def deploy_beacon(pytestconfig, remote, beacon_host):
 
 
 # ---------------------------------------------------------------------------
+# Preflight — fail fast on a broken environment instead of mid-suite timeouts
+# ---------------------------------------------------------------------------
+
+def _preflight_host(host: str, checks: list[tuple[str, str]], problems: list[str]):
+    """Run `cmd` on host; a non-zero exit appends f"{host}: {label}" to problems."""
+    for label, cmd in checks:
+        r = run(host, cmd)
+        if not r.ok:
+            problems.append(f"{host}: {label}")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def preflight(pytestconfig, deploy, deploy_beacon, remote, beacon_host):
+    """Validate both VMs before any test runs.
+
+    Catches the classic time-wasters up front: missing/stale binaries,
+    leftover processes holding binaries (ETXTBSY) or ports, stale fuse
+    mounts, missing fuse.conf/libvirtd setup, clock skew (TLS breakage).
+    """
+    # Baseline reverts freeze the clock; sync before the skew check so a
+    # freshly reverted VM doesn't fail spuriously.
+    vm_sync_clock(remote)
+    vm_sync_clock(beacon_host)
+
+    # Auto-clean fixable dirt (leftover procs, stale mounts) instead of
+    # failing — per-test fixtures do the same; a failed suite always leaves
+    # some of this behind and forcing manual cleanup each time is pointless.
+    for host in (remote, beacon_host):
+        run(host, "sudo pkill -9 -x rsc 2>/dev/null; sudo pkill -9 -x rsclient 2>/dev/null; "
+                  "sudo pkill -9 -x rsbeacon 2>/dev/null; "
+                  "mount | awk '$5==\"fuse\" && $3 ~ /rsc/ {print $3}' | "
+                  "xargs -r sudo umount -l 2>/dev/null; true")
+
+    problems: list[str] = []
+    _preflight_host(remote, [
+        ("rsc binary missing/not executable — run `make deploy`",
+         f"test -x {REMOTE_DIR}/target/release/rsc"),
+        ("rsclient binary missing/not executable — run `make deploy`",
+         f"test -x {REMOTE_DIR}/target/release/rsclient"),
+        ("user_allow_other missing from /etc/fuse.conf (qemu relay needs it)",
+         "grep -q '^user_allow_other' /etc/fuse.conf"),
+        ("libvirtd not active (test_qemu_relay will skip/fail)",
+         "systemctl is-active --quiet libvirtd"),
+        ("relay boot artifacts missing — run `make deploy`",
+         "ls /var/lib/libvirt/images/rscaller-relay/ | grep -q ."),
+    ], problems)
+
+    if not pytestconfig.getoption("--no-e2e"):
+        _preflight_host(beacon_host, [
+            ("rsbeacon binary missing/not executable — run `make deploy-beacon`",
+             f"test -x {BEACON_BIN}"),
+            ("/dev/vdb missing (qemu relay scratch disk) — attach via virsh",
+             "test -b /dev/vdb"),
+        ], problems)
+
+    # Clock skew breaks TLS (certs 'not yet valid') and image pulls.
+    now = time.time()
+    for host in (remote, beacon_host):
+        r = run(host, "date +%s")
+        skew = abs(int(r.stdout.strip()) - now)
+        if skew > 120:
+            problems.append(f"{host}: clock skew {skew:.0f}s > 120s (TLS will fail)")
+
+    assert not problems, "preflight failed:\n  - " + "\n  - ".join(problems)
+
+
+
+# ---------------------------------------------------------------------------
 # kmod (legacy, opt-in)
 # ---------------------------------------------------------------------------
 
@@ -360,11 +456,16 @@ def _netstack_args(pytestconfig) -> str:
     return f"--netstack {netstack} --xdp-iface {xdp_iface} --xdp-queue {xdp_queue} "
 
 
-@pytest.fixture(scope="session")
-def rsbeacon_on_beacon(pytestconfig, beacon_host, beacon_port, deploy_beacon):
-    """Start rsbeacon on beacon_host, listening on all interfaces."""
-    if pytestconfig.getoption("--no-e2e"):
-        pytest.skip("E2E disabled via --no-e2e")
+def _ensure_rsbeacon(pytestconfig, beacon_host: str, beacon_port: int) -> None:
+    """Start rsbeacon on beacon_host if the port isn't already listening.
+
+    Session consumers beyond the first must call this: later test files can
+    kill the beacon (test_reverse pkills rsbeacon; beacon_snapshotted reverts
+    the whole VM), and a session-scoped fixture never re-runs to notice.
+    """
+    r = run(beacon_host, f"ss -tln | grep ':{beacon_port} '")
+    if r.ok:
+        return
     run(beacon_host, "sudo pkill -9 rsbeacon 2>/dev/null || true")
     run_bg(beacon_host,
            f"nohup sudo {BEACON_BIN} "
@@ -372,10 +473,19 @@ def rsbeacon_on_beacon(pytestconfig, beacon_host, beacon_port, deploy_beacon):
            f"{_netstack_args(pytestconfig)}"
            f">/tmp/rsbeacon.log 2>&1")
     time.sleep(1)
-    r = run(beacon_host, f"ss -tlnp | grep ':{beacon_port}'")
+    r = run(beacon_host, f"ss -tln | grep ':{beacon_port} '")
     if not r.ok:
         log = run(beacon_host, "cat /tmp/rsbeacon.log 2>/dev/null")
         pytest.fail(f"rsbeacon failed to start on {beacon_host}:\n{log.stdout}")
+
+
+@pytest.fixture(scope="session")
+def rsbeacon_on_beacon(pytestconfig, beacon_host, beacon_port, deploy_beacon):
+    """Start rsbeacon on beacon_host, listening on all interfaces."""
+    if pytestconfig.getoption("--no-e2e"):
+        pytest.skip("E2E disabled via --no-e2e")
+    run(beacon_host, "sudo pkill -9 rsbeacon 2>/dev/null || true")
+    _ensure_rsbeacon(pytestconfig, beacon_host, beacon_port)
     yield
     # Deliberately NOT killing rsbeacon here: the interface must stay usable
     # between/after test runs (manual relay commands, iterative debugging).
@@ -487,7 +597,7 @@ def _seccomp_cleanup(client, mount_dir: str):
 
 
 @pytest.fixture(scope="session")
-def rsc_seccomp(pytestconfig, client, beacon_ip, beacon_port,
+def rsc_seccomp(pytestconfig, client, beacon_host, beacon_ip, beacon_port,
                 rsbeacon_on_beacon, deploy):
     """rsc exec on client, rsbeacon on beacon_host — direct TCP, no tunnel.
 
@@ -496,6 +606,10 @@ def rsc_seccomp(pytestconfig, client, beacon_ip, beacon_port,
     """
     if pytestconfig.getoption("--no-seccomp"):
         pytest.skip("seccomp disabled via --no-seccomp")
+
+    # The session beacon may have been killed by an earlier file (test_reverse
+    # pkills rsbeacon) — restart if the port went away.
+    _ensure_rsbeacon(pytestconfig, beacon_host, beacon_port)
 
     mount_dir = "/tmp/rsc-mount"
     _seccomp_cleanup(client, mount_dir)
