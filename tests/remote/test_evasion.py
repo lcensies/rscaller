@@ -129,6 +129,24 @@ def ensure_tracee_image(beacon_host):
     _make_tracee(beacon_host).ensure_image()
 
 
+@pytest.fixture(scope="module", autouse=True)
+def cleanup_rsc_leftovers(client):
+    """Module teardown: kill the rsc exec / rscfuse this file leaves running.
+
+    _rsc_read_fib_trie starts `rsc exec -- sleep N` via run_bg and never
+    reaps it (per-test revert only happens BEFORE a test). When this file is
+    followed by another suite (make test-vm), the stale FUSE mount + dead
+    beacon connection breaks the next file's rsc exec. Clean up after
+    ourselves."""
+    yield
+    run(client, "pkill -9 -f 'rsc exec' 2>/dev/null; pkill -9 rsclient 2>/dev/null; "
+                "pkill -9 -f 'rsc fuse' 2>/dev/null; pkill -9 sleep 2>/dev/null || true")
+    run(client,
+        f"fusermount -u {MOUNT_BASE}/{MOUNT_NAME} 2>/dev/null || "
+        f"umount -l {MOUNT_BASE}/{MOUNT_NAME} 2>/dev/null || true; "
+        f"rm -rf {MOUNT_BASE}")
+
+
 # ---------------------------------------------------------------------------
 # Function-scoped fixtures for the evasion test
 # ---------------------------------------------------------------------------

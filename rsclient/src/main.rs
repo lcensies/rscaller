@@ -312,5 +312,21 @@ async fn run_seccomp(args: Args, beacon_addr: std::net::SocketAddr) -> Result<()
         }
     }
 
+    // Reap the tracee and propagate its exit status: rsclient is the
+    // tracee's parent (rsc exec's parent side execvpe'd into us), and
+    // callers reasonably expect `rsc exec -- false` to exit 1.
+    let mut status = 0i32;
+    let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+    if pid > 0 {
+        if libc::WIFEXITED(status) {
+            let code = libc::WEXITSTATUS(status);
+            if code != 0 {
+                std::process::exit(code);
+            }
+        } else if libc::WIFSIGNALED(status) {
+            std::process::exit(128 + libc::WTERMSIG(status));
+        }
+    }
+
     result
 }

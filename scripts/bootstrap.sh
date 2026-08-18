@@ -59,6 +59,9 @@ PKGS=(
   clang llvm libbpf-dev libelf-dev bpftool
   # libvirt SDK for qemu-vdw-core relay VM provisioning
   libvirt-dev
+  # libvirtd + KVM hypervisor for qemu-relay (relay VMs run on the client).
+  # qemu-kvm is a virtual package on 24.04+ — install qemu-system-x86.
+  qemu-system-x86 libvirt-daemon-system libvirt-clients
 )
 
 # Check which are missing

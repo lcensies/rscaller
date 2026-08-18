@@ -324,7 +324,11 @@ fn launch_rscfuse(
     // Built pre-fork: allocating in the forked child of a multithreaded
     // process can deadlock on the malloc lock.
     let devnull = CString::new("/dev/null").unwrap();
-    let logpath = CString::new("/tmp/rscfuse.log").unwrap();
+    // Per-uid log name: with fs.protected_regular=1 (Ubuntu default), root
+    // cannot open a non-root-owned file in sticky /tmp, which previously
+    // killed this redirect and left rscfuse holding the ssh session's pipes
+    // open (fabric/ssh hangs).
+    let logpath = CString::new(format!("/tmp/rscfuse-{}.log", unsafe { libc::geteuid() })).unwrap();
 
     let pid = unsafe { libc::fork() };
     match pid {
@@ -332,7 +336,7 @@ fn launch_rscfuse(
         0 => {
             // Detach from the parent's stdio: rsc is often run over ssh, and an
             // orphaned rscfuse inheriting ssh's pipes keeps the session open
-            // forever. stdin ← /dev/null, stdout/stderr → /tmp/rscfuse.log.
+            // forever. stdin ← /dev/null, stdout/stderr → the log file.
             unsafe {
                 libc::setsid();
                 let dn = libc::open(devnull.as_ptr(), libc::O_RDWR);
@@ -344,9 +348,12 @@ fn launch_rscfuse(
                     libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
                     0o644,
                 );
-                if lg >= 0 {
-                    libc::dup2(lg, libc::STDOUT_FILENO);
-                    libc::dup2(lg, libc::STDERR_FILENO);
+                // Fall back to /dev/null if the log can't be opened — NEVER
+                // keep the inherited stdio pipes (see comment above).
+                let sink = if lg >= 0 { lg } else { dn };
+                if sink >= 0 {
+                    libc::dup2(sink, libc::STDOUT_FILENO);
+                    libc::dup2(sink, libc::STDERR_FILENO);
                 }
                 libc::execvpe(argv_ptrs[0], argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
             }

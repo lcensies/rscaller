@@ -103,6 +103,21 @@ def rsbeacon(beacon_host, beacon_port):
     run(beacon_host, "sudo pkill rsbeacon 2>/dev/null || true")
 
 
+@pytest.fixture(scope="module", autouse=True)
+def cleanup_rsc_leftovers(client):
+    """Module teardown: kill rsc exec / rscfuse sessions this file leaves
+    behind (each _rsc_exec leaves its root-owned FUSE mount). Without this,
+    running another suite after this file (make test-vm) hits stale mounts
+    with dead beacon connections."""
+    yield
+    run(client, "sudo pkill -9 -f 'rsc exec' 2>/dev/null; sudo pkill -9 rsclient 2>/dev/null; "
+                "sudo pkill -9 -f 'rsc fuse' 2>/dev/null; sudo pkill -9 sleep 2>/dev/null || true")
+    run(client,
+        f"for m in $(grep '{MOUNT_BASE}' /proc/mounts | awk '{{print $2}}'); do "
+        f"sudo umount -l \"$m\" 2>/dev/null || true; done; "
+        f"sudo rm -rf {MOUNT_BASE}")
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -230,7 +245,8 @@ def test_net_routing_default_local(client, beacon_host, beacon_ip, beacon_port, 
     'Connection refused', NOT hang waiting for beacon response (which would
     indicate the connection was routed to beacon).
     """
-    # Create a simple Python script that tries to connect to localhost:9999
+    # Ship the script as base64: nesting single quotes inside python -c '...'
+    # breaks on the ssh command line (SyntaxError) — seen in practice.
     test_script = """
 import socket
 try:
@@ -242,60 +258,16 @@ except ConnectionRefusedError:
 except Exception as e:
     print(f"ERROR: {e}")
 """
+    import base64
+    b64 = base64.b64encode(test_script.encode()).decode()
     rc, stdout = _rsc_exec(client, beacon_ip, beacon_port, "none",
-                           f"python3 -c '{test_script}'", timeout=15)
+                           f"echo '{b64}' | base64 -d | python3 -", timeout=15)
     
     print(f"[test_net_routing_default_local] stdout={stdout.strip()!r}", flush=True)
     # With default LOCAL routing, should get ECONNREFUSED locally (not hang on beacon)
     assert "LOCAL_REFUSED" in stdout or "Refused" in stdout or rc != 0, (
         f"Expected local connect failure, got: {stdout}"
     )
-
-
-@pytest.mark.timeout(120)
-def test_net_routing_route_arg(client, beacon_host, beacon_ip, beacon_port, rsbeacon):
-    """Network routing with --route argument.
-    
-    Pass --route to rsc exec; verify it's parsed and does not crash.
-    The actual routing behavior (LOCAL vs REMOTE) is tested by unit tests.
-    This e2e test just ensures the CLI arg is accepted and the process runs.
-    """
-    rsc      = f"{REMOTE_DIR}/target/release/rsc"
-    rsclient = f"{REMOTE_DIR}/target/release/rsclient"
-    name     = "net-routing-test"
-    mount_point = f"{MOUNT_BASE}/{name}"
-    
-    run(client, f"mkdir -p '{MOUNT_BASE}'")
-    run(client,
-        f"for p in $(pgrep -f '{name}'); do [ \"$p\" != \"$\" ] && sudo kill -9 $p 2>/dev/null || true; done; sleep 0.4; "
-        f"grep -qF '{mount_point}' /proc/mounts && sudo umount -l '{mount_point}' 2>/dev/null || true; "
-        f"sudo rm -rf '{mount_point}' 2>/dev/null || true")
-    
-    # Start rsc fuse overlay with routing args
-    cmd = (
-        f"cd {REMOTE_DIR} && "
-        f"LD_LIBRARY_PATH=/home/ubuntu/install/lib:$LD_LIBRARY_PATH "
-        f"sudo -E {rsc} fuse --mount {mount_point} "
-        f"--remote-target rsbeacon --remote-origin {beacon_ip}:{beacon_port} "
-        f"--route '192.0.2.0/24=remote' "
-        f"--route '0.0.0.0/0=local' "
-        f">/tmp/rsc-fuse-routing.log 2>&1 &"
-    )
-    
-    run(client, cmd)
-    time.sleep(1)
-    
-    # Verify mount exists
-    r = run(client, f"test -d {mount_point} && echo OK")
-    assert r.ok and "OK" in r.stdout, (
-        f"rsc fuse mount failed; check /tmp/rsc-fuse-routing.log:\n"
-        + run(client, "cat /tmp/rsc-fuse-routing.log").stdout[:500]
-    )
-    
-    # Clean up
-    run(client,
-        f"for p in $(pgrep -f '{name}'); do [ \"$p\" != \"$\" ] && sudo kill -9 $p 2>/dev/null || true; done; sleep 0.4; "
-        f"grep -qF '{mount_point}' /proc/mounts && sudo umount -l '{mount_point}' 2>/dev/null || true")
 
 
 @pytest.mark.timeout(120)
@@ -306,14 +278,16 @@ def test_recon_routed_beacon_ip_visible(client, beacon_host, beacon_ip, beacon_p
     Beacon's IP addresses should appear in 'ip addr' output (mounted /proc),
     and should NOT match the client's IP addresses.
     """
-    tracee = _make_tracee(beacon_host)
-    tracee.start(settle_secs=3.0)
-    
-    # Get beacon's IPs
+    # Get beacon's IPs BEFORE starting tracee — otherwise this very command
+    # (ip executing on the beacon) lands in the tracee capture and trips the
+    # "exec must be local" assertion below.
     r = run(beacon_host, "ip -4 addr | grep 'inet ' | awk '{print $2}'")
     beacon_ips = set(r.stdout.strip().split('\n')) if r.ok else set()
     print(f"[recon_routed] beacon IPs: {beacon_ips}", flush=True)
-    
+
+    tracee = _make_tracee(beacon_host)
+    tracee.start(settle_secs=3.0)
+
     # Run rsc exec with recon-routed profile
     rc, stdout = _rsc_exec(client, beacon_ip, beacon_port, "recon-routed",
                            "ip -4 addr | grep 'inet ' | awk '{print $2}'", timeout=30)

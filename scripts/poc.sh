@@ -236,8 +236,12 @@ if [[ -n "$SCENARIO" ]]; then
 	case "$SCENARIO" in
 	exec)
 		[[ "$PROFILE_SET" -eq 1 ]] || PROFILE="ghost"
-		[[ "$CMD_SET" -eq 1 ]] || CMD="cat /mnt/target/etc/shadow"
-		[[ "$BASELINE_CMD_SET" -eq 1 ]] || BASELINE_CMD="sudo cat /etc/shadow"
+		# Redirect to a temp file: the demo is the tracee events, not the
+		# file content — printing /etc/shadow into the evidence shot is
+		# pure noise.
+		[[ "$CMD_SET" -eq 1 ]] || CMD="sh -c 'cat /mnt/target/etc/shadow > /tmp/.rsc-poc-shadow'"
+		[[ "$BASELINE_CMD_SET" -eq 1 ]] || BASELINE_CMD="sudo sh -c 'cat /etc/shadow > /tmp/.rsc-poc-shadow'"
+		[[ "$CLEANUP_CMD_SET" -eq 1 ]] || CLEANUP_CMD="rm -f /tmp/.rsc-poc-shadow"
 		[[ "$EVENTS_SET" -eq 1 ]] || TRACEE_EVENTS="execve,execveat"
 		# "shadow", not "cat": both payload cmdlines contain the path, and
 		# daemon noise (update-motd cat /var/run/reboot-required etc.) no
@@ -703,7 +707,7 @@ ssh "$REMOTE" \
         --name '$NAME' \
         --mount-profile '$PROFILE' \
         $RSC_EXTRA_ARGS \
-        -- $CMD" 2>&1 | grep -v 'Guest agent is not responding\|Domain not found' | head -n 20
+        -- $CMD" 2>&1 | grep -vE 'Guest agent is not responding|Domain not found|^rsc: |rsclient' | head -n 20
 EXIT_CODE=${PIPESTATUS[0]}
 set -e
 echo "─────────────────────────────────────────────────────────────────────────"
