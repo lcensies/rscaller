@@ -103,7 +103,11 @@ struct Args {
     /// only). smoltcp does no PMTU discovery — lower this to the path
     /// MTU when a tunnel/overlay sits between the beacon and its peers
     /// (lab DLP tunnel: 1376), or full-size DF segments blackhole.
-    #[arg(long, default_value = "1500")]
+    /// Default 1360, not 1500: smoltcp has no PMTUD, so a blackholing
+    /// mid-path stalls the transfer permanently (verified by controlled
+    /// A/B, 2026-08). 1360 fits the 1376 tunnel class with margin; raise
+    /// only on paths verified clean.
+    #[arg(long, default_value = "1360")]
     xdp_mtu: usize,
 
     /// Print the embedded CA certificate (PEM) to stdout and exit.

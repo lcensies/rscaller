@@ -84,6 +84,20 @@ needed `virsh reboot`). `rsbeacon` refuses that config; always pass a distinct,
 unused on-subnet `--xdp-ip` (PoC default: 192.168.122.250). Rebuild `xdp_prog.o` on
 dev-vm-1 with the clang command in `rsbeacon/bpf/xdp_prog.c`'s header.
 
+### smoltcp-xdp MTU: default 1360, and why (2026-08 investigation verdict)
+smoltcp has **no PMTUD** — a mid-path blackhole of full-size segments (DLP tunnel
+class, MTU 1376) stalls transfers *permanently*. Not a code bug: verified by
+controlled A/B (`rsbeacon/src/bin/xdp_mvp.rs`, raw smoltcp socket over the
+production XDP stack): blackhole sim stalls at 0 bytes; everything else — clean
+paths, 5% loss + 25% reorder, 100MB transfers, pattern/md5-verified, local and
+internet paths, full `rsc exec` relay stack — is byte-perfect. The field-reported
+"61440 stall / stray bytes" were **not reproducible** on current builds (likely
+stale-baseline-binary artifacts from the pre-push-cache era). Default
+`--xdp-mtu 1360` (MSS 1320) fits the 1376 tunnel class with margin. Proper fix
+(PMTUD + production TCP) = parked openspec change `go-beacon-gvisor-netstack`.
+Sim pitfall: length-based `iptables OUTPUT` drops see pre-GSO superframes — they
+cannot model per-segment blackholes; `xdp_mvp` + netns + veth is the harness.
+
 ### Never hand-install packages on dev VMs — fix the harness instead
 If a dev VM is missing a system package (build tool, library, etc.), **do not**
 `ssh dev-vm-N "sudo apt-get install ..."` ad hoc. Add the package to
